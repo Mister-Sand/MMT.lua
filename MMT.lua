@@ -49,7 +49,12 @@ if MONET_DPI_SCALE == nil then MONET_DPI_SCALE = 1.0 ISMONETLOADER = false SEPOR
 local folderConfig = 'config'..SEPORATORPATCH -- Folder config
 local PATCHCONFIG = folderConfig..'MMT CFGs'..SEPORATORPATCH  -- Main folder cfgs
 
-local colors = {
+local TIMEOUT_DIALOG = 10
+local MAX_BANK_AMOUNT = 19999999 - 10000
+local WAIT_INTERVAL = 100
+local SHELF_TIMEOUT = 10
+
+local COLORS = {
     WHITE = "FFFFFF",
     RED = "FF3333",
     YELLOW = "FFE133",
@@ -79,15 +84,17 @@ local defaultSettings = {
         typeChatMessage = {
             messages = true,
             debug = false,
-        }
+        },
+        -- Черный список домов, которые нужно скрыть
+        blackListHouses = {}
     },
     style = {
         -- масштаб интерфейса
         scaleUI = 1.0,
         -- Цвет в тексте
-        colorChat = 'BFA68C',
+        colorChat = '8cbf91',
         -- Цвет текста
-        colorMessage = 0xFFBFA68C,
+        colorMessage = 0xFF8cbf91,
         -- Размер скроллбара
         scrollbarSizeStyle = 10,
         -- Стартовый размер основного окна скрипта
@@ -122,7 +129,7 @@ local posMainFraim = { x = 0, y = 0}
 -- Активный раздел в скрипте
 local activeTabScript = "main"
 
-local imguiInit = false
+local inputBlackHouse = new.int()
 
 -- --------------------------------------------------------
 --                           State
@@ -139,14 +146,22 @@ local idDialogs = {
 local stateCrypto = {
     -- Запущен ли процесс взаимодействия
     work = false,
+    -- Ожидаме заливки видяхи
+    waitFill = false,
+    -- Ожидаем пополнения дома
+    waitDep = false,
     -- Прогресс домов
     progressHouses = 0,
-    -- Список дотов в очереди
+    -- Список домов в очереди
     queueHouses = {},
     -- Прогресс полок
     progressShelves = 0,
     -- Список полок в очереди
     queueShelves = {},
+    -- Прогресс домов банка
+    progressHousesBank = 0,
+    -- Список домов банка в очереди
+    queueHousesBank = {},
 }
 
 local processes = {
@@ -158,6 +173,8 @@ local processes = {
     on = false,
     -- выключаем
     off = false,
+    -- пополнить банк
+    dep = false,
 }
 
 local haveLiquid = {
@@ -171,8 +188,24 @@ local shelves = {}
 
 local houses = {}
 
+local housesBanks = {}
+
 local lastIDDialog = 0
 
+local lastOpenHouse = 1
+
+-- --------------------------------------------------------
+--                           Class
+-- --------------------------------------------------------
+
+-- Утилиты для работы с диалогами в Interacting
+local DialogUtils = {}
+
+-- Класс для обработки домов
+local HouseProcessor = {}
+
+-- Класс для обработки полок
+local ShelfProcessor = {}
 
 -- =====================================================================================================================
 --                                                          MAIN
@@ -181,7 +214,11 @@ local lastIDDialog = 0
 imgui.OnInitialize(function()
     fa.Init()
 
-    imguiInit = true
+    if not ISMONETLOADER then
+        SetScaleUI()
+    end
+
+    SetStyle()
 end)
 
 function main()
@@ -195,16 +232,6 @@ function main()
         settings.style.scaleUI = MONET_DPI_SCALE
     end
 
-    while not imguiInit do wait(10) end
-
-    if not ISMONETLOADER then
-        SetScaleUI()
-    end
-
-    SetStyle()
-
-    AddChatMessage('Скрипт загружен. Команда активации: {'..settings.style.colorChat..'}/mmt{FFFFFF}.')
-
     sampRegisterChatCommand("mmt", function ()
         SwitchMainWindow()
     end)
@@ -216,6 +243,8 @@ function main()
         SaveSettings()
         thisScript():reload()
     end)
+
+    AddChatMessage('Скрипт загружен. Команда активации: {'..settings.style.colorChat..'}/mmt{FFFFFF}.')
 
     processInteractingThread = lua_thread.create_suspended(ProcessInteracting)
 end
@@ -229,21 +258,32 @@ end
 -- --------------------------------------------------------
 
 function sampev.onServerMessage(color, text)
-    if text:find("Вы залили") and text:find("охлаждающей жидкости в видеокарту") and color == 1941201407 then
-        local nowFillLiquid = text:match("восстановлено до ([%d%.]+)%%")
+    if stateCrypto.work then
+        if text:find("Вы залили") and text:find("охлаждающей жидкости в видеокарту") and color == 1941201407 then
+            local nowFillLiquid = text:match("восстановлено до ([%d%.]+)%%")
 
-        if nowFillLiquid then
-            stateCrypto.queueShelves[stateCrypto.progressShelves].fill = tonumber(nowFillLiquid)
-            stateCrypto.waitFill = false
+            if nowFillLiquid then
+                stateCrypto.queueShelves[stateCrypto.progressShelves].fill = tonumber(nowFillLiquid)
+                stateCrypto.waitFill = false
+            end
         end
-    end
 
-    if text:find("Чтобы запустить видеокарту в работу, необходимо вывести всю прибыль этой видеокарты") and color == -1104335361 then
-        DeactivateProcessesInteracting()
-    end
+        if text:find("Чтобы запустить видеокарту в работу, необходимо вывести всю прибыль этой видеокарты") and color == -1104335361 then
+            DeactivateProcessesInteracting()
+        end
 
-    if text:find("Эта функция недоступна через флешку") and color == -1104335361 then
-        DeactivateProcessesInteracting()
+        if text:find("Эта функция недоступна через флешку") and color == -1104335361 then
+            DeactivateProcessesInteracting()
+        end
+
+        if text:find("Вы успешно пополнили счёт дома за электроэнергию на ") and color == 1941201407 then
+            stateCrypto.waitDep = false
+        end
+
+        if text:find("В этом доме нет подвала с вентиляцией или он еще не достроен.") and color == -1104335361 then
+            DeactivateProcessesInteracting()
+            AddChatMessage("Вы можете добавить данный дом в чёрный список, чтобы его скрыть", TYPECHATMESSAGES.SECONDARY)
+        end
     end
 end
 
@@ -254,7 +294,19 @@ end
 function sampev.onShowDialog(dialogId, style, title, button1, button2, text)
     lastIDDialog = dialogId
 
-    if stateCrypto.work and processes.take and title:find("Вывод прибыли видеокарты")then
+    if stateCrypto.work and processes.dep and title:find("{73B461}Баланс домашнего счёта") then
+        local _dep = text:match("Можно пополнить счёт ещё на:%s*{%w+}%$([%d%.,]+)")
+        if _dep then
+            _dep = _dep:gsub(",", ""):gsub("%.", "")
+        end
+
+        _dep = tonumber(_dep)-1 > 10000000 and 10000000 or tonumber(_dep)-1
+        sampSendDialogResponse(dialogId, 1, 0, tostring(_dep))
+        stateCrypto.queueHousesBank[stateCrypto.progressHousesBank].bankNow = stateCrypto.queueHousesBank[stateCrypto.progressHousesBank].bankNow + _dep
+        return not settings.main.replaceDialog
+    end
+
+    if stateCrypto.work and processes.take and title:find("Вывод прибыли видеокарты") then
         local continue = stateCrypto.queueShelves[stateCrypto.progressShelves].count - math.floor(stateCrypto.queueShelves[stateCrypto.progressShelves].count)
         stateCrypto.queueShelves[stateCrypto.progressShelves].count = continue
         sampSendDialogResponse(dialogId, 1, 0, "")
@@ -334,7 +386,7 @@ function sampev.onShowDialog(dialogId, style, title, button1, button2, text)
                 haveLiquid.btc = 0
                 haveLiquid.supper_btc = 0
                 haveLiquid.asc = 0
-                
+
                 processes.fill = false
                 AddChatMessage("Нет жидкости для видеокарты "..value.action, TYPECHATMESSAGES.CRITICAL)
             end
@@ -356,12 +408,19 @@ function sampev.onShowDialog(dialogId, style, title, button1, button2, text)
         end
     end
 
-    if title:find("Выбор дома") and text:find("циклов") then
+    if title:find("Выбор дома") then
         idDialogs.selectHouse = dialogId
 
         imguiWindows.main[0] = true
 
-        houses = ParseHouseData(text)
+        houses = {}
+        housesBanks ={}
+
+        if text:find("циклов") then
+            houses = ParseHouseData(text)
+        else
+            housesBanks = ParseHouseBankData(text)
+        end
 
         if settings.main.replaceDialog then
             return false
@@ -379,6 +438,7 @@ function sampev.onSendDialogResponse(id, btn, list, input)
     if id == idDialogs.selectHouse then
         imguiWindows.main[0] = false
         houses = {}
+        housesBanks ={}
     end
 
     if id == idDialogs.selectVideoCard then
@@ -390,6 +450,284 @@ end
 -- =====================================================================================================================
 --                                                          FUNCTIONS
 -- =====================================================================================================================
+
+function CheckHouseInBlackList(number)
+    for index, value in ipairs(settings.main.blackListHouses) do
+        if tonumber(number) == value then return true end
+    end
+    return false
+end
+
+-- --------------------------------------------------------
+--                           Dialog Utils
+-- --------------------------------------------------------
+
+function DialogUtils.waitForDialog(expectedDialogId, timeoutSeconds)
+    local timeout = os.clock() + (timeoutSeconds or TIMEOUT_DIALOG)
+
+    while lastIDDialog ~= expectedDialogId do
+        wait(WAIT_INTERVAL)
+
+        if os.clock() > timeout then
+            return false, "Timeout waiting for dialog " .. tostring(expectedDialogId)
+        end
+
+        if not CheckProcessInteracting() then
+            return false, "Process was interrupted"
+        end
+    end
+
+    return true
+end
+
+function DialogUtils.waitForAnyDialog(expectedDialogIds, timeoutSeconds)
+    local timeout = os.clock() + (timeoutSeconds or TIMEOUT_DIALOG)
+
+    while true do
+        for _, dialogId in ipairs(expectedDialogIds) do
+            if lastIDDialog == dialogId then
+                return true, dialogId
+            end
+        end
+
+        wait(WAIT_INTERVAL)
+
+        if os.clock() > timeout then
+            local dialogNames = table.concat(expectedDialogIds, ", ")
+            return false, "Timeout waiting for any dialog: " .. dialogNames
+        end
+
+        if not CheckProcessInteracting() then
+            return false, "Process was interrupted"
+        end
+    end
+end
+
+function DialogUtils.sendResponseAndWait(dialogId, button, listitem, input, waitCondition)
+    sampSendDialogResponse(dialogId, button, listitem, input or "")
+
+    if waitCondition then
+        local timeout = os.clock() + TIMEOUT_DIALOG
+        while not waitCondition() do
+            wait(WAIT_INTERVAL)
+            if os.clock() > timeout then
+                return false, "Timeout waiting for condition"
+            end
+            if not CheckProcessInteracting() then
+                return false, "Process was interrupted"
+            end
+        end
+    end
+
+    return true
+end
+
+-- --------------------------------------------------------
+--                           Shelf Processor
+-- --------------------------------------------------------
+
+function ShelfProcessor.filterShelves()
+    local filtered = {}
+
+    for _, shelf in ipairs(shelves) do
+        local shouldProcess = (
+            (shelf.status == "Работает" and processes.off) or
+            (shelf.status ~= "Работает" and processes.on and shelf.percentage > 0) or
+            (shelf.profit >= 1.0 and processes.take) or
+            (shelf.percentage <= settings.main.fillFrom and processes.fill)
+        )
+
+        if shouldProcess then
+            table.insert(filtered, {
+                samp_line = shelf.samp_line,
+                fill = shelf.percentage,
+                work = shelf.status == "Работает",
+                count = shelf.profit
+            })
+        end
+    end
+
+    return filtered
+end
+
+function ShelfProcessor.process()
+    stateCrypto.progressShelves = 1
+    stateCrypto.queueShelves = ShelfProcessor.filterShelves()
+
+    if #stateCrypto.queueShelves == 0 then
+        AddChatMessage("Отсутствуют полки для работы", TYPECHATMESSAGES.WARNING)
+        return true
+    end
+
+    for index, shelfData in ipairs(stateCrypto.queueShelves) do
+        local success, dialogId = DialogUtils.waitForAnyDialog({
+            idDialogs.selectVideoCardItemFlash,
+            idDialogs.selectVideoCard
+        })
+
+        if not success then
+            AddChatMessage("Ошибка ожидания диалога полок: " .. error, TYPECHATMESSAGES.CRITICAL)
+            return false
+        end
+
+        local oldProgress = stateCrypto.progressShelves
+        local progressUpdated = function()
+            return stateCrypto.progressShelves ~= oldProgress
+        end
+
+        success, error = DialogUtils.sendResponseAndWait(
+            lastIDDialog, 1, shelfData.samp_line, "", progressUpdated
+        )
+
+        if not success then
+            AddChatMessage("Ошибка обработки полки: " .. error, TYPECHATMESSAGES.CRITICAL)
+            return false
+        end
+    end
+
+    return true
+end
+
+-- --------------------------------------------------------
+--                           House Processor
+-- --------------------------------------------------------
+
+function HouseProcessor.filterBankHouses()
+    local filtered = {}
+
+    for _, house in ipairs(housesBanks) do
+        if tonumber(house.bankNow) < MAX_BANK_AMOUNT then
+            table.insert(filtered, {
+                samp_line = house.samp_line,
+                bankNow = house.bankNow
+            })
+        end
+    end
+
+    return filtered
+end
+
+function HouseProcessor.processBankHouses()
+    stateCrypto.progressHousesBank = 1
+    stateCrypto.queueHousesBank = HouseProcessor.filterBankHouses()
+
+    if #stateCrypto.queueHousesBank == 0 then
+        return true
+    end
+
+    for index, houseData in ipairs(stateCrypto.queueHousesBank) do
+        local success, error = DialogUtils.waitForDialog(idDialogs.selectHouse)
+        if not success then
+            AddChatMessage("Ошибка ожидания диалога дома: " .. error, TYPECHATMESSAGES.CRITICAL)
+            return false
+        end
+
+        sampSendDialogResponse(lastIDDialog, 1, houseData.samp_line, "")
+        lastOpenHouse = index
+        stateCrypto.waitDep = true
+
+        -- Ждем завершения операции депозита
+        local timeout = os.clock() + TIMEOUT_DIALOG
+        while stateCrypto.waitDep do
+            wait(WAIT_INTERVAL)
+            if os.clock() > timeout then
+                AddChatMessage("Timeout при ожидании депозита", TYPECHATMESSAGES.CRITICAL)
+                return false
+            end
+            if not CheckProcessInteracting() then
+                return false
+            end
+        end
+
+        -- Дополнительная проверка и повторная операция если нужно
+        if tonumber(houseData.bankNow) < MAX_BANK_AMOUNT then
+            sampSendDialogResponse(lastIDDialog, 1, houseData.samp_line, "")
+            stateCrypto.waitDep = true
+
+            timeout = os.clock() + TIMEOUT_DIALOG
+            while stateCrypto.waitDep do
+                wait(WAIT_INTERVAL)
+                if os.clock() > timeout then
+                    AddChatMessage("Timeout при повторном депозите", TYPECHATMESSAGES.CRITICAL)
+                    return false
+                end
+                if not CheckProcessInteracting() then
+                    return false
+                end
+            end
+        end
+
+        stateCrypto.progressHousesBank = stateCrypto.progressHousesBank + 1
+    end
+
+    return true
+end
+
+function HouseProcessor.processRegularHouses()
+    stateCrypto.progressHouses = 1
+    stateCrypto.queueHouses = {}
+
+    for _, house in ipairs(houses) do
+        table.insert(stateCrypto.queueHouses, {
+            samp_line = house.samp_line,
+        })
+    end
+
+    for index, houseData in ipairs(stateCrypto.queueHouses) do
+        local success, error = DialogUtils.waitForDialog(idDialogs.selectHouse)
+        if not success then
+            AddChatMessage("DeactivateProcessesInteracting - " .. error, TYPECHATMESSAGES.CRITICAL)
+            return false
+        end
+
+        -- Очищаем данные полок для нового дома
+        shelves = {}
+        stateCrypto.queueShelves = {}
+
+        sampSendDialogResponse(lastIDDialog, 1, houseData.samp_line, "")
+        lastOpenHouse = index
+
+        -- Ждем загрузки полок с таймаутом
+        local timeout = os.clock() + SHELF_TIMEOUT
+        local shelvesLoaded = false
+
+        while not shelvesLoaded do
+            wait(10)
+
+            if #shelves > 0 then
+                shelvesLoaded = true
+            elseif os.clock() > timeout then
+                AddChatMessage("Не смог получить полки для дома " .. index, TYPECHATMESSAGES.WARNING)
+                break
+            end
+
+            if not CheckProcessInteracting() then
+                return false
+            end
+        end
+
+        if shelvesLoaded then
+            local shelfSuccess = ShelfProcessor.process()
+            if not shelfSuccess then
+                return false
+            end
+        end
+
+        -- Закрываем диалог дома
+        while lastIDDialog ~= idDialogs.selectHouse do
+            sampSendDialogResponse(lastIDDialog, 0, 0, "")
+            wait(WAIT_INTERVAL)
+
+            if not CheckProcessInteracting() then
+                return false
+            end
+        end
+
+        stateCrypto.progressHouses = stateCrypto.progressHouses + 1
+    end
+
+    return true
+end
 
 function StartProcessInteracting(action)
     if stateCrypto.work then AddChatMessage("Процесс уже запущен", TYPECHATMESSAGES.WARNING) end
@@ -403,42 +741,11 @@ function StartProcessInteracting(action)
         processes.on = true
     elseif action == "off" then
         processes.off = true
+    elseif action == "dep" then
+        processes.dep = true
     else
         AddChatMessage("Нет действий", TYPECHATMESSAGES.CRITICAL)
         return false
-    end
-
-    stateCrypto.work = true
-
-    if #houses > 0 then
-        stateCrypto.progressHouses = 1
-
-        for index, house in ipairs(houses) do
-            table.insert(stateCrypto.queueHouses, {
-                samp_line = house.samp_line,
-            })
-        end
-    end
-
-    stateCrypto.progressShelves = 1
-    for index, shelf in ipairs(shelves) do
-        if
-            (shelf.status == "Работает" and processes.off) or
-            (shelf.status ~= "Работает" and processes.on and shelf.percentage > 0) or
-            (shelf.profit >= 1.0 and processes.take) or
-            (shelf.percentage <= settings.main.fillFrom and processes.fill)
-        then
-            table.insert(stateCrypto.queueShelves, {
-                samp_line = shelf.samp_line,
-                fill = shelf.percentage,
-                work = shelf.status == "Работает",
-                count = shelf.profit
-            })
-        end
-    end
-
-    if #stateCrypto.queueShelves == 0 then
-        AddChatMessage("Отсутствуют полки для работы", TYPECHATMESSAGES.WARNING)
     end
 
     if processInteractingThread:status() == "suspended"
@@ -451,30 +758,38 @@ function StartProcessInteracting(action)
 end
 
 function ProcessInteracting()
-    for index, value in ipairs(stateCrypto.queueShelves) do
-        while lastIDDialog ~= idDialogs.selectVideoCardItemFlash and lastIDDialog ~= idDialogs.selectVideoCard do
-            wait(100)
-            if not CheckProcessInteracting() then
-                DeactivateProcessesInteracting()
-                return
-            end
-        end
-        sampSendDialogResponse(lastIDDialog, 1, value.samp_line, "")
-        local _oldProgressShelves = stateCrypto.progressShelves
-        while _oldProgressShelves == stateCrypto.progressShelves do
-            wait(100)
-            if not CheckProcessInteracting() then
-                DeactivateProcessesInteracting()
-                return
-            end
+    -- Инициализация
+    stateCrypto.work = true
+
+    local success = true
+
+    -- Обрабатываем дома с банками
+    if #housesBanks > 0 then
+        success = HouseProcessor.processBankHouses()
+        if not success then
+            DeactivateProcessesInteracting()
+            return
         end
     end
 
+    -- Обрабатываем обычные дома или полки напрямую
+    if #houses > 0 then
+        success = HouseProcessor.processRegularHouses()
+    else
+        success = ShelfProcessor.process()
+    end
+
+    if not success then
+        DeactivateProcessesInteracting()
+        return
+    end
+
     DeactivateProcessesInteracting()
+    AddChatMessage("Обработка завершена успешно", TYPECHATMESSAGES.SUCCESS)
 end
 
 function CheckProcessInteracting()
-    return processes.take or processes.fill or processes.on or processes.off
+    return processes.take or processes.fill or processes.on or processes.off or processes.dep
 end
 
 function DeactivateProcessesInteracting()
@@ -484,10 +799,13 @@ function DeactivateProcessesInteracting()
     stateCrypto.queueHouses = {}
     stateCrypto.progressShelves = 0
     stateCrypto.queueShelves = {}
+    stateCrypto.progressHousesBank = 0
+    stateCrypto.queueHousesBank = {}
     processes.on = false
     processes.off = false
     processes.take = false
     processes.fill = false
+    processes.dep = false
 end
 
 -- --------------------------------------------------------
@@ -588,6 +906,8 @@ function ParseHouseData(text)
 
         -- Сначала пробуем паттерн с налогом
         for houseNum, city, tax, cycles, bankNow, bankMax in string.gmatch(line, patternWithTax) do
+            if CheckHouseInBlackList(houseNum) then break end
+
             table.insert(results, {
                 samp_line = lineIndex - 2,
                 house_number = tonumber(houseNum),
@@ -604,6 +924,8 @@ function ParseHouseData(text)
         -- Если не найдено совпадений с налогом, пробуем паттерн без налога
         if not found then
             for houseNum, city, cycles, bankNow, bankMax in string.gmatch(line, patternWithoutTax) do
+                if CheckHouseInBlackList(houseNum) then break end
+
                 table.insert(results, {
                     samp_line = lineIndex - 2,
                     house_number = tonumber(houseNum),
@@ -615,6 +937,36 @@ function ParseHouseData(text)
                     raw_line = line
                 })
             end
+        end
+    end
+
+    return results
+end
+
+function ParseHouseBankData(text)
+    housesBanks = {}
+
+    local results = {}
+    local lines = {}
+
+    -- Разбиваем текст на строки
+    for line in text:gmatch("[^\r\n]+") do
+        table.insert(lines, line)
+    end
+
+    local pattern = "Дом №(%d+)%s*([^%d]+)%s*%$([%d%.,]+)"
+
+    for lineIndex, line in ipairs(lines) do
+        for houseNum, city, bankNow in string.gmatch(line, pattern) do
+            if CheckHouseInBlackList(houseNum) then break end
+
+            table.insert(results, {
+                samp_line = lineIndex - 2,
+                house_number = tonumber(houseNum),
+                city = city:gsub("^%s+", ""):gsub("%s+$", ""),
+                bankNow = bankNow:gsub(",", ""),
+                raw_line = line
+            })
         end
     end
 
@@ -725,6 +1077,7 @@ function AddChatMessage(message, type)
     local _scriptName = "MMT"
     local _pref = "[ ".._scriptName.." ]"
     if type then
+        if type == TYPECHATMESSAGES.SUCCESS then _pref = "[ :true: ".._scriptName.." ]" end
         if type == TYPECHATMESSAGES.SECONDARY then _pref = "[ :paperclip: ".._scriptName.." ]" end
         if type == TYPECHATMESSAGES.WARNING then _pref = "[ :warning: ".._scriptName.." ]" end
         if type == TYPECHATMESSAGES.CRITICAL then _pref = "[ :sos: ".._scriptName.." ]" end
@@ -815,11 +1168,12 @@ local mainFrame = imgui.OnFrame( function() return imguiWindows.main[0] end, fun
 
         imgui.SameLine()
 
-        imgui.CenterText("[MMT] Mining Tool @Mister_Sand")
+        imgui.CenterText("[MMT] Mining Tool | TG: @Mister_Sand")
 
         imgui.SameLine()
 
-        if imgui.RightButton("\t"..fa.CIRCLE_XMARK.."\t") then
+        local _icon = lastIDDialog == idDialogs.selectVideoCardItemFlash and fa.REPLY or fa.CIRCLE_XMARK
+        if imgui.RightButton("\t".._icon.."\t") then
             SwitchMainWindow()
             DeactivateProcessesInteracting()
             sampSendDialogResponse(lastIDDialog, 0, 0, "")
@@ -855,32 +1209,66 @@ end)
 -- =====================================================================================================================
 
 function DrawMainMenu()
-    imgui.Text(u8(string.format("Охлада: BTC - %s | supper BTC - %s | ASC - %s", haveLiquid.btc, haveLiquid.supper_btc, haveLiquid.asc)))
-    imgui.Separator()
-
-    if #houses > 0 then
+    if #housesBanks > 0 then
+        DrawHousesBank()
+    elseif #houses > 0 then
         DrawHouses()
     else
+        imgui.Text(u8(string.format("Охлада: BTC - %s | supper BTC - %s | ASC - %s", haveLiquid.btc, haveLiquid.supper_btc, haveLiquid.asc)))
+        imgui.Separator()
         DrawShelves()
     end
 end
 
 function DrawSettings()
-    imgui.Text(u8(string.format("Работа - %s | Заливать - %s | Собирать - %s", stateCrypto.work, processes.fill, processes.take)))
+    imgui.Text(u8(string.format("Работаю - %s | Заливаю - %s | Собираю - %s | Вкл/выкл - %s", stateCrypto.work, processes.fill, processes.take, (processes.on or processes.off))))
     if stateCrypto.work then
-        if imgui.Button(u8"Отменить процесс") then
+        if imgui.Button(u8"Отменить процесс", imgui.ImVec2(-1, 0)) then
             DeactivateProcessesInteracting()
         end
     end
+    imgui.Separator()
 
-    local _fillFrom = new.float(settings.main.fillFrom)
-    if imgui.SliderFloat(u8("Заливать, когда "..settings.main.fillFrom.." процентов или ниже"), _fillFrom, 0, 100) then
-        settings.main.fillFrom = _fillFrom[0] SaveSettings()
-    end
+
+    imgui.CenterText(u8"Основное")
 
     if imgui.Checkbox(u8"Заменять окно диалога на окно скрипта", new.bool(settings.main.replaceDialog)) then
         settings.main.replaceDialog = not settings.main.replaceDialog SaveSettings()
     end
+    imgui.Text(u8("Заливать, когда "..settings.main.fillFrom.." процентов или ниже:"))
+    imgui.PushItemWidth(-1)
+    local _fillFrom = new.float(settings.main.fillFrom)
+    if imgui.SliderFloat("##Заливать, когда этот процент или ниже", _fillFrom, 0, 100) then
+        settings.main.fillFrom = _fillFrom[0] SaveSettings()
+    end
+    imgui.PopItemWidth()
+
+
+    imgui.Spacing()
+    imgui.CenterText(u8"Черный список домов")
+
+    imgui.Text(u8"Номер дома, который нужно скрыть")
+    if imgui.Button(u8"Добавить", imgui.ImVec2(imgui.GetWindowWidth()/4)) then
+        table.insert(settings.main.blackListHouses, inputBlackHouse[0])
+        SaveSettings()
+    end
+    imgui.SameLine()
+    imgui.PushItemWidth(-1)
+    imgui.InputInt("##numberHouse", inputBlackHouse, 0,0)
+    imgui.PopItemWidth()
+
+    for index, blackHouse in ipairs(settings.main.blackListHouses) do
+        if imgui.Button("X##"..index) then
+            table.remove(settings.main.blackListHouses, index)
+            SaveSettings()
+        end
+        imgui.SameLine()
+        imgui.Text(u8"Дом №"..blackHouse)
+    end
+
+
+    imgui.Spacing()
+    imgui.CenterText(u8"Интерфейс")
 
     local _scrollbarSizeStyle = new.int(settings.style.scrollbarSizeStyle)
     if imgui.SliderInt(u8("Размер скроллбара"), _scrollbarSizeStyle, 10, 50) then
@@ -889,55 +1277,148 @@ function DrawSettings()
     end
 
     local _MONET_DPI_SCALE = new.float(settings.style.scaleUI)
-    if imgui.SliderFloat(u8("DPI"), _MONET_DPI_SCALE, 0, 5) then
+    if imgui.SliderFloat(u8("DPI (Масштаб скрипта)"), _MONET_DPI_SCALE, 0, 5) then
         settings.style.scaleUI = _MONET_DPI_SCALE[0] SaveSettings()
     end
     if imgui.Button(u8"Перезапустите") then
         thisScript():reload()
     end
     imgui.SameLine()
-    imgui.Text(u8("скрипт, чтобы применить /mcrmr"))
+    imgui.Text(u8("скрипт, чтобы применить. Либо команда: /mmtr"))
 
-    for index, value in ipairs(stateCrypto.queueShelves) do
-        imgui.Separator()
-        imgui.Text(u8(string.format("Строка - %s | Заливка - %s | Крипты - %s | Состояние - %s", value.samp_line, value.fill, value.count, value.work)))
+
+    if #stateCrypto.queueShelves > 0 then
+        imgui.Spacing()
+        imgui.CenterText(u8"Тех состояние")
+
+        for index, value in ipairs(stateCrypto.queueShelves) do
+            imgui.Separator()
+            imgui.Text(u8(string.format("Строка - %s | Заливка - %s | Крипты - %s | Состояние - %s", value.samp_line, value.fill, value.count, value.work)))
+        end
     end
 end
 
+function DrawHousesBank()
+    if stateCrypto.work then
+        imgui.ProgressBar(stateCrypto.progressHousesBank/#stateCrypto.queueHousesBank,imgui.ImVec2(-1,0), u8"Дом "..stateCrypto.progressHousesBank.."/"..#stateCrypto.queueHousesBank)
+    end
+
+    if imgui.ButtonClickable(not stateCrypto.work, u8"Заполнить до MAX", imgui.ImVec2(-1, 0)) then
+        StartProcessInteracting("dep")
+    end
+
+    imgui.BeginChild("list", imgui.ImVec2(-1, -1))
+    for i, house in ipairs(housesBanks) do
+        local _bank_now_str = house.bankNow:gsub("[^%d]", "")
+        local bank_now = tonumber(_bank_now_str) or 0
+        local bank_color = COLORS.WHITE
+
+        if bank_now < 5000000 then
+            bank_color = COLORS.RED
+        elseif bank_now < 10000000 then
+            bank_color = COLORS.YELLOW
+        end
+
+        -- Формируем текст для строки
+        local house_text = string.format("Дом №%s (%s) - {%s}Банк: {%s}%s$",
+            house.house_number,
+            house.city,
+            COLORS.WHITE,
+            bank_color,
+            GetCommaValue(house.bankNow)
+        )
+
+        if imgui.SelectableEx(house_text, lastOpenHouse == i, imgui.SelectableFlags.SpanAllColumns) then
+            lastOpenHouse = i
+            sampSendDialogResponse(idDialogs.selectHouse, 1, house.samp_line, "")
+            housesBanks = {}
+            SwitchMainWindow()
+        end
+
+        -- Добавляем небольшой отступ между домами
+        if i < #houses then
+            imgui.Spacing()
+        end
+    end
+    imgui.EndChild()
+end
+
 function DrawHouses()
+    local totalHouse = #houses
+    local lowCycles = 0
+    local lowBank = 0
+
+    for i, house in ipairs(houses) do
+        if house.cycles < 100 then
+            lowCycles = lowCycles + 1
+        end
+        if tonumber(house.bankNow) < 5000000 then
+            lowBank = lowBank + 1
+        end
+    end
+
+    -- Отображение статистики
+    imgui.Text(u8(string.format("Найдено домов: %d", totalHouse)))
+    imgui.SameLine()
+    imgui.TextColoredRGB(string.format("  Мало циклов:{%s} %d", COLORS.RED, lowCycles))
+    imgui.SameLine()
+    imgui.TextColoredRGB(string.format("  Мало денег:{%s} %d", COLORS.YELLOW, lowBank))
+
+    imgui.Separator()
+
+    local button_width = (imgui.GetWindowWidth() - ScaleUI(30)) / 2
+    if imgui.ButtonClickable(not stateCrypto.work, fa.HAND_HOLDING_DOLLAR .. u8"\tСобрать всю прибыль", imgui.ImVec2(button_width, 0)) then
+        StartProcessInteracting("take")
+    end
+    imgui.SameLine()
+    if imgui.ButtonClickable(not stateCrypto.work, fa.TOGGLE_ON .. u8"\tВключить все видеокарты", imgui.ImVec2(-1, 0)) then
+        StartProcessInteracting("on")
+    end
+
+    if stateCrypto.work then
+        imgui.ProgressBar(stateCrypto.progressHouses/#stateCrypto.queueHouses,imgui.ImVec2(-1,0), u8"Дом "..stateCrypto.progressHouses.."/"..#stateCrypto.queueHouses)
+    end
+    if stateCrypto.work then
+        imgui.ProgressBar(stateCrypto.progressShelves/#stateCrypto.queueShelves,imgui.ImVec2(-1,0), u8"Полка "..stateCrypto.progressShelves.."/"..#stateCrypto.queueShelves)
+    end
+
+    imgui.Separator()
+
     imgui.BeginChild("list", imgui.ImVec2(-1, -1))
     for i, house in ipairs(houses) do
         -- Определяем цвета для циклов и банка
-        local cycles_color = house.cycles < 100 and colors.RED or colors.WHITE -- красный если < 100, белый если >= 100
+        local cycles_color = house.cycles < 100 and COLORS.RED or COLORS.WHITE -- красный если < 100, белый если >= 100
 
         local _bank_now_str = house.bankNow:gsub("[^%d]", "")
         local bank_now = tonumber(_bank_now_str) or 0
-        local bank_color = colors.WHITE
+        local bank_color = COLORS.WHITE
 
         if bank_now < 5000000 then
-            bank_color = colors.RED
+            bank_color = COLORS.RED
         elseif bank_now < 10000000 then
-            bank_color = colors.YELLOW
+            bank_color = COLORS.YELLOW
         end
+        
+        -- Формируем текст для строки
+        local house_text = string.format("Дом №%s (%s) - Налог: %s  {%s}Циклов: {%s}%s  {%s}Банк: {%s}%s{%s}/%s$",
+            house.house_number,
+            house.city,
+            house.tax,
+            COLORS.WHITE,
+            cycles_color,
+            GetCommaValue(house.cycles),
+            COLORS.WHITE,
+            bank_color,
+            GetCommaValue(house.bankNow),
+            COLORS.WHITE,
+            GetCommaValue(house.bankMax)
+        )
 
-        if imgui.Button(u8("Открыть##")..i) then
+        if imgui.SelectableEx(house_text, lastOpenHouse == i, imgui.SelectableFlags.SpanAllColumns) then
+            lastOpenHouse = i
             sampSendDialogResponse(idDialogs.selectHouse, 1, house.samp_line, "")
             houses = {}
         end
-        imgui.SameLine()
-
-        -- Заголовок дома
-        imgui.Text(u8(string.format("Дом №%s (%s) - Налог: %s", 
-            house.house_number, house.city, house.tax)))
-
-        -- Строка с циклами и банком в одной строке
-        imgui.SameLine(0, 0)
-        imgui.TextColoredRGB(string.format("  {%s}Циклов:{%s} %s",
-            colors.WHITE, cycles_color, GetCommaValue(house.cycles)))
-
-        imgui.SameLine()
-        imgui.TextColoredRGB(string.format("  {%s}Банк:{%s} %s/%s$",
-            colors.WHITE, bank_color, GetCommaValue(house.bankNow), GetCommaValue(house.bankMax)))
 
         -- Добавляем небольшой отступ между домами
         if i < #houses then
@@ -970,36 +1451,36 @@ function DrawShelves()
     imgui.Text(u8(string.format("Найдено полок: %d", total_shelves)))
     imgui.SameLine()
     imgui.TextColoredRGB(string.format("  Работают:{%s} %d",
-        working_shelves > 0 and colors.GREEN or colors.RED,
+        working_shelves > 0 and COLORS.GREEN or COLORS.RED,
         working_shelves))
     imgui.SameLine()
-    imgui.TextColoredRGB(string.format("  Не работают:{%s} %d", colors.RED, not_working_shelves))
-    imgui.TextColoredRGB(string.format("Нет или мало охлаждайки:{%s} %d", colors.YELLOW, low_liauid))
+    imgui.TextColoredRGB(string.format("  Не работают:{%s} %d", COLORS.RED, not_working_shelves))
+    imgui.TextColoredRGB(string.format("Нет или мало охлаждайки:{%s} %d", COLORS.YELLOW, low_liauid))
 
     imgui.Spacing()
 
-    if stateCrypto.work then
-        imgui.ProgressBar(stateCrypto.progressShelves/#stateCrypto.queueShelves,imgui.ImVec2(-1,0), stateCrypto.progressShelves.."/"..#stateCrypto.queueShelves)
-    end
-
     -- Первая строка кнопок: Собрать и Залить
-    local button_width = (imgui.GetWindowWidth() - ScaleUI(30)) / 2 -- ширина для 2 кнопок в ряд
+    local button_width = (imgui.GetWindowWidth() - ScaleUI(30)) / 2
 
-    if imgui.Button(fa.HAND_HOLDING_DOLLAR .. u8" Собрать всё", imgui.ImVec2(button_width, 0)) then
+    if imgui.ButtonClickable(not stateCrypto.work, fa.HAND_HOLDING_DOLLAR .. u8"\tСобрать всё", imgui.ImVec2(button_width, 0)) then
         StartProcessInteracting("take")
     end
     imgui.SameLine()
-    if imgui.Button(fa.FILL_DRIP .. u8" Залить всё", imgui.ImVec2(-1, 0)) then
+    if imgui.ButtonClickable(not stateCrypto.work, fa.FILL_DRIP .. u8"\tЗалить всё", imgui.ImVec2(-1, 0)) then
         StartProcessInteracting("fill")
     end
 
     -- Вторая строка кнопок: Включить и Отключить
-    if imgui.Button(fa.TOGGLE_ON .. u8" Включить всё", imgui.ImVec2(button_width, 0)) then
+    if imgui.ButtonClickable(not stateCrypto.work, fa.TOGGLE_ON .. u8"\tВключить всё", imgui.ImVec2(button_width, 0)) then
         StartProcessInteracting("on")
     end
     imgui.SameLine()
-    if imgui.Button(fa.TOGGLE_OFF .. u8" Отключить всё", imgui.ImVec2(-1, 0)) then
+    if imgui.ButtonClickable(not stateCrypto.work, fa.TOGGLE_OFF .. u8"\tОтключить всё", imgui.ImVec2(-1, 0)) then
         StartProcessInteracting("off")
+    end
+
+    if stateCrypto.work then
+        imgui.ProgressBar(stateCrypto.progressShelves/#stateCrypto.queueShelves,imgui.ImVec2(-1,0), stateCrypto.progressShelves.."/"..#stateCrypto.queueShelves)
     end
 
     imgui.Separator()
@@ -1014,18 +1495,18 @@ function DrawShelves()
             imgui.Text(u8(string.format("=== Стойка №%d ===", shelf_in_rack)))
         end
 
-        local cooling_color = colors.WHITE
+        local cooling_color = COLORS.WHITE
         if shelf.percentage == 0 then
-            cooling_color = colors.RED
-        elseif shelf.percentage < 50 then
-            cooling_color = colors.YELLOW
+            cooling_color = COLORS.RED
+        elseif shelf.percentage <= settings.main.fillFrom then
+            cooling_color = COLORS.YELLOW
         end
 
-        local profit_color = shelf.profit > 1 and colors.GREEN or colors.WHITE -- зеленый если > 1, белый если <= 1
+        local profit_color = shelf.profit > 1 and COLORS.GREEN or COLORS.WHITE -- зеленый если > 1, белый если <= 1
 
-        local gpu_color = colors.RED
+        local gpu_color = COLORS.RED
         if shelf.status:find("Работает") then
-            gpu_color = colors.GREEN
+            gpu_color = COLORS.GREEN
         end
 
         if imgui.Button(u8(string.format("Открыть##%d", i))) then
@@ -1140,6 +1621,15 @@ function imgui.TextColoredRGB(text)
         end
     end
     render_text(text)
+end
+
+function imgui.SelectableEx(label, selected, flags, imVecSize)
+    if imgui.Selectable("##"..label, selected, flags, imVecSize) then
+        return true
+    end
+    imgui.SameLine()
+    imgui.SetCursorPosX(imgui.GetCursorPosX() + imgui.GetStyle().ItemInnerSpacing.x)
+    imgui.TextColoredRGB(label)
 end
 
 -- --------------------------------------------------------
