@@ -4,7 +4,7 @@
 
 script_authors('Sand')
 script_description('Mining assistant TG: @Mister_Sand')
-script_version("0.1")
+script_version("1.1")
 
 -- =====================================================================================================================
 --                                                          Import
@@ -49,11 +49,6 @@ if MONET_DPI_SCALE == nil then MONET_DPI_SCALE = 1.0 ISMONETLOADER = false SEPOR
 local folderConfig = 'config'..SEPORATORPATCH -- Folder config
 local PATCHCONFIG = folderConfig..'MMT CFGs'..SEPORATORPATCH  -- Main folder cfgs
 
-local TIMEOUT_DIALOG = 10
-local MAX_BANK_AMOUNT = 19999999 - 10000
-local WAIT_INTERVAL = 100
-local SHELF_TIMEOUT = 10
-
 local COLORS = {
     WHITE = "FFFFFF",
     RED = "FF3333",
@@ -86,7 +81,15 @@ local defaultSettings = {
             debug = false,
         },
         -- Черный список домов, которые нужно скрыть
-        blackListHouses = {}
+        blackListHouses = {},
+        maxBankAmount = 19999999 - 10000,
+    },
+    deley = {
+        timeoutDialog = 10,
+        waitInterval = 10,
+        timeoutShelf = 10,
+        -- Ждать перед отправкой ответа на диалог
+        waitRun = 0,
     },
     style = {
         -- масштаб интерфейса
@@ -150,6 +153,8 @@ local stateCrypto = {
     waitFill = false,
     -- Ожидаем пополнения дома
     waitDep = false,
+    -- Количество, которое снимаем крипты
+    takeCount = 0,
     -- Прогресс домов
     progressHouses = 0,
     -- Список домов в очереди
@@ -212,25 +217,27 @@ local ShelfProcessor = {}
 -- =====================================================================================================================
 
 imgui.OnInitialize(function()
-    fa.Init()
-
-    if not ISMONETLOADER then
-        SetScaleUI()
-    end
-
-    SetStyle()
-end)
-
-function main()
-    while not isSampAvailable() do wait(0) end
-
-    LoadSettings()
-
     if ISMONETLOADER and settings.style.scaleUI ~= 1.0 then
         MONET_DPI_SCALE = settings.style.scaleUI
     elseif ISMONETLOADER then
         settings.style.scaleUI = MONET_DPI_SCALE
     end
+
+    if not ISMONETLOADER then
+        SetScaleUI()
+    end
+
+    SetStyle(ISMONETLOADER)
+
+    if ISMONETLOADER then
+        fa.Init(14*MONET_DPI_SCALE)
+    else
+        fa.Init(14)
+    end
+end)
+
+function main()
+    while not isSampAvailable() do wait(0) end
 
     sampRegisterChatCommand("mmt", function ()
         SwitchMainWindow()
@@ -284,6 +291,10 @@ function sampev.onServerMessage(color, text)
             DeactivateProcessesInteracting()
             AddChatMessage("Вы можете добавить данный дом в чёрный список, чтобы его скрыть", TYPECHATMESSAGES.SECONDARY)
         end
+
+        if text:find("У Вас недостаточно денежных средств!") and color == -1104335361 then
+            DeactivateProcessesInteracting()
+        end
     end
 end
 
@@ -301,15 +312,16 @@ function sampev.onShowDialog(dialogId, style, title, button1, button2, text)
         end
 
         _dep = tonumber(_dep)-1 > 10000000 and 10000000 or tonumber(_dep)-1
-        sampSendDialogResponse(dialogId, 1, 0, tostring(_dep))
+        DialogUtils.waitAndSendDialogResponse(dialogId, 1, 0, tostring(_dep))
         stateCrypto.queueHousesBank[stateCrypto.progressHousesBank].bankNow = stateCrypto.queueHousesBank[stateCrypto.progressHousesBank].bankNow + _dep
         return not settings.main.replaceDialog
     end
 
     if stateCrypto.work and processes.take and title:find("Вывод прибыли видеокарты") then
-        local continue = stateCrypto.queueShelves[stateCrypto.progressShelves].count - math.floor(stateCrypto.queueShelves[stateCrypto.progressShelves].count)
+        local continue = stateCrypto.queueShelves[stateCrypto.progressShelves].count - stateCrypto.takeCount
         stateCrypto.queueShelves[stateCrypto.progressShelves].count = continue
-        sampSendDialogResponse(dialogId, 1, 0, "")
+        DialogUtils.waitAndSendDialogResponse(dialogId, 1, 0, "")
+        stateCrypto.takeCount = 0
         return not settings.main.replaceDialog
     end
 
@@ -321,10 +333,12 @@ function sampev.onShowDialog(dialogId, style, title, button1, button2, text)
 
             if processes.take then
                 if  value.count > 0 and (value.action == "take_btc" or value.action == "take_asc") then
-                    sampSendDialogResponse(dialogId, 1, value.samp_line, "")
-                elseif math.floor(stateCrypto.queueShelves[stateCrypto.progressShelves].count) == 0 then
+                    stateCrypto.takeCount = value.count
+                    DialogUtils.waitAndSendDialogResponse(dialogId, 1, value.samp_line, "")
+                    return not settings.main.replaceDialog
+                elseif math.floor(stateCrypto.queueShelves[stateCrypto.progressShelves].count) <= 0 then
                     stateCrypto.progressShelves = stateCrypto.progressShelves +1
-                    sampSendDialogResponse(dialogId, 0, 0, "")
+                    DialogUtils.waitAndSendDialogResponse(dialogId, 0, 0, "")
                     return not settings.main.replaceDialog
                 end
             end
@@ -332,30 +346,30 @@ function sampev.onShowDialog(dialogId, style, title, button1, button2, text)
             if processes.fill and value.action == "fill" then
                 if stateCrypto.queueShelves[stateCrypto.progressShelves].fill > settings.main.fillFrom then
                     stateCrypto.progressShelves = stateCrypto.progressShelves +1
-                    sampSendDialogResponse(dialogId, 0, 0, "")
+                    DialogUtils.waitAndSendDialogResponse(dialogId, 0, 0, "")
                     return not settings.main.replaceDialog
                 end
-                sampSendDialogResponse(dialogId, 1, value.samp_line, "")
+                DialogUtils.waitAndSendDialogResponse(dialogId, 1, value.samp_line, "")
                 return not settings.main.replaceDialog
             end
 
             if processes.on and value.action == "on" then
-                sampSendDialogResponse(dialogId, 1, value.samp_line, "")
+                DialogUtils.waitAndSendDialogResponse(dialogId, 1, value.samp_line, "")
                 return not settings.main.replaceDialog
             elseif processes.on and value.action == "off" then
                 stateCrypto.queueShelves[stateCrypto.progressShelves].work = true
                 stateCrypto.progressShelves = stateCrypto.progressShelves +1
-                sampSendDialogResponse(dialogId, 0, 0, "")
+                DialogUtils.waitAndSendDialogResponse(dialogId, 0, 0, "")
                 return not settings.main.replaceDialog
             end
 
             if processes.off and value.action == "off" then
-                sampSendDialogResponse(dialogId, 1, value.samp_line, "")
+                DialogUtils.waitAndSendDialogResponse(dialogId, 1, value.samp_line, "")
                 return not settings.main.replaceDialog
             elseif processes.off and value.action == "on" then
                 stateCrypto.queueShelves[stateCrypto.progressShelves].work = false
                 stateCrypto.progressShelves = stateCrypto.progressShelves +1
-                sampSendDialogResponse(dialogId, 0, 0, "")
+                DialogUtils.waitAndSendDialogResponse(dialogId, 0, 0, "")
                 return not settings.main.replaceDialog
             end
         end
@@ -370,17 +384,17 @@ function sampev.onShowDialog(dialogId, style, title, button1, button2, text)
             if value.action == "btc" and value.count > 0 then
                 haveLiquid.btc = value.count
                 stateCrypto.waitFill = true
-                sampSendDialogResponse(dialogId, 1, value.samp_line, "")
+                DialogUtils.waitAndSendDialogResponse(dialogId, 1, value.samp_line, "")
                 return not settings.main.replaceDialog
             elseif value.action == "supper_btc" and value.count > 0 then
                 haveLiquid.supper_btc = value.count
                 stateCrypto.waitFill = true
-                sampSendDialogResponse(dialogId, 1, value.samp_line, "")
+                DialogUtils.waitAndSendDialogResponse(dialogId, 1, value.samp_line, "")
                 return not settings.main.replaceDialog
             elseif value.action == "asc" and value.count > 0 then
                 haveLiquid.asc = value.count
                 stateCrypto.waitFill = true
-                sampSendDialogResponse(dialogId, 1, value.samp_line, "")
+                DialogUtils.waitAndSendDialogResponse(dialogId, 1, value.samp_line, "")
                 return not settings.main.replaceDialog
             else
                 haveLiquid.btc = 0
@@ -463,10 +477,10 @@ end
 -- --------------------------------------------------------
 
 function DialogUtils.waitForDialog(expectedDialogId, timeoutSeconds)
-    local timeout = os.clock() + (timeoutSeconds or TIMEOUT_DIALOG)
+    local timeout = os.clock() + (timeoutSeconds or settings.deley.timeoutDialog)
 
     while lastIDDialog ~= expectedDialogId do
-        wait(WAIT_INTERVAL)
+        wait(settings.deley.waitInterval)
 
         if os.clock() > timeout then
             return false, "Timeout waiting for dialog " .. tostring(expectedDialogId)
@@ -481,7 +495,7 @@ function DialogUtils.waitForDialog(expectedDialogId, timeoutSeconds)
 end
 
 function DialogUtils.waitForAnyDialog(expectedDialogIds, timeoutSeconds)
-    local timeout = os.clock() + (timeoutSeconds or TIMEOUT_DIALOG)
+    local timeout = os.clock() + (timeoutSeconds or settings.deley.timeoutDialog)
 
     while true do
         for _, dialogId in ipairs(expectedDialogIds) do
@@ -490,7 +504,7 @@ function DialogUtils.waitForAnyDialog(expectedDialogIds, timeoutSeconds)
             end
         end
 
-        wait(WAIT_INTERVAL)
+        wait(settings.deley.waitInterval)
 
         if os.clock() > timeout then
             local dialogNames = table.concat(expectedDialogIds, ", ")
@@ -507,9 +521,9 @@ function DialogUtils.sendResponseAndWait(dialogId, button, listitem, input, wait
     sampSendDialogResponse(dialogId, button, listitem, input or "")
 
     if waitCondition then
-        local timeout = os.clock() + TIMEOUT_DIALOG
+        local timeout = os.clock() + settings.deley.timeoutDialog
         while not waitCondition() do
-            wait(WAIT_INTERVAL)
+            wait(settings.deley.waitInterval)
             if os.clock() > timeout then
                 return false, "Timeout waiting for condition"
             end
@@ -520,6 +534,22 @@ function DialogUtils.sendResponseAndWait(dialogId, button, listitem, input, wait
     end
 
     return true
+end
+
+-- Запускает поток, в котором ждем время на ответ и отвечаем
+function DialogUtils.waitAndSendDialogResponse(dialogId, button, listitem, input, waitRun)
+    lua_thread.create(function ()
+        waitRun = waitRun or settings.deley.waitRun
+
+        local timeout = os.clock() + waitRun/1000
+        while os.clock() < timeout do
+            wait(settings.deley.waitInterval)
+        -- AddChatMessage(os.clock().." - "..timeout)
+
+        end
+
+        sampSendDialogResponse(dialogId, button, listitem, input or "")
+    end)
 end
 
 -- --------------------------------------------------------
@@ -542,7 +572,7 @@ function ShelfProcessor.filterShelves()
                 samp_line = shelf.samp_line,
                 fill = shelf.percentage,
                 work = shelf.status == "Работает",
-                count = shelf.profit
+                count = shelf.profit + (shelf.profit2 or 0)
             })
         end
     end
@@ -566,7 +596,7 @@ function ShelfProcessor.process()
         })
 
         if not success then
-            AddChatMessage("Ошибка ожидания диалога полок: " .. error, TYPECHATMESSAGES.CRITICAL)
+            AddChatMessage("Ошибка ожидания диалога полок: " .. dialogId, TYPECHATMESSAGES.CRITICAL)
             return false
         end
 
@@ -596,7 +626,7 @@ function HouseProcessor.filterBankHouses()
     local filtered = {}
 
     for _, house in ipairs(housesBanks) do
-        if tonumber(house.bankNow) < MAX_BANK_AMOUNT then
+        if tonumber(house.bankNow) <= settings.main.maxBankAmount then
             table.insert(filtered, {
                 samp_line = house.samp_line,
                 bankNow = house.bankNow
@@ -627,9 +657,9 @@ function HouseProcessor.processBankHouses()
         stateCrypto.waitDep = true
 
         -- Ждем завершения операции депозита
-        local timeout = os.clock() + TIMEOUT_DIALOG
+        local timeout = os.clock() + settings.deley.timeoutDialog
         while stateCrypto.waitDep do
-            wait(WAIT_INTERVAL)
+            wait(settings.deley.waitInterval)
             if os.clock() > timeout then
                 AddChatMessage("Timeout при ожидании депозита", TYPECHATMESSAGES.CRITICAL)
                 return false
@@ -640,13 +670,13 @@ function HouseProcessor.processBankHouses()
         end
 
         -- Дополнительная проверка и повторная операция если нужно
-        if tonumber(houseData.bankNow) < MAX_BANK_AMOUNT then
+        if tonumber(houseData.bankNow) <= settings.main.maxBankAmount then
             sampSendDialogResponse(lastIDDialog, 1, houseData.samp_line, "")
             stateCrypto.waitDep = true
 
-            timeout = os.clock() + TIMEOUT_DIALOG
+            timeout = os.clock() + settings.deley.timeoutDialog
             while stateCrypto.waitDep do
-                wait(WAIT_INTERVAL)
+                wait(settings.deley.waitInterval)
                 if os.clock() > timeout then
                     AddChatMessage("Timeout при повторном депозите", TYPECHATMESSAGES.CRITICAL)
                     return false
@@ -688,7 +718,7 @@ function HouseProcessor.processRegularHouses()
         lastOpenHouse = index
 
         -- Ждем загрузки полок с таймаутом
-        local timeout = os.clock() + SHELF_TIMEOUT
+        local timeout = os.clock() + settings.deley.timeoutShelf
         local shelvesLoaded = false
 
         while not shelvesLoaded do
@@ -716,7 +746,7 @@ function HouseProcessor.processRegularHouses()
         -- Закрываем диалог дома
         while lastIDDialog ~= idDialogs.selectHouse do
             sampSendDialogResponse(lastIDDialog, 0, 0, "")
-            wait(WAIT_INTERVAL)
+            wait(settings.deley.waitInterval)
 
             if not CheckProcessInteracting() then
                 return false
@@ -795,6 +825,7 @@ end
 function DeactivateProcessesInteracting()
     stateCrypto.work = false
     stateCrypto.waitFill = false
+    stateCrypto.takeCount = 0
     stateCrypto.progressHouses = 0
     stateCrypto.queueHouses = {}
     stateCrypto.progressShelves = 0
@@ -853,6 +884,8 @@ function MergeSettings(dest, source)
     end
 end
 
+LoadSettings()
+
 -- --------------------------------------------------------
 --                           Save
 -- --------------------------------------------------------
@@ -895,17 +928,17 @@ function ParseHouseData(text)
         table.insert(lines, line)
     end
 
-    -- Паттерн для извлечения данных о полке с налогом
-    local patternWithTax = "Дом №(%d+)%s*([^%d]+)%s*{%w+}([%d]+)%s*([%d]+)%s*циклов%s*%(%$([%d,]+) / %$([%d%.,]+)%)"
+    -- Паттерн для извлечения данных о доме с налогом (поддержка разных валют)
+    local patternWithTax = "Дом №(%d+)%s*([^%d]+)%s*{%w+}([%d]+)%s*([%d]+)%s*циклов%s*%(([VC]*%$)([%d,]+) / [VC]*%$([%d%.,]+)%)"
 
-    -- Паттерн для извлечения данных о полке без налога
-    local patternWithoutTax = "Дом №(%d+)%s*([^%d]+)%s*([%d]+)%s*циклов%s*%(%$([%d,]+) / %$([%d%.,]+)%)"
+    -- Паттерн для извлечения данных о доме без налога (поддержка разных валют)
+    local patternWithoutTax = "Дом №(%d+)%s*([^%d]+)%s*([%d]+)%s*циклов%s*%(([VC]*%$)([%d,]+) / [VC]*%$([%d%.,]+)%)"
 
     for lineIndex, line in ipairs(lines) do
         local found = false
 
         -- Сначала пробуем паттерн с налогом
-        for houseNum, city, tax, cycles, bankNow, bankMax in string.gmatch(line, patternWithTax) do
+        for houseNum, city, tax, cycles, currency, bankNow, bankMax in string.gmatch(line, patternWithTax) do
             if CheckHouseInBlackList(houseNum) then break end
 
             table.insert(results, {
@@ -914,6 +947,7 @@ function ParseHouseData(text)
                 city = city:gsub("^%s+", ""):gsub("%s+$", ""),
                 tax = tonumber(tax),
                 cycles = tonumber(cycles),
+                currency = currency,
                 bankNow = bankNow:gsub(",", ""),
                 bankMax = bankMax:gsub(",", ""),
                 raw_line = line
@@ -923,7 +957,7 @@ function ParseHouseData(text)
 
         -- Если не найдено совпадений с налогом, пробуем паттерн без налога
         if not found then
-            for houseNum, city, cycles, bankNow, bankMax in string.gmatch(line, patternWithoutTax) do
+            for houseNum, city, cycles, currency, bankNow, bankMax in string.gmatch(line, patternWithoutTax) do
                 if CheckHouseInBlackList(houseNum) then break end
 
                 table.insert(results, {
@@ -932,6 +966,7 @@ function ParseHouseData(text)
                     city = city:gsub("^%s+", ""):gsub("%s+$", ""),
                     tax = nil,
                     cycles = tonumber(cycles),
+                    currency = currency,
                     bankNow = bankNow:gsub(",", ""),
                     bankMax = bankMax:gsub(",", ""),
                     raw_line = line
@@ -983,22 +1018,48 @@ function ParseShelfData(text)
         table.insert(lines, line)
     end
 
-    -- Паттерн для извлечения данных о полке
-    local pattern = "Полка №(%d+)%s*|%s*{(%w+)}([^%d]+)([%d%.]+)%s+(%w+)%s+(%d+)%s+уровень%s+([%d%.]+)"
+    -- Паттерн для полки с одной валютой
+    local patternSingle = "Полка №(%d+)%s*|%s*{(%w+)}([^%d]+)([%d%.]+)%s+(%w+)%s+(%d+)%s+уровень%s+([%d%.]+)"
+
+    -- Паттерн для полки с двумя валютами
+    local patternDouble = "Полка №(%d+)%s*|%s*{(%w+)}([^%d]+)([%d%.]+)%s+(%w+)%s*|%s*([%d%.]+)%s+(%w+)%s+(%d+)%s+уровень%s+([%d%.]+)"
 
     for lineIndex, line in ipairs(lines) do
-        for shelfNum, colorCode, status, profit, currency, level, percentage in string.gmatch(line, pattern) do
+        local found = false
+
+        -- Сначала пробуем паттерн с двумя валютами
+        for shelfNum, colorCode, status, profit1, currency1, profit2, currency2, level, percentage in string.gmatch(line, patternDouble) do
             table.insert(results, {
                 shelf_number = tonumber(shelfNum),
                 samp_line = lineIndex - 2,
                 status = status:gsub("^%s+", ""):gsub("%s+$", ""),
                 color_code = colorCode,
-                profit = tonumber(profit),
-                currency = currency,
+                profit = tonumber(profit1),
+                currency = currency1,
+                profit2 = tonumber(profit2),
+                currency2 = currency2,
                 level = tonumber(level),
                 percentage = tonumber(percentage),
                 raw_line = line
             })
+            found = true
+        end
+
+        -- Если не найдено, пробуем паттерн с одной валютой
+        if not found then
+            for shelfNum, colorCode, status, profit, currency, level, percentage in string.gmatch(line, patternSingle) do
+                table.insert(results, {
+                    shelf_number = tonumber(shelfNum),
+                    samp_line = lineIndex - 2,
+                    status = status:gsub("^%s+", ""):gsub("%s+$", ""),
+                    color_code = colorCode,
+                    profit = tonumber(profit),
+                    currency = currency,
+                    level = tonumber(level),
+                    percentage = tonumber(percentage),
+                    raw_line = line
+                })
+            end
         end
     end
 
@@ -1229,6 +1290,7 @@ function DrawSettings()
     end
     imgui.Separator()
 
+    imgui.BeginChild("settings", imgui.ImVec2(-1, -1))
 
     imgui.CenterText(u8"Основное")
 
@@ -1241,6 +1303,39 @@ function DrawSettings()
     if imgui.SliderFloat("##Заливать, когда этот процент или ниже", _fillFrom, 0, 100) then
         settings.main.fillFrom = _fillFrom[0] SaveSettings()
     end
+    imgui.PopItemWidth()
+
+    imgui.Spacing()
+    imgui.CenterText(u8"Задержки")
+
+    imgui.PushItemWidth(imgui.GetWindowWidth()/2)
+
+    -- todo Нужно доделать, поменять еще в диалогах макс закид
+    -- local _maxBankAmount = new.int(settings.main.maxBankAmount)
+    -- if imgui.SliderInt(u8("Заполнять до"), _maxBankAmount, 10000, 19999999-10000) then
+    --     settings.main.maxBankAmount = _maxBankAmount[0] SaveSettings()
+    -- end
+
+    local _timeoutDialog = new.int(settings.deley.timeoutDialog)
+    if imgui.SliderInt(u8("Ожидание ответа диалога (сек)"), _timeoutDialog, 1, 30) then
+        settings.deley.timeoutDialog = _timeoutDialog[0] SaveSettings()
+    end
+
+    local _waitInterval = new.int(settings.deley.waitInterval)
+    if imgui.SliderInt(u8("Интервал проверки (миллисекунды)"), _waitInterval, 1, 100) then
+        settings.deley.waitInterval = _waitInterval[0] SaveSettings()
+    end
+
+    local _timeoutShelf = new.int(settings.deley.timeoutShelf)
+    if imgui.SliderInt(u8("Ожидание ответа от полок (сек)"), _timeoutShelf, 1, 30) then
+        settings.deley.timeoutShelf = _timeoutShelf[0] SaveSettings()
+    end
+
+    local _waitRun = new.int(settings.deley.waitRun)
+    if imgui.SliderInt(u8("Ожидать перед ответом на диалог (миллисекунды)"), _waitRun, 1, 100) then
+        settings.deley.waitRun = _waitRun[0] SaveSettings()
+    end
+
     imgui.PopItemWidth()
 
 
@@ -1285,6 +1380,7 @@ function DrawSettings()
     end
     imgui.SameLine()
     imgui.Text(u8("скрипт, чтобы применить. Либо команда: /mmtr"))
+    imgui.Text(u8("Сбросить масштаб, команда: /mmtsr"))
 
 
     if #stateCrypto.queueShelves > 0 then
@@ -1296,6 +1392,8 @@ function DrawSettings()
             imgui.Text(u8(string.format("Строка - %s | Заливка - %s | Крипты - %s | Состояние - %s", value.samp_line, value.fill, value.count, value.work)))
         end
     end
+
+    imgui.EndChild()
 end
 
 function DrawHousesBank()
@@ -1398,9 +1496,9 @@ function DrawHouses()
         elseif bank_now < 10000000 then
             bank_color = COLORS.YELLOW
         end
-        
+
         -- Формируем текст для строки
-        local house_text = string.format("Дом №%s (%s) - Налог: %s  {%s}Циклов: {%s}%s  {%s}Банк: {%s}%s{%s}/%s$",
+        local house_text = string.format("Дом №%s (%s) - Налог: %s  {%s}Циклов: {%s}%s  {%s}Банк: {%s}%s{%s}/%s%s",
             house.house_number,
             house.city,
             house.tax,
@@ -1411,7 +1509,8 @@ function DrawHouses()
             bank_color,
             GetCommaValue(house.bankNow),
             COLORS.WHITE,
-            GetCommaValue(house.bankMax)
+            GetCommaValue(house.bankMax),
+            house.currency
         )
 
         if imgui.SelectableEx(house_text, lastOpenHouse == i, imgui.SelectableFlags.SpanAllColumns) then
@@ -1502,12 +1601,12 @@ function DrawShelves()
             cooling_color = COLORS.YELLOW
         end
 
-        local profit_color = shelf.profit > 1 and COLORS.GREEN or COLORS.WHITE -- зеленый если > 1, белый если <= 1
-
         local gpu_color = COLORS.RED
         if shelf.status:find("Работает") then
             gpu_color = COLORS.GREEN
         end
+
+        local profit_color = shelf.profit > 1 and COLORS.GREEN or COLORS.WHITE -- зеленый если > 1, белый если <= 1
 
         if imgui.Button(u8(string.format("Открыть##%d", i))) then
             sampSendDialogResponse(lastIDDialog, 1, shelf.samp_line, "")
@@ -1515,12 +1614,21 @@ function DrawShelves()
         end
         imgui.SameLine()
 
-        imgui.TextColoredRGB(string.format("Полка №%d Ур.%d {%s}%s {%s}%.6f %s {%s}%.1f%%",
-            shelf.shelf_number,
-            shelf.level,
-            gpu_color, shelf.status,
-            profit_color, shelf.profit, shelf.currency,
-            cooling_color, shelf.percentage))
+        if shelf.profit2 then
+            imgui.TextColoredRGB(string.format("Полка №%d Ур.%d {%s}%s {%s}%.6f %s | %.6f %s {%s}%.1f%%",
+                shelf.shelf_number,
+                shelf.level,
+                gpu_color, shelf.status,
+                profit_color, shelf.profit, shelf.currency, shelf.profit2, shelf.currency2,
+                cooling_color, shelf.percentage))
+        else
+            imgui.TextColoredRGB(string.format("Полка №%d Ур.%d {%s}%s {%s}%.6f %s {%s}%.1f%%",
+                shelf.shelf_number,
+                shelf.level,
+                gpu_color, shelf.status,
+                profit_color, shelf.profit, shelf.currency,
+                cooling_color, shelf.percentage))
+        end
     end
     imgui.EndChild()
 end
@@ -1661,8 +1769,38 @@ local function MainStyle()
     return colors, clr, ImVec4
 end
 
-function SetStyle()
-    local colors, clr, ImVec4 = MainStyle()
+local function MainStyleMobile()
+    settings.style.colorChat, settings.style.colorMessage = '8cbf91', 0xFF8cbf91
+
+    local style = imgui.GetStyle()
+    local colors = style.Colors
+    local clr = imgui.Col
+    local ImVec4 = imgui.ImVec4
+    local ImVec2 = imgui.ImVec2
+    style.WindowPadding = ImVec2(8, 8)
+    style.WindowRounding = 10*MONET_DPI_SCALE
+    style.ChildRounding = 8*MONET_DPI_SCALE
+    style.FramePadding = ImVec2(6, 4)
+    style.FrameRounding = 8*MONET_DPI_SCALE
+    style.ItemSpacing = ImVec2(6*MONET_DPI_SCALE, 6*MONET_DPI_SCALE)
+    style.ItemInnerSpacing = ImVec2(4, 4)
+    style.IndentSpacing = 21
+    style.ScrollbarSize = settings.style.scrollbarSizeStyle
+    style.ScrollbarRounding = 13*MONET_DPI_SCALE
+    style.GrabMinSize = 8
+    style.GrabRounding = 1*MONET_DPI_SCALE
+    style.WindowTitleAlign = ImVec2(0.5, 0.5)
+    style.ButtonTextAlign = ImVec2(0.5, 0.5)
+    return colors, clr, ImVec4
+end
+
+function SetStyle(mobile)
+    local colors, clr, ImVec4
+    if mobile then
+        colors, clr, ImVec4 = MainStyleMobile()
+    else
+        colors, clr, ImVec4 = MainStyle()
+    end
 
     local mainColor = settings.style.mainColor
     local textColor = settings.style.textColor
