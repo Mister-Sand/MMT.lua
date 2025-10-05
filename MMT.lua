@@ -25,6 +25,7 @@ local sampevSuccess,    sampev      = CheckLibrary('lib.samp.events')
 local jsonSuccess,      json        = CheckLibrary('cjson')
 local lfsSuccess,       lfs         = CheckLibrary('lfs')
 local faSuccess,        fa          = CheckLibrary('fAwesome6_solid')
+local keysSuccess,      keys        = CheckLibrary('vkeys')
 
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
@@ -83,6 +84,10 @@ local defaultSettings = {
         -- Черный список домов, которые нужно скрыть
         blackListHouses = {},
         maxBankAmount = 19999999 - 10000,
+        -- Закрывать ли на ESC
+        closeOnESC = true,
+        -- Скрывать текст полученной крипты
+        hideMessagesCollect = true,
     },
     deley = {
         timeoutDialog = 10,
@@ -167,6 +172,11 @@ local stateCrypto = {
     progressHousesBank = 0,
     -- Список домов банка в очереди
     queueHousesBank = {},
+    -- Идентификатор текущего дома (номер) и валюта текущего take
+    currentHouseId = nil,
+    takeCurrency = nil,
+    -- Тип текущей карты при работе с полкой/охлаждайкой: "BTC" | "ASC" | "ASIC" | nil
+    currentCardType = nil,
 }
 
 local processes = {
@@ -186,6 +196,12 @@ local haveLiquid = {
     btc = 0,
     supper_btc = 0,
     asc = 0,
+}
+
+-- Статистика по сбору
+local collectStats = {
+    total = { BTC = 0, ASC = 0 },
+    house = {}  -- [house_number] = { BTC = 0, ASC = 0 }
 }
 
 -- Доступные полки
@@ -287,13 +303,24 @@ function sampev.onServerMessage(color, text)
             stateCrypto.waitDep = false
         end
 
-        if text:find("В этом доме нет подвала с вентиляцией или он еще не достроен.") and color == -1104335361 then
+        if text:find("В этом доме нет подвала с вентиляцией или он еще не достроен") and color == -1104335361 then
             DeactivateProcessesInteracting()
             AddChatMessage("Вы можете добавить данный дом в чёрный список, чтобы его скрыть", TYPECHATMESSAGES.SECONDARY)
         end
 
         if text:find("У Вас недостаточно денежных средств!") and color == -1104335361 then
             DeactivateProcessesInteracting()
+        end
+
+        if  text:find("осталось на счету видеокарты:") or (
+                text:find("Вам был добавлен предмет") and (
+                    text:find(":item1811:", nil, true) or
+                    text:find(":item5996:", nil, true)
+                )
+            ) and
+            color == -65281 and
+            settings.main.hideMessagesCollect then
+            return false
         end
     end
 end
@@ -320,13 +347,26 @@ function sampev.onShowDialog(dialogId, style, title, button1, button2, text)
     if stateCrypto.work and processes.take and title:find("Вывод прибыли видеокарты") then
         local continue = stateCrypto.queueShelves[stateCrypto.progressShelves].count - stateCrypto.takeCount
         stateCrypto.queueShelves[stateCrypto.progressShelves].count = continue
+        if stateCrypto.takeCount and stateCrypto.takeCount > 0 and stateCrypto.takeCurrency then
+            local cur = stateCrypto.takeCurrency
+            -- итого по всем домам
+            collectStats.total[cur] = (collectStats.total[cur] or 0) + stateCrypto.takeCount
+            -- итого по текущему дому (если он известен)
+            local hid = stateCrypto.currentHouseId or 0
+            collectStats.house[hid] = collectStats.house[hid] or { BTC = 0, ASC = 0 }
+            collectStats.house[hid][cur] = (collectStats.house[hid][cur] or 0) + stateCrypto.takeCount
+        end
         DialogUtils.waitAndSendDialogResponse(dialogId, 1, 0, "")
         stateCrypto.takeCount = 0
+        stateCrypto.takeCurrency = nil
         return not settings.main.replaceDialog
     end
 
     if stateCrypto.work and title:find("Стойка") and title:find("Полка") then
         local actions = ParseShelfVideoCardData(text)
+        -- Определим тип карты по возможным действиям на полке
+        stateCrypto.currentCardType = InferCardTypeFromShelf(actions) or stateCrypto.currentCardType
+
 
         for index, value in ipairs(actions) do
             -- AddChatMessage(value.action.." - "..value.samp_line.." - "..value.count)
@@ -334,6 +374,7 @@ function sampev.onShowDialog(dialogId, style, title, button1, button2, text)
             if processes.take then
                 if  value.count > 0 and (value.action == "take_btc" or value.action == "take_asc") then
                     stateCrypto.takeCount = value.count
+                    stateCrypto.takeCurrency = (value.action == "take_btc") and "BTC" or "ASC"
                     DialogUtils.waitAndSendDialogResponse(dialogId, 1, value.samp_line, "")
                     return not settings.main.replaceDialog
                 elseif math.floor(stateCrypto.queueShelves[stateCrypto.progressShelves].count) <= 0 then
@@ -379,31 +420,53 @@ function sampev.onShowDialog(dialogId, style, title, button1, button2, text)
     if stateCrypto.work and processes.fill and not stateCrypto.waitFill and title:find("Выберите тип жидкости") then
         local actions = ParseLiquidData(text)
 
-        for index, value in ipairs(actions) do
-            -- AddChatMessage(value.action.." - "..value.samp_line.." - "..value.count)
-            if value.action == "btc" and value.count > 0 then
-                haveLiquid.btc = value.count
-                stateCrypto.waitFill = true
-                DialogUtils.waitAndSendDialogResponse(dialogId, 1, value.samp_line, "")
-                return not settings.main.replaceDialog
-            elseif value.action == "supper_btc" and value.count > 0 then
-                haveLiquid.supper_btc = value.count
-                stateCrypto.waitFill = true
-                DialogUtils.waitAndSendDialogResponse(dialogId, 1, value.samp_line, "")
-                return not settings.main.replaceDialog
-            elseif value.action == "asc" and value.count > 0 then
-                haveLiquid.asc = value.count
-                stateCrypto.waitFill = true
-                DialogUtils.waitAndSendDialogResponse(dialogId, 1, value.samp_line, "")
-                return not settings.main.replaceDialog
-            else
-                haveLiquid.btc = 0
-                haveLiquid.supper_btc = 0
-                haveLiquid.asc = 0
+        -- Соберём наличие
+        local counts = { btc = 0, supper_btc = 0, asc = 0 }
+        local lines  = { btc = nil, supper_btc = nil, asc = nil }
 
-                processes.fill = false
-                AddChatMessage("Нет жидкости для видеокарты "..value.action, TYPECHATMESSAGES.CRITICAL)
+        for _, v in ipairs(actions) do
+            if v.action == "btc"         then counts.btc        = v.count or 0; lines.btc        = v.samp_line end
+            if v.action == "supper_btc"  then counts.supper_btc = v.count or 0; lines.supper_btc = v.samp_line end
+            if v.action == "asc"         then counts.asc        = v.count or 0; lines.asc        = v.samp_line end
+        end
+
+        haveLiquid.btc        = counts.btc
+        haveLiquid.supper_btc = counts.supper_btc
+        haveLiquid.asc        = counts.asc
+
+        -- Тип карты из текущей очереди полок:
+        local cur = stateCrypto.queueShelves[stateCrypto.progressShelves]
+        local card = cur and cur.card_type or nil  -- "ASIC" | "BTC" | "ASC" | nil
+
+        -- Фолбэк: если в самом диалоге есть фраза про ASIC — подстрахуемся
+        if (not card or card == "BTC") and (text:find("ASIC") or text:find("Достать ASIC")) then
+            card = "ASIC"
+        end
+
+        -- Выбор по типу карты
+        local choice = nil
+        if card == "ASC" then
+            if counts.asc > 0 then choice = "asc" end
+        else
+            -- BTC или ASIC (или тип не определён) — не льём ASC для BTC/ASIC
+            if counts.btc > 0 then
+                choice = "btc"
+            elseif counts.supper_btc > 0 then
+                choice = "supper_btc"
+            elseif not card and counts.asc > 0 then
+                -- Тип не распознан: разрешим asc как крайний случай
+                choice = "asc"
             end
+        end
+
+        if choice then
+            stateCrypto.waitFill = true
+            DialogUtils.waitAndSendDialogResponse(dialogId, 1, lines[choice], "")
+            return not settings.main.replaceDialog
+        else
+            processes.fill = false
+            local reason = (card == "ASC") and "нет охлаждайки ASC" or "нет охлаждайки BTC/super"
+            AddChatMessage("Охлаждение: " .. reason .. " для текущей карты", TYPECHATMESSAGES.CRITICAL)
         end
     end
 
@@ -423,18 +486,20 @@ function sampev.onShowDialog(dialogId, style, title, button1, button2, text)
     end
 
     if title:find("Выбор дома") then
-        idDialogs.selectHouse = dialogId
-
-        imguiWindows.main[0] = true
-
         houses = {}
         housesBanks ={}
 
-        if text:find("циклов") then
+        if text:find("Энергия") then
             houses = ParseHouseData(text)
-        else
+        elseif text:find("Баланс") then
             housesBanks = ParseHouseBankData(text)
+        else
+            return true
         end
+
+        idDialogs.selectHouse = dialogId
+
+        imguiWindows.main[0] = true
 
         if settings.main.replaceDialog then
             return false
@@ -459,6 +524,28 @@ function sampev.onSendDialogResponse(id, btn, list, input)
         imguiWindows.main[0] = false
     end
 
+end
+
+-- --------------------------------------------------------
+--                           onWindowMessage
+-- --------------------------------------------------------
+
+function onWindowMessage(msg, wparam, lparam)
+    if not keysSuccess then return end
+    local isEscapePressed = (wparam == keys.VK_ESCAPE)
+    local shouldCloseOnEsc = settings.main.closeOnESC
+    local isMainWindowActive = imguiWindows.main[0]
+    local isPauseInactive = not isPauseMenuActive()
+
+    if (msg == 0x100 or msg == 0x101) and isEscapePressed and isMainWindowActive and isPauseInactive and shouldCloseOnEsc then
+        consumeWindowMessage(true, false)
+        if msg == 0x101 then
+            SwitchMainWindow()
+            DeactivateProcessesInteracting()
+            sampSendDialogResponse(lastIDDialog, 0, 0, "")
+            houses = {}
+        end
+    end
 end
 
 -- =====================================================================================================================
@@ -572,7 +659,8 @@ function ShelfProcessor.filterShelves()
                 samp_line = shelf.samp_line,
                 fill = shelf.percentage,
                 work = shelf.status == "Работает",
-                count = shelf.profit + (shelf.profit2 or 0)
+                count = shelf.profit + (shelf.profit2 or 0),
+                card_type = shelf.card_type
             })
         end
     end
@@ -716,6 +804,10 @@ function HouseProcessor.processRegularHouses()
 
         sampSendDialogResponse(lastIDDialog, 1, houseData.samp_line, "")
         lastOpenHouse = index
+        stateCrypto.currentHouseId = houses[index] and houses[index].house_number or nil
+        if stateCrypto.currentHouseId and not collectStats.house[stateCrypto.currentHouseId] then
+            collectStats.house[stateCrypto.currentHouseId] = { BTC = 0, ASC = 0 }
+        end
 
         -- Ждем загрузки полок с таймаутом
         local timeout = os.clock() + settings.deley.timeoutShelf
@@ -754,6 +846,15 @@ function HouseProcessor.processRegularHouses()
         end
 
         stateCrypto.progressHouses = stateCrypto.progressHouses + 1
+
+        if stateCrypto.currentHouseId and collectStats.house[stateCrypto.currentHouseId] then
+            local s = collectStats.house[stateCrypto.currentHouseId]
+            AddChatMessage(string.format(
+                "Дом №%s: собрано %s BTC и %s ASC",
+                tostring(stateCrypto.currentHouseId), s.BTC or 0, s.ASC or 0
+            ), TYPECHATMESSAGES.SECONDARY)
+        end
+        stateCrypto.currentHouseId = nil
     end
 
     return true
@@ -767,6 +868,8 @@ function StartProcessInteracting(action)
         processes.fill = true
     elseif action == "take" then
         processes.take = true
+        collectStats = { total = { BTC = 0, ASC = 0 }, house = {} }
+        stateCrypto.currentHouseId = nil
     elseif action == "on" then
         processes.on = true
     elseif action == "off" then
@@ -816,6 +919,14 @@ function ProcessInteracting()
 
     DeactivateProcessesInteracting()
     AddChatMessage("Обработка завершена успешно", TYPECHATMESSAGES.SUCCESS)
+
+    -- Итоги по всем домам (если больше одного дома или просто удобно видеть общий итог)
+    if (collectStats.total.BTC > 0) or (collectStats.total.ASC > 0) then
+        AddChatMessage(string.format(
+            "Итого за сессию: %s BTC и %s ASC",
+            collectStats.total.BTC or 0, collectStats.total.ASC or 0
+        ), TYPECHATMESSAGES.SUCCESS)
+    end
 end
 
 function CheckProcessInteracting()
@@ -1040,6 +1151,7 @@ function ParseShelfData(text)
                 currency2 = currency2,
                 level = tonumber(level),
                 percentage = tonumber(percentage),
+                card_type = "ASIC",
                 raw_line = line
             })
             found = true
@@ -1057,6 +1169,7 @@ function ParseShelfData(text)
                     currency = currency,
                     level = tonumber(level),
                     percentage = tonumber(percentage),
+                    card_type = (currency == "ASC") and "ASC" or "BTC",
                     raw_line = line
                 })
             end
@@ -1128,6 +1241,15 @@ function ParseLiquidData(text)
     end
 
     return results
+end
+
+function InferCardTypeFromShelf(actions)
+    -- actions из ParseShelfVideoCardData: v.action = "take_btc" | "take_asc", v.count и т.д.
+    local hasBTC, hasASC = false, false
+
+    if hasBTC then return "BTC" end
+    if hasASC then return "ASC" end
+    return nil
 end
 
 -- --------------------------------------------------------
@@ -1296,6 +1418,12 @@ function DrawSettings()
 
     if imgui.Checkbox(u8"Заменять окно диалога на окно скрипта", new.bool(settings.main.replaceDialog)) then
         settings.main.replaceDialog = not settings.main.replaceDialog SaveSettings()
+    end
+    if imgui.Checkbox(u8"Закрывать скрипт на ESC", new.bool(settings.main.closeOnESC)) then
+        settings.main.closeOnESC = not settings.main.closeOnESC SaveSettings()
+    end
+    if imgui.Checkbox(u8"Скрыть текст получения крипты в чате", new.bool(settings.main.hideMessagesCollect)) then
+        settings.main.hideMessagesCollect = not settings.main.hideMessagesCollect SaveSettings()
     end
     imgui.Text(u8("Заливать, когда "..settings.main.fillFrom.." процентов или ниже:"))
     imgui.PushItemWidth(-1)
