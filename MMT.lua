@@ -4,7 +4,7 @@
 
 script_authors('Sand')
 script_description('Mining assistant TG: @Mister_Sand')
-script_version("1.1")
+script_version("1.2")
 
 -- =====================================================================================================================
 --                                                          Import
@@ -175,8 +175,6 @@ local stateCrypto = {
     -- Идентификатор текущего дома (номер) и валюта текущего take
     currentHouseId = nil,
     takeCurrency = nil,
-    -- Тип текущей карты при работе с полкой/охлаждайкой: "BTC" | "ASC" | "ASIC" | nil
-    currentCardType = nil,
 }
 
 local processes = {
@@ -364,9 +362,6 @@ function sampev.onShowDialog(dialogId, style, title, button1, button2, text)
 
     if stateCrypto.work and title:find("Стойка") and title:find("Полка") then
         local actions = ParseShelfVideoCardData(text)
-        -- Определим тип карты по возможным действиям на полке
-        stateCrypto.currentCardType = InferCardTypeFromShelf(actions) or stateCrypto.currentCardType
-
 
         for index, value in ipairs(actions) do
             -- AddChatMessage(value.action.." - "..value.samp_line.." - "..value.count)
@@ -1243,15 +1238,6 @@ function ParseLiquidData(text)
     return results
 end
 
-function InferCardTypeFromShelf(actions)
-    -- actions из ParseShelfVideoCardData: v.action = "take_btc" | "take_asc", v.count и т.д.
-    local hasBTC, hasASC = false, false
-
-    if hasBTC then return "BTC" end
-    if hasASC then return "ASC" end
-    return nil
-end
-
 -- --------------------------------------------------------
 --                           Message
 -- --------------------------------------------------------
@@ -1351,7 +1337,7 @@ local mainFrame = imgui.OnFrame( function() return imguiWindows.main[0] end, fun
 
         imgui.SameLine()
 
-        imgui.CenterText("[MMT] Mining Tool | TG: @Mister_Sand")
+        imgui.CenterText("[MMT] Mining Tool v"..thisScript().version.." | TG: @Mister_Sand")
 
         imgui.SameLine()
 
