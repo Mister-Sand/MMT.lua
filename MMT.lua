@@ -4,7 +4,7 @@
 
 script_authors('Sand')
 script_description('Mining assistant TG: @Mister_Sand')
-script_version("1.2")
+script_version("1.3")
 
 -- =====================================================================================================================
 --                                                          Import
@@ -25,7 +25,8 @@ local sampevSuccess,    sampev      = CheckLibrary('lib.samp.events')
 local jsonSuccess,      json        = CheckLibrary('cjson')
 local lfsSuccess,       lfs         = CheckLibrary('lfs')
 local faSuccess,        fa          = CheckLibrary('fAwesome6_solid')
-local keysSuccess,      keys        = CheckLibrary('vkeys')
+local keysSuccess,      vkeys       = CheckLibrary('vkeys')
+local ffiSuccess,       ffi         = CheckLibrary('ffi')
 
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
@@ -34,6 +35,10 @@ if not imguiSuccess     or not encodingSuccess  or not sampevSuccess or
    not jsonSuccess      or not faSuccess then
     print("Некоторые библиотеки не были загружены. Пожалуйста, установите недостающие библиотеки.")
 end
+
+local VK_RETURN = (keysSuccess and vkeys.VK_RETURN) or 0x0D
+local VK_UP     = (keysSuccess and vkeys.VK_UP)     or 0x26
+local VK_DOWN   = (keysSuccess and vkeys.VK_DOWN)   or 0x28
 
 -- =====================================================================================================================
 --                                                          GLOBAL VARIABLES
@@ -65,6 +70,15 @@ local TYPECHATMESSAGES = {
     DEBUG = 10
 }
 
+-- Доходность видеокарт по уровням (в час, уровни 1..10)
+local GPU_HOURLY_BY_LEVEL = {
+    [1]=0.029999, [2]=0.059999, [3]=0.090000, [4]=0.119990, [5]=0.150000,
+    [6]=0.180000, [7]=0.209999, [8]=0.239999, [9]=0.270000, [10]=0.300000,
+}
+
+-- Сколько часов видеокарта отработает за полный цикл при 100% охлаждения
+local GPU_CYCLE_HOURS = 224
+
 -- --------------------------------------------------------
 --                           Settings
 -- --------------------------------------------------------
@@ -79,15 +93,32 @@ local defaultSettings = {
         -- Типы сообщений в чат игры
         typeChatMessage = {
             messages = true,
-            debug = false,
+            debug    = false,
         },
         -- Черный список домов, которые нужно скрыть
         blackListHouses = {},
         maxBankAmount = 19999999 - 10000,
+        -- Пополнять банк до целевой суммы (если выключено — до максимума диалога)
+        bankFillToTarget = false,
+        bankTargetAmount = 10000000,
         -- Закрывать ли на ESC
         closeOnESC = true,
+        -- Перемещаться стрелками
+        arrowsMove = true,
         -- Скрывать текст полученной крипты
         hideMessagesCollect = true,
+        -- автозаливка
+        autoFillEnabled = false,
+        -- Панель статуса
+        showStatusPanel = false,
+        -- Отображение доходности (что показывать в списке полок)
+        income = {
+            showPerHour             = true,  -- "/ч"
+            showPer24h              = true,  -- "/24ч"
+            showPerCycle            = true,  -- "/цикл"
+            showTillThresholdHours  = true,  -- "до доливки" (часы и прибыль)
+            showTillThresholdProfit = true,  -- "до доливки" (часы и прибыль)
+        },
     },
     deley = {
         timeoutDialog = 10,
@@ -138,6 +169,7 @@ local posMainFraim = { x = 0, y = 0}
 local activeTabScript = "main"
 
 local inputBlackHouse = new.int()
+local ui_bank = { buf = new.char[32]("") }
 
 -- --------------------------------------------------------
 --                           State
@@ -212,6 +244,7 @@ local housesBanks = {}
 local lastIDDialog = 0
 
 local lastOpenHouse = 1
+local lastOpenShelves = 1
 
 -- --------------------------------------------------------
 --                           Class
@@ -331,14 +364,44 @@ function sampev.onShowDialog(dialogId, style, title, button1, button2, text)
     lastIDDialog = dialogId
 
     if stateCrypto.work and processes.dep and title:find("{73B461}Баланс домашнего счёта") then
-        local _dep = text:match("Можно пополнить счёт ещё на:%s*{%w+}%$([%d%.,]+)")
-        if _dep then
-            _dep = _dep:gsub(",", ""):gsub("%.", "")
+        -- Сколько можно пополнить по данным диалога (остаток до максимума банка)
+        local can_str = text:match("Можно пополнить счёт ещё на:%s*{%w+}%$([%d%.,]+)")
+        local can = 0
+        if can_str then
+            can = tonumber((can_str:gsub("[^%d]", ""))) or 0
         end
 
-        _dep = tonumber(_dep)-1 > 10000000 and 10000000 or tonumber(_dep)-1
-        DialogUtils.waitAndSendDialogResponse(dialogId, 1, 0, tostring(_dep))
-        stateCrypto.queueHousesBank[stateCrypto.progressHousesBank].bankNow = stateCrypto.queueHousesBank[stateCrypto.progressHousesBank].bankNow + _dep
+        -- Текущий баланс по данным очереди (парсится ранее)
+        local cur = tonumber(stateCrypto.queueHousesBank[stateCrypto.progressHousesBank].bankNow) or 0
+
+        -- Цель (если включена), иначе nil => льём до максимума диалога
+        local target = (settings.main.bankFillToTarget and settings.main.bankTargetAmount) or nil
+
+        local dep
+        if target and target > 0 then
+            if cur >= target then
+                -- Ничего пополнять: уже достигли цели
+                DialogUtils.waitAndSendDialogResponse(dialogId, 0, 0, "")
+                return not settings.main.replaceDialog
+            end
+            dep = target - cur
+        else
+            -- По умолчанию льём до максимума
+            dep = can
+        end
+
+        -- Страховочные ограничения (как было): не больше доступного и лимита за раз
+        local PER_OP_LIMIT = 10000000
+        dep = math.minEx(dep,  math.maxEx(0, can - 1))  -- -1 как и раньше, чтобы не упереться в край
+        dep = math.minEx(dep, PER_OP_LIMIT)
+        if dep <= 0 then
+            DialogUtils.waitAndSendDialogResponse(dialogId, 0, 0, "")
+            return not settings.main.replaceDialog
+        end
+
+        DialogUtils.waitAndSendDialogResponse(dialogId, 1, 0, tostring(dep))
+        -- Обновим локальный «текущий баланс» в очереди домов банка
+        stateCrypto.queueHousesBank[stateCrypto.progressHousesBank].bankNow = cur + dep
         return not settings.main.replaceDialog
     end
 
@@ -475,6 +538,28 @@ function sampev.onShowDialog(dialogId, style, title, button1, button2, text)
 
         shelves = ParseShelfData(text)
 
+        -- Не автолить, если зашли через флешку
+        local openedViaFlash = (dialogId == idDialogs.selectVideoCardItemFlash)
+        -- Если включена автозаливка и мы не заняты процессом — стартуем заливку
+        if settings.main.autoFillEnabled and not stateCrypto.work and not openedViaFlash then
+            -- Есть ли вообще смысл заливать (ниже или равно порогу)?
+            local needFill = false
+            for _, s in ipairs(shelves) do
+                if (s.percentage or 0) <= (settings.main.fillFrom or 50.0) then
+                    needFill = true
+                    break
+                end
+            end
+
+            if needFill then
+                -- Стартанём с небольшим отложенным запуском, чтобы диалог "устаканился"
+                lua_thread.create(function()
+                    wait(50)
+                    StartProcessInteracting("fill")
+                end)
+            end
+        end
+
         if settings.main.replaceDialog then
             return false
         end
@@ -527,10 +612,28 @@ end
 
 function onWindowMessage(msg, wparam, lparam)
     if not keysSuccess then return end
-    local isEscapePressed = (wparam == keys.VK_ESCAPE)
-    local shouldCloseOnEsc = settings.main.closeOnESC
+
     local isMainWindowActive = imguiWindows.main[0]
-    local isPauseInactive = not isPauseMenuActive()
+    local isPauseInactive    = not isPauseMenuActive()
+
+    if (msg == 0x0100 or msg == 0x0101)
+       and isMainWindowActive and isPauseInactive
+       and settings.main.arrowsMove
+    then
+        local io = imgui.GetIO()
+        local wantkbd = io and io.WantCaptureKeyboard
+        if not wantkbd and (
+            wparam == vkeys.VK_UP or
+            wparam == vkeys.VK_DOWN
+        ) then
+            consumeWindowMessage(true, false)
+            return
+        end
+    end
+
+    -- =========================================================================
+    local isEscapePressed   = (wparam == vkeys.VK_ESCAPE)
+    local shouldCloseOnEsc  = settings.main.closeOnESC
 
     if (msg == 0x100 or msg == 0x101) and isEscapePressed and isMainWindowActive and isPauseInactive and shouldCloseOnEsc then
         consumeWindowMessage(true, false)
@@ -553,6 +656,54 @@ function CheckHouseInBlackList(number)
     end
     return false
 end
+
+-- level            : уровень видеокарты (целое)
+-- cool_percent_opt : (опц.) остаток охлаждения в процентах [0..100]
+-- min_percent_opt  : (опц.) порог доливки, если задан — "время" до доливки,
+--                    иначе — до полного нуля
+-- Возвращает:
+--   per_hour, per_24h, per_cycle, hours_to_show, income_to_end
+-- где:
+--   hours_to_show  — время до доливки (если выше порога) ИЛИ до конца работы (если порог уже пройден)
+--   income_to_end  — прибыль до полного окончания охлаждайки (всегда до нуля)
+local function CalcGpuIncome(level, cool_percent_opt, min_percent_opt)
+    level = tonumber(level) or 1
+    local per_hour  = GPU_HOURLY_BY_LEVEL[level] or 0
+    local per_24h   = per_hour * 24
+    local per_cycle = per_hour * GPU_CYCLE_HOURS
+
+    local hours_to_show  = 0
+    local income_to_end  = 0
+
+    if cool_percent_opt ~= nil then
+        -- нормализуем проценты
+        local p = tonumber(cool_percent_opt) or 0
+        if p < 0 then p = 0 elseif p > 100 then p = 100 end
+
+        -- Всегда считаем "до нуля"
+        local hours_until_zero = (p / 100) * GPU_CYCLE_HOURS
+        income_to_end = per_hour * hours_until_zero
+
+        -- Логика показа "времени":
+        -- если выше порога — показываем до доливки,
+        -- если на/ниже порога — показываем до конца работы (до нуля)
+        local threshold = tonumber(min_percent_opt)
+        if threshold ~= nil then
+            if threshold < 0 then threshold = 0 elseif threshold > 100 then threshold = 100 end
+            if p > threshold then
+                hours_to_show = ((p - threshold) / 100) * GPU_CYCLE_HOURS
+            else
+                hours_to_show = hours_until_zero
+            end
+        else
+            -- порога нет — просто до конца работы
+            hours_to_show = hours_until_zero
+        end
+    end
+
+    return per_hour, per_24h, per_cycle, hours_to_show, income_to_end
+end
+
 
 -- --------------------------------------------------------
 --                           Dialog Utils
@@ -706,17 +857,25 @@ end
 -- --------------------------------------------------------
 
 function HouseProcessor.filterBankHouses()
-    local filtered = {}
+    local function NeedTopupForBank(now)
+        local nowNum = tonumber(now) or 0
+        if settings.main.bankFillToTarget and (settings.main.bankTargetAmount or 0) > 0 then
+            return nowNum < (settings.main.bankTargetAmount or 0)
+        else
+            -- старое поведение: до тех пор, пока <= порог maxBankAmount
+            return nowNum <= settings.main.maxBankAmount
+        end
+    end
 
+    local filtered = {}
     for _, house in ipairs(housesBanks) do
-        if tonumber(house.bankNow) <= settings.main.maxBankAmount then
+        if NeedTopupForBank(house.bankNow) then
             table.insert(filtered, {
                 samp_line = house.samp_line,
                 bankNow = house.bankNow
             })
         end
     end
-
     return filtered
 end
 
@@ -752,8 +911,17 @@ function HouseProcessor.processBankHouses()
             end
         end
 
+        local function NeedTopupForBankValue(now)
+            local nowNum = tonumber(now) or 0
+            if settings.main.bankFillToTarget and (settings.main.bankTargetAmount or 0) > 0 then
+                return nowNum < (settings.main.bankTargetAmount or 0)
+            else
+                return nowNum <= settings.main.maxBankAmount
+            end
+        end
+
         -- Дополнительная проверка и повторная операция если нужно
-        if tonumber(houseData.bankNow) <= settings.main.maxBankAmount then
+        if NeedTopupForBankValue(houseData.bankNow) then
             sampSendDialogResponse(lastIDDialog, 1, houseData.samp_line, "")
             stateCrypto.waitDep = true
 
@@ -912,16 +1080,16 @@ function ProcessInteracting()
         return
     end
 
-    DeactivateProcessesInteracting()
-    AddChatMessage("Обработка завершена успешно", TYPECHATMESSAGES.SUCCESS)
-
     -- Итоги по всем домам (если больше одного дома или просто удобно видеть общий итог)
-    if (collectStats.total.BTC > 0) or (collectStats.total.ASC > 0) then
+    if ( (collectStats.total.BTC > 0) or (collectStats.total.ASC > 0) ) and processes.take then
         AddChatMessage(string.format(
             "Итого за сессию: %s BTC и %s ASC",
             collectStats.total.BTC or 0, collectStats.total.ASC or 0
         ), TYPECHATMESSAGES.SUCCESS)
     end
+
+    DeactivateProcessesInteracting()
+    AddChatMessage("Обработка завершена успешно", TYPECHATMESSAGES.SUCCESS)
 end
 
 function CheckProcessInteracting()
@@ -1283,6 +1451,35 @@ function SetScaleUI()
     imgui.GetIO().DisplayFramebufferScale = imgui.ImVec2(1.0*_scale, 1.0*_scale)  -- Увеличение для HD экранов
 end
 
+-- Буфер для строк
+local function buf_set(buf, str)
+    str = tostring(str or "")
+    local n = math.minEx(#str, ffi.sizeof(buf) - 1)
+    ffi.copy(buf, str, n)
+    buf[n] = 0
+end
+
+-- Формат «10,000,000»
+local function format_commas(n)
+    n = math.floor(tonumber(n) or 0)
+    local s = tostring(math.abs(n))
+    s = s:reverse():gsub("(%d%d%d)", "%1,"):reverse():gsub("^,", "")
+    if n < 0 then s = '-' .. s end
+    return s
+end
+
+local function digits_to_int(s)
+    if not s or s == "" then return 0 end
+    local neg = s:match("^%-") ~= nil
+    local digits = s:gsub("%D", "")
+    local n = tonumber(digits) or 0
+    return neg and -n or n
+end
+
+local function clamp_bank_target(v)
+    return math.maxEx(10000, math.minEx(19999999 - 10000, v))
+end
+
 -- =====================================================================================================================
 --                                                          UTLITES
 -- =====================================================================================================================
@@ -1309,6 +1506,69 @@ end
 function GetCommaValue(n)
 	local left,num,right = string.match(n,'^([^%d]*%d)(%d*)(.-)$')
 	return left..(num:reverse():gsub('(%d%d%d)','%1,'):reverse())..right
+end
+
+-- Округление до n знаков (по умолчанию 2)
+function Round(x, n)
+    n = n or 2
+    local m = 10^n
+    return math.floor((x or 0) * m + 0.5) / m
+end
+
+function ImGuiKeyPressed(keyConst)
+    local ok, pressed = pcall(function() return imgui.IsKeyPressed(keyConst, false) end)
+    return ok and pressed
+end
+
+function IsEnterPressed()
+    -- пробуем ImGui Enter
+    if ImGuiKeyPressed(imgui.Key.Enter) then return true end
+    -- фолбэк: системная клавиша Enter
+    if isKeyJustPressed then
+        local ok, pressed = pcall(isKeyJustPressed, VK_RETURN)
+        if ok and pressed then return true end
+    end
+    return false
+end
+
+-- current  – текущий индекс (1..max)
+-- max      – количество элементов
+-- onEnter  – колбэк при нажатии Enter на текущем элементе
+function HandleListNavigation(current, max, onEnter)
+    if max <= 0 or not settings.main.arrowsMove then return current end
+
+    if imgui.IsWindowFocused(imgui.FocusedFlags.RootAndChildWindows)
+       and not imgui.IsAnyItemActive() then
+
+        local newIndex = current
+
+        -- Вверх: ImGui или фолбэк через VK_UP
+        if ImGuiKeyPressed(imgui.Key.UpArrow) or (isKeyJustPressed and isKeyJustPressed(VK_UP)) then
+            newIndex = (current > 1) and (current - 1) or max
+        end
+
+        -- Вниз: ImGui или фолбэк через VK_DOWN
+        if ImGuiKeyPressed(imgui.Key.DownArrow) or (isKeyJustPressed and isKeyJustPressed(VK_DOWN)) then
+            newIndex = (current < max) and (current + 1) or 1
+        end
+
+        current = newIndex
+
+        -- Enter (без KeypadEnter)
+        if IsEnterPressed() and onEnter then
+            onEnter(current)
+        end
+    end
+
+    return current
+end
+
+function math.maxEx(a, b)
+    return a > b and a or b
+end
+
+function math.minEx(a, b)
+    return a < b and a or b
 end
 
 -- =====================================================================================================================
@@ -1390,121 +1650,393 @@ function DrawMainMenu()
 end
 
 function DrawSettings()
-    imgui.Text(u8(string.format("Работаю - %s | Заливаю - %s | Собираю - %s | Вкл/выкл - %s", stateCrypto.work, processes.fill, processes.take, (processes.on or processes.off))))
-    if stateCrypto.work then
-        if imgui.Button(u8"Отменить процесс", imgui.ImVec2(-1, 0)) then
-            DeactivateProcessesInteracting()
+    -- Верхняя панель статуса (если включена)
+    if settings.main.showStatusPanel then
+        imgui.BeginChild("status_panel", imgui.ImVec2(-1, 60), true)
+        imgui.Text(u8(string.format("Работаю: %s | Заливаю: %s | Собираю: %s | Вкл/выкл: %s", 
+            stateCrypto.work, processes.fill, processes.take, (processes.on or processes.off))))
+
+        if stateCrypto.work then
+            imgui.Spacing()
+            if imgui.Button(u8"Отменить процесс", imgui.ImVec2(-1, 0)) then
+                DeactivateProcessesInteracting()
+            end
         end
-    end
-    imgui.Separator()
+        imgui.EndChild()
 
-    imgui.BeginChild("settings", imgui.ImVec2(-1, -1))
-
-    imgui.CenterText(u8"Основное")
-
-    if imgui.Checkbox(u8"Заменять окно диалога на окно скрипта", new.bool(settings.main.replaceDialog)) then
-        settings.main.replaceDialog = not settings.main.replaceDialog SaveSettings()
-    end
-    if imgui.Checkbox(u8"Закрывать скрипт на ESC", new.bool(settings.main.closeOnESC)) then
-        settings.main.closeOnESC = not settings.main.closeOnESC SaveSettings()
-    end
-    if imgui.Checkbox(u8"Скрыть текст получения крипты в чате", new.bool(settings.main.hideMessagesCollect)) then
-        settings.main.hideMessagesCollect = not settings.main.hideMessagesCollect SaveSettings()
-    end
-    imgui.Text(u8("Заливать, когда "..settings.main.fillFrom.." процентов или ниже:"))
-    imgui.PushItemWidth(-1)
-    local _fillFrom = new.float(settings.main.fillFrom)
-    if imgui.SliderFloat("##Заливать, когда этот процент или ниже", _fillFrom, 0, 100) then
-        settings.main.fillFrom = _fillFrom[0] SaveSettings()
-    end
-    imgui.PopItemWidth()
-
-    imgui.Spacing()
-    imgui.CenterText(u8"Задержки")
-
-    imgui.PushItemWidth(imgui.GetWindowWidth()/2)
-
-    -- todo Нужно доделать, поменять еще в диалогах макс закид
-    -- local _maxBankAmount = new.int(settings.main.maxBankAmount)
-    -- if imgui.SliderInt(u8("Заполнять до"), _maxBankAmount, 10000, 19999999-10000) then
-    --     settings.main.maxBankAmount = _maxBankAmount[0] SaveSettings()
-    -- end
-
-    local _timeoutDialog = new.int(settings.deley.timeoutDialog)
-    if imgui.SliderInt(u8("Ожидание ответа диалога (сек)"), _timeoutDialog, 1, 30) then
-        settings.deley.timeoutDialog = _timeoutDialog[0] SaveSettings()
-    end
-
-    local _waitInterval = new.int(settings.deley.waitInterval)
-    if imgui.SliderInt(u8("Интервал проверки (миллисекунды)"), _waitInterval, 1, 100) then
-        settings.deley.waitInterval = _waitInterval[0] SaveSettings()
-    end
-
-    local _timeoutShelf = new.int(settings.deley.timeoutShelf)
-    if imgui.SliderInt(u8("Ожидание ответа от полок (сек)"), _timeoutShelf, 1, 30) then
-        settings.deley.timeoutShelf = _timeoutShelf[0] SaveSettings()
-    end
-
-    local _waitRun = new.int(settings.deley.waitRun)
-    if imgui.SliderInt(u8("Ожидать перед ответом на диалог (миллисекунды)"), _waitRun, 1, 100) then
-        settings.deley.waitRun = _waitRun[0] SaveSettings()
-    end
-
-    imgui.PopItemWidth()
-
-
-    imgui.Spacing()
-    imgui.CenterText(u8"Черный список домов")
-
-    imgui.Text(u8"Номер дома, который нужно скрыть")
-    if imgui.Button(u8"Добавить", imgui.ImVec2(imgui.GetWindowWidth()/4)) then
-        table.insert(settings.main.blackListHouses, inputBlackHouse[0])
-        SaveSettings()
-    end
-    imgui.SameLine()
-    imgui.PushItemWidth(-1)
-    imgui.InputInt("##numberHouse", inputBlackHouse, 0,0)
-    imgui.PopItemWidth()
-
-    for index, blackHouse in ipairs(settings.main.blackListHouses) do
-        if imgui.Button("X##"..index) then
-            table.remove(settings.main.blackListHouses, index)
-            SaveSettings()
-        end
-        imgui.SameLine()
-        imgui.Text(u8"Дом №"..blackHouse)
-    end
-
-
-    imgui.Spacing()
-    imgui.CenterText(u8"Интерфейс")
-
-    local _scrollbarSizeStyle = new.int(settings.style.scrollbarSizeStyle)
-    if imgui.SliderInt(u8("Размер скроллбара"), _scrollbarSizeStyle, 10, 50) then
-        settings.style.scrollbarSizeStyle = _scrollbarSizeStyle[0] SaveSettings()
-        SetStyle()
-    end
-
-    local _MONET_DPI_SCALE = new.float(settings.style.scaleUI)
-    if imgui.SliderFloat(u8("DPI (Масштаб скрипта)"), _MONET_DPI_SCALE, 0, 5) then
-        settings.style.scaleUI = _MONET_DPI_SCALE[0] SaveSettings()
-    end
-    if imgui.Button(u8"Перезапустите") then
-        thisScript():reload()
-    end
-    imgui.SameLine()
-    imgui.Text(u8("скрипт, чтобы применить. Либо команда: /mmtr"))
-    imgui.Text(u8("Сбросить масштаб, команда: /mmtsr"))
-
-
-    if #stateCrypto.queueShelves > 0 then
         imgui.Spacing()
-        imgui.CenterText(u8"Тех состояние")
+    end
 
-        for index, value in ipairs(stateCrypto.queueShelves) do
+    -- Основная область с табами
+    imgui.BeginChild("settings_tabs", imgui.ImVec2(-1, -1))
+
+    if imgui.BeginTabBar("SettingsTabs") then
+
+        -- ТАБ 1: Основное
+        if imgui.BeginTabItem(u8"Основное") then
+            imgui.BeginChild("tab_main", imgui.ImVec2(-1, -1))
+            imgui.Spacing()
+
+            if imgui.Checkbox(u8"Заменять окно диалога на окно скрипта", new.bool(settings.main.replaceDialog)) then
+                settings.main.replaceDialog = not settings.main.replaceDialog 
+                SaveSettings()
+            end
+
+            if imgui.Checkbox(u8"Закрывать скрипт на ESC", new.bool(settings.main.closeOnESC)) then
+                settings.main.closeOnESC = not settings.main.closeOnESC 
+                SaveSettings()
+            end
+
+            if imgui.Checkbox(u8"Перемещаться стрелочками в списке", new.bool(settings.main.arrowsMove)) then
+                settings.main.arrowsMove = not settings.main.arrowsMove 
+                SaveSettings()
+            end
+
+            if imgui.Checkbox(u8"Скрыть текст получения крипты в чате", new.bool(settings.main.hideMessagesCollect)) then
+                settings.main.hideMessagesCollect = not settings.main.hideMessagesCollect 
+                SaveSettings()
+            end
+
+            if imgui.Checkbox(u8"Отображать панель статуса (дебаг информация)", new.bool(settings.main.showStatusPanel)) then
+                settings.main.showStatusPanel = not settings.main.showStatusPanel 
+                SaveSettings()
+            end
+            imgui.TextDisabled(u8"Отображать информацию о работающих процессах вверху окна")
+
+            imgui.Spacing()
             imgui.Separator()
-            imgui.Text(u8(string.format("Строка - %s | Заливка - %s | Крипты - %s | Состояние - %s", value.samp_line, value.fill, value.count, value.work)))
+            imgui.Spacing()
+
+            imgui.Text(u8(string.format("Заливать при %.0f%%%% или ниже:", settings.main.fillFrom)))
+            imgui.PushItemWidth(-1)
+            local _fillFrom = new.float(settings.main.fillFrom)
+            if imgui.SliderFloat("##fillFrom", _fillFrom, 0, 100, "%.0f%%") then
+                settings.main.fillFrom = Round(_fillFrom[0], 2)
+                SaveSettings()
+            end
+            imgui.PopItemWidth()
+
+            imgui.EndChild()
+            imgui.EndTabItem()
         end
+
+        -- ТАБ 2: Доходность
+        if imgui.BeginTabItem(u8"Доходность") then
+            imgui.BeginChild("tab_income", imgui.ImVec2(-1, -1))
+            imgui.Spacing()
+
+            local inc = settings.main.income or { 
+                showPerHour=true, showPer24h=true, showPerCycle=true, 
+                showTillThresholdProfit=true, showTillThresholdHours=true 
+            }
+            settings.main.income = inc
+
+            imgui.TextWrapped(u8"Выберите, какие показатели доходности отображать:")
+            imgui.Spacing()
+            imgui.Separator()
+            imgui.Spacing()
+
+            if imgui.Checkbox(u8"Показывать доход за час", imgui.new.bool(inc.showPerHour)) then
+                inc.showPerHour = not inc.showPerHour  
+                SaveSettings()
+            end
+            imgui.SameLine()
+            imgui.TextDisabled(u8"(/час)")
+
+            if imgui.Checkbox(u8"Показывать доход за 24 часа", imgui.new.bool(inc.showPer24h)) then
+                inc.showPer24h = not inc.showPer24h  
+                SaveSettings()
+            end
+            imgui.SameLine()
+            imgui.TextDisabled(u8"(/24ч)")
+
+            if imgui.Checkbox(u8"Показывать доход за цикл", imgui.new.bool(inc.showPerCycle)) then
+                inc.showPerCycle = not inc.showPerCycle  
+                SaveSettings()
+            end
+            imgui.SameLine()
+            imgui.TextDisabled(u8"(/цикл)")
+
+            imgui.Spacing()
+            imgui.Separator()
+            imgui.Spacing()
+
+            if imgui.Checkbox(u8"Показывать текущую прибыль", imgui.new.bool(inc.showTillThresholdProfit)) then
+                inc.showTillThresholdProfit = not inc.showTillThresholdProfit  
+                SaveSettings()
+            end
+
+            if imgui.Checkbox(u8"Показывать время до доливки", imgui.new.bool(inc.showTillThresholdHours)) then
+                inc.showTillThresholdHours = not inc.showTillThresholdHours  
+                SaveSettings()
+            end
+            imgui.SameLine()
+            imgui.TextDisabled(u8"(в часах)")
+
+            imgui.EndChild()
+            imgui.EndTabItem()
+        end
+
+        -- ТАБ 3: Банк
+        if imgui.BeginTabItem(u8"Банк") then
+            imgui.BeginChild("tab_bank", imgui.ImVec2(-1, -1))
+            imgui.Spacing()
+
+            imgui.TextWrapped(u8"Настройки автоматического пополнения банка:")
+            imgui.Spacing()
+            imgui.Separator()
+            imgui.Spacing()
+
+            local _bankFillToTarget = imgui.new.bool(settings.main.bankFillToTarget)
+            if imgui.Checkbox(u8"Пополнять до заданной суммы", _bankFillToTarget) then
+                settings.main.bankFillToTarget = not settings.main.bankFillToTarget
+                SaveSettings()
+            end
+            imgui.TextDisabled(u8"Если выключено - пополнение до максимума")
+
+            imgui.Spacing()
+            imgui.Spacing()
+
+            imgui.Text(u8"Целевая сумма для пополнения:")
+            imgui.PushItemWidth(-1)
+
+            if ui_bank.buf[0] == 0 then
+                buf_set(ui_bank.buf, format_commas(settings.main.bankTargetAmount or 10000000))
+            end
+
+            local pressed = imgui.InputText("##bankTargetAmount", ui_bank.buf, 32,
+                imgui.InputTextFlags.AutoSelectAll + imgui.InputTextFlags.EnterReturnsTrue)
+            if pressed then
+                local s = ffi.string(ui_bank.buf)
+                local v = clamp_bank_target(digits_to_int(s))
+                if v ~= (settings.main.bankTargetAmount or 0) then
+                    settings.main.bankTargetAmount = v
+                    SaveSettings()
+                end
+                buf_set(ui_bank.buf, format_commas(settings.main.bankTargetAmount))
+            end
+            if imgui.IsItemDeactivatedAfterEdit() then
+                buf_set(ui_bank.buf, format_commas(settings.main.bankTargetAmount))
+            end
+            imgui.PopItemWidth()
+            imgui.TextDisabled(u8"Нажмите Enter для сохранения")
+            
+            imgui.EndChild()
+            imgui.EndTabItem()
+        end
+
+        -- ТАБ 4: Задержки
+        if imgui.BeginTabItem(u8"Задержки") then
+            imgui.BeginChild("tab_delays", imgui.ImVec2(-1, -1))
+            imgui.Spacing()
+            
+            imgui.TextWrapped(u8"Настройка временных интервалов для стабильной работы скрипта:")
+            imgui.Spacing()
+            imgui.Separator()
+            imgui.Spacing()
+            
+            imgui.PushItemWidth(-1)
+
+            imgui.Text(u8"Ожидание ответа диалога:")
+            local _timeoutDialog = new.int(settings.deley.timeoutDialog)
+            if imgui.SliderInt("##timeoutDialog", _timeoutDialog, 1, 30, u8"%d сек") then
+                settings.deley.timeoutDialog = _timeoutDialog[0]
+                SaveSettings()
+            end
+            imgui.TextDisabled(u8"Максимальное время ожидания открытия диалога")
+
+            imgui.Spacing()
+
+            imgui.Text(u8"Интервал проверки:")
+            local _waitInterval = new.int(settings.deley.waitInterval)
+            if imgui.SliderInt("##waitInterval", _waitInterval, 1, 100, u8"%d мс") then
+                settings.deley.waitInterval = _waitInterval[0]
+                SaveSettings()
+            end
+            imgui.TextDisabled(u8"Частота проверки состояния (миллисекунды)")
+
+            imgui.Spacing()
+
+            imgui.Text(u8"Ожидание ответа от полок:")
+            local _timeoutShelf = new.int(settings.deley.timeoutShelf)
+            if imgui.SliderInt("##timeoutShelf", _timeoutShelf, 1, 30, u8"%d сек") then
+                settings.deley.timeoutShelf = _timeoutShelf[0]
+                SaveSettings()
+            end
+            imgui.TextDisabled(u8"Максимальное время ожидания ответа от полок")
+
+            imgui.Spacing()
+
+            imgui.Text(u8"Задержка перед ответом на диалог:")
+            local _waitRun = new.int(settings.deley.waitRun)
+            if imgui.SliderInt("##waitRun", _waitRun, 1, 100, u8"%d мс") then
+                settings.deley.waitRun = _waitRun[0]
+                SaveSettings()
+            end
+            imgui.TextDisabled(u8"Пауза перед отправкой ответа в диалог")
+
+            imgui.PopItemWidth()
+            
+            imgui.EndChild()
+            imgui.EndTabItem()
+        end
+
+        -- ТАБ 5: Черный список
+        if imgui.BeginTabItem(u8"Черный список") then
+            imgui.BeginChild("tab_blacklist", imgui.ImVec2(-1, -1))
+            imgui.Spacing()
+            
+            imgui.TextWrapped(u8"Добавьте номера домов, которые нужно исключить из обработки:")
+            imgui.Spacing()
+            imgui.Separator()
+            imgui.Spacing()
+            
+            imgui.Text(u8"Номер дома:")
+            imgui.PushItemWidth(200)
+            imgui.InputInt("##numberHouse", inputBlackHouse, 0, 0)
+            imgui.PopItemWidth()
+            imgui.SameLine()
+            if imgui.Button(u8"Добавить в список", imgui.ImVec2(ScaleUI(150), 0)) then
+                if inputBlackHouse[0] > 0 then
+                    table.insert(settings.main.blackListHouses, inputBlackHouse[0])
+                    SaveSettings()
+                    inputBlackHouse[0] = 0
+                end
+            end
+
+            imgui.Spacing()
+            imgui.Separator()
+            imgui.Spacing()
+
+            if #settings.main.blackListHouses > 0 then
+                imgui.Text(u8(string.format("Домов в черном списке: %d", #settings.main.blackListHouses)))
+                imgui.Spacing()
+                imgui.BeginChild("blacklist_scroll", imgui.ImVec2(-1, -1), true)
+                for index, blackHouse in ipairs(settings.main.blackListHouses) do
+                    if imgui.Button(u8"Удалить##"..index, imgui.ImVec2(ScaleUI(80), 0)) then
+                        table.remove(settings.main.blackListHouses, index)
+                        SaveSettings()
+                    end
+                    imgui.SameLine()
+                    imgui.Text(u8(string.format("Дом №%d", blackHouse)))
+                    if index < #settings.main.blackListHouses then
+                        imgui.Spacing()
+                    end
+                end
+                imgui.EndChild()
+            else
+                imgui.TextDisabled(u8"Список пуст. Добавьте первый дом.")
+            end
+            
+            imgui.EndChild()
+            imgui.EndTabItem()
+        end
+
+        -- ТАБ 6: Интерфейс
+        if imgui.BeginTabItem(u8"Интерфейс") then
+            imgui.BeginChild("tab_interface", imgui.ImVec2(-1, -1))
+            imgui.Spacing()
+            
+            imgui.TextWrapped(u8"Настройка внешнего вида и масштаба интерфейса:")
+            imgui.Spacing()
+            imgui.Separator()
+            imgui.Spacing()
+            
+            imgui.PushItemWidth(-1)
+            
+            imgui.Text(u8"Размер полосы прокрутки:")
+            local _scrollbarSizeStyle = new.int(settings.style.scrollbarSizeStyle)
+            if imgui.SliderInt("##scrollbarSize", _scrollbarSizeStyle, 10, 50, "%d px") then
+                settings.style.scrollbarSizeStyle = _scrollbarSizeStyle[0] 
+                SaveSettings()
+                SetStyle()
+            end
+
+            imgui.Spacing()
+
+            imgui.Text(u8"Масштаб интерфейса (DPI):")
+            local _MONET_DPI_SCALE = new.float(settings.style.scaleUI)
+            if imgui.SliderFloat("##scaleUI", _MONET_DPI_SCALE, 0.5, 3.0, "%.2f") then
+                settings.style.scaleUI = _MONET_DPI_SCALE[0] 
+                SaveSettings()
+            end
+            imgui.TextDisabled(u8"Рекомендуемые значения: 1.0 - 2.0")
+            
+            imgui.PopItemWidth()
+            
+            imgui.Spacing()
+            imgui.Separator()
+            imgui.Spacing()
+            
+            if imgui.Button(u8"Перезапустить скрипт", imgui.ImVec2(-1, ScaleUI(40))) then
+                thisScript():reload()
+            end
+            
+            imgui.Spacing()
+            imgui.TextWrapped(u8"Для применения изменения масштаба необходимо перезапустить скрипт.")
+            imgui.Spacing()
+            imgui.Text(u8"Полезные команды:")
+            imgui.BulletText(u8"/mmtr - перезапустить скрипт")
+            imgui.BulletText(u8"/mmtsr - сбросить масштаб к значению по умолчанию")
+            
+            imgui.EndChild()
+            imgui.EndTabItem()
+        end
+
+        -- ТАБ 7: Техническая информация (только если есть данные)
+        if #stateCrypto.queueShelves > 0 then
+            if imgui.BeginTabItem(u8"Тех. состояние") then
+                imgui.BeginChild("tab_techstate", imgui.ImVec2(-1, -1))
+                imgui.Spacing()
+                
+                imgui.Text(u8(string.format("Количество активных полок: %d", #stateCrypto.queueShelves)))
+                imgui.Spacing()
+                imgui.Separator()
+                imgui.Spacing()
+                
+                imgui.BeginChild("tech_state_scroll", imgui.ImVec2(-1, -1), true)
+                
+                -- Заголовки таблицы
+                imgui.Columns(4, "tech_columns", true)
+                imgui.SetColumnWidth(0, 100)
+                imgui.SetColumnWidth(1, 100)
+                imgui.SetColumnWidth(2, 100)
+                imgui.SetColumnWidth(3, 150)
+                
+                imgui.Text(u8"Строка")
+                imgui.NextColumn()
+                imgui.Text(u8"Заливка")
+                imgui.NextColumn()
+                imgui.Text(u8"Крипты")
+                imgui.NextColumn()
+                imgui.Text(u8"Состояние")
+                imgui.NextColumn()
+                imgui.Separator()
+                
+                -- Данные
+                for index, value in ipairs(stateCrypto.queueShelves) do
+                    imgui.Text(u8(tostring(value.samp_line)))
+                    imgui.NextColumn()
+                    imgui.Text(u8(tostring(value.fill)))
+                    imgui.NextColumn()
+                    imgui.Text(u8(tostring(value.count)))
+                    imgui.NextColumn()
+                    imgui.Text(u8(tostring(value.work)))
+                    imgui.NextColumn()
+                    if index < #stateCrypto.queueShelves then
+                        imgui.Separator()
+                    end
+                end
+                
+                imgui.Columns(1)
+                imgui.EndChild()
+                
+                imgui.EndChild()
+                imgui.EndTabItem()
+            end
+        end
+
+        imgui.EndTabBar()
     end
 
     imgui.EndChild()
@@ -1515,11 +2047,24 @@ function DrawHousesBank()
         imgui.ProgressBar(stateCrypto.progressHousesBank/#stateCrypto.queueHousesBank,imgui.ImVec2(-1,0), u8"Дом "..stateCrypto.progressHousesBank.."/"..#stateCrypto.queueHousesBank)
     end
 
-    if imgui.ButtonClickable(not stateCrypto.work, u8"Заполнить до MAX", imgui.ImVec2(-1, 0)) then
+    local btnTitle = settings.main.bankFillToTarget and u8"Заполнить до цели" or u8"Заполнить до MAX"
+    if imgui.ButtonClickable(not stateCrypto.work, btnTitle, imgui.ImVec2(-1, 0)) then
         StartProcessInteracting("dep")
     end
 
     imgui.BeginChild("list", imgui.ImVec2(-1, -1))
+    lastOpenHouse = HandleListNavigation(
+        (lastOpenHouse > 0 and lastOpenHouse or 1),
+        #housesBanks,
+        function(idx)
+            local house = housesBanks[idx]
+            if house then
+                sampSendDialogResponse(idDialogs.selectHouse, 1, house.samp_line, "")
+                housesBanks = {}
+                SwitchMainWindow()
+            end
+        end
+    )
     for i, house in ipairs(housesBanks) do
         local _bank_now_str = house.bankNow:gsub("[^%d]", "")
         local bank_now = tonumber(_bank_now_str) or 0
@@ -1540,7 +2085,7 @@ function DrawHousesBank()
             GetCommaValue(house.bankNow)
         )
 
-        if imgui.SelectableEx(house_text, lastOpenHouse == i, imgui.SelectableFlags.SpanAllColumns) then
+        if imgui.SelectableEx(i, house_text, lastOpenHouse == i, imgui.SelectableFlags.SpanAllColumns) then
             lastOpenHouse = i
             sampSendDialogResponse(idDialogs.selectHouse, 1, house.samp_line, "")
             housesBanks = {}
@@ -1597,6 +2142,17 @@ function DrawHouses()
     imgui.Separator()
 
     imgui.BeginChild("list", imgui.ImVec2(-1, -1))
+    lastOpenHouse = HandleListNavigation(
+         math.maxEx(1, math.minEx(lastOpenHouse, #houses)),
+        #houses,
+        function(idx)
+            local house = houses[idx]
+            if house then
+                sampSendDialogResponse(idDialogs.selectHouse, 1, house.samp_line, "")
+                houses = {}
+            end
+        end
+    )
     for i, house in ipairs(houses) do
         -- Определяем цвета для циклов и банка
         local cycles_color = house.cycles < 100 and COLORS.RED or COLORS.WHITE -- красный если < 100, белый если >= 100
@@ -1627,7 +2183,7 @@ function DrawHouses()
             house.currency
         )
 
-        if imgui.SelectableEx(house_text, lastOpenHouse == i, imgui.SelectableFlags.SpanAllColumns) then
+        if imgui.SelectableEx(i, house_text, lastOpenHouse == i, imgui.SelectableFlags.SpanAllColumns) then
             lastOpenHouse = i
             sampSendDialogResponse(idDialogs.selectHouse, 1, house.samp_line, "")
             houses = {}
@@ -1673,22 +2229,35 @@ function DrawShelves()
     imgui.Spacing()
 
     -- Первая строка кнопок: Собрать и Залить
-    local button_width = (imgui.GetWindowWidth() - ScaleUI(30)) / 2
+    local totalWidth = (imgui.GetWindowWidth() - ScaleUI(30))
+    local half    = totalWidth / 2
+    local quarter = totalWidth / 4
 
-    if imgui.ButtonClickable(not stateCrypto.work, fa.HAND_HOLDING_DOLLAR .. u8"\tСобрать всё", imgui.ImVec2(button_width, 0)) then
+    if imgui.ButtonClickable(not stateCrypto.work, fa.HAND_HOLDING_DOLLAR .. u8"\tСобрать", imgui.ImVec2(half, 0)) then
         StartProcessInteracting("take")
     end
     imgui.SameLine()
-    if imgui.ButtonClickable(not stateCrypto.work, fa.FILL_DRIP .. u8"\tЗалить всё", imgui.ImVec2(-1, 0)) then
+    if imgui.ButtonClickable(not stateCrypto.work, fa.FILL_DRIP .. u8"\tЗалить", imgui.ImVec2(quarter, 0)) then
         StartProcessInteracting("fill")
     end
 
+    imgui.SameLine()
+
+    -- 1/4 ширины — новый переключатель
+    local autoIcon  = settings.main.autoFillEnabled and fa.TOGGLE_ON or fa.TOGGLE_OFF
+    local autoTitle = settings.main.autoFillEnabled and u8"Автозаливка: вкл" or u8"Автозаливка: выкл"
+    if imgui.Button(autoIcon .. "\t" .. autoTitle, imgui.ImVec2(-1, 0)) then
+        settings.main.autoFillEnabled = not settings.main.autoFillEnabled
+        SaveSettings()
+        AddChatMessage("Автозаливка: " .. (settings.main.autoFillEnabled and "включена" or "выключена"), TYPECHATMESSAGES.SECONDARY)
+    end
+
     -- Вторая строка кнопок: Включить и Отключить
-    if imgui.ButtonClickable(not stateCrypto.work, fa.TOGGLE_ON .. u8"\tВключить всё", imgui.ImVec2(button_width, 0)) then
+    if imgui.ButtonClickable(not stateCrypto.work, fa.TOGGLE_ON .. u8"\tВключить карты", imgui.ImVec2(half, 0)) then
         StartProcessInteracting("on")
     end
     imgui.SameLine()
-    if imgui.ButtonClickable(not stateCrypto.work, fa.TOGGLE_OFF .. u8"\tОтключить всё", imgui.ImVec2(-1, 0)) then
+    if imgui.ButtonClickable(not stateCrypto.work, fa.TOGGLE_OFF .. u8"\tОтключить карты", imgui.ImVec2(-1, 0)) then
         StartProcessInteracting("off")
     end
 
@@ -1699,6 +2268,17 @@ function DrawShelves()
     imgui.Separator()
 
     imgui.BeginChild("list", imgui.ImVec2(-1, -1))
+    lastOpenShelves = HandleListNavigation(
+         math.maxEx(1, math.minEx(lastOpenShelves, #shelves)),
+        #shelves,
+        function(idx)
+            local shelf = shelves[idx]
+            if shelf then
+                sampSendDialogResponse(lastIDDialog, 1, shelf.samp_line, "")
+                imguiWindows.main[0] = false
+            end
+        end
+    )
     for i, shelf in ipairs(shelves) do
         local shelf_in_rack = math.floor(i / 4) + 1
 
@@ -1722,26 +2302,62 @@ function DrawShelves()
 
         local profit_color = shelf.profit > 1 and COLORS.GREEN or COLORS.WHITE -- зеленый если > 1, белый если <= 1
 
-        if imgui.Button(u8(string.format("Открыть##%d", i))) then
-            sampSendDialogResponse(lastIDDialog, 1, shelf.samp_line, "")
-            imguiWindows.main[0] = false
-        end
-        imgui.SameLine()
+        -- Расчёт ожидаемой выработки по уровню + остаток до доливки
+        local per_h, per_24h, per_cycle, hours_left, income_left =
+            CalcGpuIncome(shelf.level, shelf.percentage, settings.main.fillFrom)
 
+        -- Собираем суффикс по настройкам
+        local parts = {}
+        local inc = settings.main.income or { showPerHour=true, showPer24h=true, showPerCycle=true, showTillThreshold=true }
+
+        if inc.showPerHour  then table.insert(parts, string.format("%.2f/ч",   per_h))     end
+        if inc.showPer24h   then table.insert(parts, string.format("%.2f/24ч", per_24h))   end
+        if inc.showPerCycle then table.insert(parts, string.format("%.2f/цикл", per_cycle)) end
+
+        local income_suffix = ""
+        if #parts > 0 then
+            income_suffix = " | Доход: " .. table.concat(parts, " | ")
+        end
+
+        -- Доп. блок "до доливки": часы и прибыль, если есть запас > 0
+        if inc.showTillThresholdHours then -- and hours_left > 0
+            local hh = math.floor(hours_left)
+            local mm = math.floor((hours_left - hh) * 60 + 0.5)
+            income_suffix = income_suffix .. string.format(" | До %s: %d:%02dч",
+                shelf.percentage > settings.main.fillFrom and "доливки" or "заливки", hh, mm)
+        end
+        if inc.showTillThresholdProfit then -- and hours_left > 0
+            income_suffix = income_suffix .. string.format(" | Принесет: %.2f %s", income_left, shelf.currency)
+        end
+
+        -- Итоговая строка (для ASIC и не-ASIC используем один и тот же суффикс)
+        local _text = ""
         if shelf.profit2 then
-            imgui.TextColoredRGB(string.format("Полка №%d Ур.%d {%s}%s {%s}%.6f %s | %.6f %s {%s}%.1f%%",
+            _text = string.format(
+                "Полка №%d Ур.%d {%s}%s {%s}%.6f %s | %.6f %s {%s}%.1f%%%s",
                 shelf.shelf_number,
                 shelf.level,
                 gpu_color, shelf.status,
                 profit_color, shelf.profit, shelf.currency, shelf.profit2, shelf.currency2,
-                cooling_color, shelf.percentage))
+                cooling_color, shelf.percentage,
+                income_suffix
+            )
         else
-            imgui.TextColoredRGB(string.format("Полка №%d Ур.%d {%s}%s {%s}%.6f %s {%s}%.1f%%",
+            _text = string.format(
+                "Полка №%d Ур.%d {%s}%s {%s}%.6f %s {%s}%.1f%%%s",
                 shelf.shelf_number,
                 shelf.level,
                 gpu_color, shelf.status,
                 profit_color, shelf.profit, shelf.currency,
-                cooling_color, shelf.percentage))
+                cooling_color, shelf.percentage,
+                income_suffix
+            )
+        end
+
+        if imgui.SelectableEx(i, _text, lastOpenShelves == i, imgui.SelectableFlags.SpanAllColumns) then
+            lastOpenShelves = i
+            sampSendDialogResponse(lastIDDialog, 1, shelf.samp_line, "")
+            imguiWindows.main[0] = false
         end
     end
     imgui.EndChild()
@@ -1845,8 +2461,8 @@ function imgui.TextColoredRGB(text)
     render_text(text)
 end
 
-function imgui.SelectableEx(label, selected, flags, imVecSize)
-    if imgui.Selectable("##"..label, selected, flags, imVecSize) then
+function imgui.SelectableEx(id, label, selected, flags, imVecSize)
+    if imgui.Selectable("##"..id.."-"..label, selected, flags, imVecSize) then
         return true
     end
     imgui.SameLine()
@@ -1960,4 +2576,8 @@ function SetStyle(mobile)
     colors[clr.CheckMark] = ImVec4(mainColor.r * 1.2, mainColor.g * 1.4, mainColor.b * 1.6, 1)
     colors[clr.SliderGrab] = ImVec4(mainColor.r * 1.2, mainColor.g * 1.3, mainColor.b * 1.4, 1)
     colors[clr.SliderGrabActive] = ImVec4(mainColor.r, mainColor.g, mainColor.b, 1)
+
+    colors[clr.Tab]                    = colors[clr.WindowBg]
+    colors[clr.TabHovered]             = colors[clr.ButtonHovered]
+    colors[clr.TabActive]              = colors[clr.FrameBg]
 end
