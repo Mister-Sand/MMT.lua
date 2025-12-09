@@ -3,14 +3,14 @@
 -- =====================================================================================================================
 
 script_authors('Sand')
+script_name('MMT | Mining Tool')
 script_description('Mining assistant TG: @Mister_Sand')
-script_version("1.3")
+script_version("1.4")
 
 -- =====================================================================================================================
 --                                                          Import
 -- =====================================================================================================================
 
--- Проверяем библиотеку
 local function CheckLibrary(libName)
     local success, lib = pcall(require, libName)
     if not success then
@@ -52,8 +52,13 @@ ISMONETLOADER = true
 SEPORATORPATCH = "/"
 if MONET_DPI_SCALE == nil then MONET_DPI_SCALE = 1.0 ISMONETLOADER = false SEPORATORPATCH = "\\" end
 
-local folderConfig = 'config'..SEPORATORPATCH -- Folder config
-local PATCHCONFIG = folderConfig..'MMT CFGs'..SEPORATORPATCH  -- Main folder cfgs
+local folderConfig = 'config'..SEPORATORPATCH
+local PATCHCONFIG = folderConfig..'MMT CFGs'..SEPORATORPATCH
+
+-- === Логи / статистика заточки видеокарт ===
+local IMPROVE_LOGS_DIR   = PATCHCONFIG .. 'logs' .. SEPORATORPATCH     -- папка для текстовых логов
+local IMPROVE_STATS_FILE = PATCHCONFIG .. 'ImproveStats.json'          -- файл со сводной статистикой
+
 
 local COLORS = {
     WHITE = "FFFFFF",
@@ -70,7 +75,7 @@ local TYPECHATMESSAGES = {
     DEBUG = 10
 }
 
--- Доходность видеокарт по уровням (в час, уровни 1..10)
+-- Доходность видеокарт по уровням в час
 local GPU_HOURLY_BY_LEVEL = {
     [1]=0.029999, [2]=0.059999, [3]=0.090000, [4]=0.119990, [5]=0.150000,
     [6]=0.180000, [7]=0.209999, [8]=0.239999, [9]=0.270000, [10]=0.300000,
@@ -98,7 +103,7 @@ local defaultSettings = {
         -- Черный список домов, которые нужно скрыть
         blackListHouses = {},
         maxBankAmount = 19999999 - 10000,
-        -- Пополнять банк до целевой суммы (если выключено — до максимума диалога)
+        -- Пополнять банк до целевой суммы (если выключено - до максимума диалога)
         bankFillToTarget = false,
         bankTargetAmount = 10000000,
         -- Закрывать ли на ESC
@@ -120,12 +125,28 @@ local defaultSettings = {
             showTillThresholdProfit = true,  -- "до доливки" (часы и прибыль)
         },
     },
+    improve = {
+        -- true: улучшать все карты; false: только выбранную
+        menuAll = true,
+        -- 1 = Обычные, 2 = Arizona
+        typeCards = 1,
+        -- 1 = Последовательное (сначала низкий уровень), 2 = Поочередное (как на экране)
+        mode = 1,
+        -- Целевой уровень (не улучшать если уже >= этого уровня)
+        maxLevel = 2,
+        -- Проверять наличие смазки при старте заточки (через /stats)
+        checkOilsOnStart = true,
+    },
     deley = {
         timeoutDialog = 10,
         waitInterval = 10,
         timeoutShelf = 10,
         -- Ждать перед отправкой ответа на диалог
         waitRun = 0,
+        -- Пуза после получения результата
+        improve_waitResult = 500,
+        -- Пуза перед нажатием на видеокарту в инвентаре
+        improve_waitTryClick = 500,
     },
     style = {
         -- масштаб интерфейса
@@ -163,13 +184,25 @@ local imguiWindows = {
     main = new.bool(false),
 }
 -- Текущая позиция основного окна
-local posMainFraim = { x = 0, y = 0}
+local windowPos = nil
 
 -- Активный раздел в скрипте
 local activeTabScript = "main"
 
 local inputBlackHouse = new.int()
 local ui_bank = { buf = new.char[32]("") }
+
+-- Состояния для элеметов в ui
+local ui_state = {
+    -- Состояние свайпа списка
+    swipe = { active = false, DRAG_THRESHOLD = 6 },
+    -- Состояние перетаскивания окна
+    drag = {
+        active = false,
+        mx = 0, my = 0,       -- координаты мыши в момент начала перетаскивания
+        wx = 0, wy = 0,       -- позиция окна в момент начала перетаскивания
+    }
+}
 
 -- --------------------------------------------------------
 --                           State
@@ -247,6 +280,84 @@ local lastOpenHouse = 1
 local lastOpenShelves = 1
 
 -- --------------------------------------------------------
+--                           Improve
+-- --------------------------------------------------------
+local improve = {
+    isOn = false,
+    step = 0,              -- 0=выкл, 1=выбор карты, 2=жду "USE", 3=подтверждаю, 4=жду результат
+
+    -- Кэш видеокарт на ТЕКУЩЕЙ странице инвентаря
+    videoCards   = {},     -- { { td = <id>, level = <int>, storageUpgrade = <bool> } ... }
+    select       = 0,      -- индекс выбранной карты (когда menuAll=false)
+    lastScan     = 0,      -- оставить на будущее, сейчас не используем
+    currentIndex = 0,      -- индекс карты, которую сейчас точим
+
+    -- Состояние инвентаря видеокарт (страницы)
+    inv = {
+        pageTD     = 0,    -- id первой кнопки страниц
+        activePage = 1,    -- номер текущей страницы (для информации)
+        needScan   = false -- нужно перечитать видеокарты на этой странице
+    },
+
+    oils = { -- инвентарь смазок
+        arizona = 0,
+        classic = 0,
+        lastAt = '-',
+        busy = false,
+    },
+    needCheckOils   = false,   -- флаг: после старта надо проверить инвентарь
+    waitOils        = false,   -- ждём завершения сканирования /stats
+    consumedThisTry = false,   -- на текущую попытку уже списали смазки
+    waitStart       = false,   -- ждём сообщения "Вы начали процесс улучшения..."
+
+    -- ID текстдравов кнопки "USE"/"Использовать"
+    useTextId  = 0,  -- TD с текстом
+    useClickId = 0,  -- кликабельный TD (id+1)
+
+    -- Режим вида улучшения:
+    -- false  = улучшение производительности
+    -- true   = увеличение объёма хранения криптовалюты
+    useStorageUpgrade = false,
+
+    -- Логи и статистика заточки
+    logs = {
+        items      = {},   -- { { ts="дата-время", type="INFO", text="...", step=1 } ... }
+        max        = 300,  -- макс. количество записей
+        autoScroll = true, -- автопрокрутка вниз в UI
+    },
+    stats = {
+        sessionId  = 0,
+        active     = false,
+        startedAt  = 0,
+        finishedAt = 0,
+        attempts   = 0,
+        success    = 0,
+        fail       = 0,
+        oilsUsed   = 0,
+        lastReason = "",
+    },
+}
+
+local improveSteps = {
+    [0]='Улучшение выключено',
+    [1]='Выбираю видеокарту',
+    [2]='Использую видеокарту',
+    [3]='Подтверждаю крафт',
+    [4]='Ожидаю крафт'
+}
+
+local function MI_Say(msg)
+    AddChatMessage("Улучшение: "..tostring(msg), TYPECHATMESSAGES.SECONDARY)
+end
+
+-- --------------------------------------------------------
+--                           TD
+-- --------------------------------------------------------
+
+-- Кэш всех TD
+local TD = {cache = {}}
+
+-- --------------------------------------------------------
 --                           Class
 -- --------------------------------------------------------
 
@@ -264,12 +375,6 @@ local ShelfProcessor = {}
 -- =====================================================================================================================
 
 imgui.OnInitialize(function()
-    if ISMONETLOADER and settings.style.scaleUI ~= 1.0 then
-        MONET_DPI_SCALE = settings.style.scaleUI
-    elseif ISMONETLOADER then
-        settings.style.scaleUI = MONET_DPI_SCALE
-    end
-
     if not ISMONETLOADER then
         SetScaleUI()
     end
@@ -296,6 +401,55 @@ function main()
         settings.style.scaleUI = 1.0
         SaveSettings()
         thisScript():reload()
+    end)
+
+    -- Фоновый поток заточки
+    lua_thread.create(function()
+        while true do
+            wait(0)
+            -- автообновление инвентаря при старте заточки (если включено)
+            if improve.isOn and improve.needCheckOils then
+                improve.needCheckOils = false
+
+                if settings.improve.checkOilsOnStart then
+                    Improve_RefreshOils(true)  -- асинхронно (/stats + парсинг)
+                    improve.waitOils = true
+                    MI_Say("Проверяю наличие смазки.")
+                else
+                    -- проверка отключена - сразу переходим к первому шагу
+                    improve.step = 1
+                end
+            end
+
+            -- ждём завершения сканирования /stats и принимаем решение
+            if improve.isOn and improve.waitOils and not improve.oils.busy then
+                improve.waitOils = false
+                local count, name = Improve_GetOilCountByType()
+                if count < 2 then
+                    MI_Say(("Смазки нет (%s). Нужно минимум 2 - остановлено."):format(name))
+                    Improve_LogAdd("WARN", string.format(
+                        "Проверка смазки перед стартом: смазки нет (%s). Сессия не запущена.",
+                        name
+                    ))
+                    Improve_Stop("Недостаточно смазки при старте")
+                else
+                    Improve_LogAdd("INFO", string.format(
+                        "Проверка смазки перед стартом: смазки достаточно (%s: %d шт.).",
+                        name, count
+                    ))
+                    improve.step = 1
+                end
+            end
+
+            -- Сканим видеокарты только по запросу (когда страница изменилась / открылась)
+            if ((imguiWindows.main[0] and activeTabScript == "improve") or improve.isOn)
+                and improve.inv.needScan then
+                Improve_ScanVideoCards()
+                improve.inv.needScan = false
+            end
+
+            Improve_Tick()
+        end
     end)
 
     AddChatMessage('Скрипт загружен. Команда активации: {'..settings.style.colorChat..'}/mmt{FFFFFF}.')
@@ -354,7 +508,96 @@ function sampev.onServerMessage(color, text)
             return false
         end
     end
+
+    -- Старт заточки видеокарты:
+    if improve.isOn and improve.waitStart then
+        if improve.useStorageUpgrade then
+            if text:find('Вы начали процесс улучшения увеличения объема хранение видеокарты') then
+                improve.waitStart = false
+                improve.step = 4      -- заточка запущена
+                Improve_LogAdd("INFO", "Сервер подтвердил начало процесса улучшения хранилища видеокарты.")
+                Improve_AttemptStart()
+            end
+        else
+            if text:find('Вы начали процесс улучшения производительности видеокарты') then
+                improve.waitStart = false
+                improve.step = 4      -- заточка запущена
+                Improve_LogAdd("INFO", "Сервер подтвердил начало процесса улучшения уровня видеокарты.")
+                Improve_AttemptStart()
+            end
+        end
+    end
+
+    if improve.isOn and improve.step == 3 then
+        -- Если жмём "Использовать" слишком рано и сервер пишет "Подождите немного."
+        if text:find('Подождите немного') then
+            Improve_LogAdd("WARN", "Сервер ответил \"Подождите немного.\" - повторяем нажатие кнопки \"Использовать\".")
+            lua_thread.create(function ()
+                wait(1000)
+                if improve.isOn and improve.step == 3 then
+                    Improve_ClickUse()
+                end
+            end)
+        end
+
+        if improve.useStorageUpgrade then
+            if text:find('[Ошибка] {ffffff}У вас нет увеличителя пропускной способности', nil, true) then
+                MI_Say("У вас нет увеличителя пропускной способности!")
+                Improve_LogAdd("ERROR", "Получено сообщение об отсутствии увеличителя пропускной способности. Сессия остановлена.")
+                Improve_Stop("Нет увеличителя пропускной способности")
+            end
+            if text:find('[Ошибка] {ffffff}На выбранной видео-карте уже увеличен объём хранение криптовалюты', nil, true) then
+                MI_Say("Видеокарта уже улучшена, переходим к следующей")
+                Improve_LogAdd("ERROR", "Получено сообщение о уже увеличен объём хранение криптовалюты")
+
+                lua_thread.create(function ()
+                    wait(settings.deley.improve_waitResult or 600)
+                    local card = improve.videoCards[improve.currentIndex]
+                    if card then
+                        card.storageUpgrade = true
+                    end
+                    improve.step = 1
+                    improve.consumedThisTry = false
+                end)
+            end
+        end
+    end
+
+    -- Результат заточки видеокарты (успех/ошибка)
+    if improve.isOn and improve.step == 4 then
+        local isFail = nil
+        local isSuccess = nil
+
+        if improve.useStorageUpgrade then
+            isFail = text:find('^%[Информация%] {ffffff}При улучшении выбранной видеокарты вы допустили техническую ошибку, попробуйте еще раз%.$')
+            isSuccess = text:find('^%[Информация%] {ffffff}Вы успешно увеличили объем хранения криптовалюты')
+        else
+            isFail = text:find('^%[Информация%] {ffffff}При улучшении выбранной видеокарты вы допустили техническую ошибку, попробуйте еще раз%.$')
+            isSuccess = text:find('^%[Информация%] {ffffff}Вы успешно улучшили выбранную')
+        end
+
+        if isFail or isSuccess then
+            if isSuccess then
+                Improve_OnResult(true, text)
+            else
+                Improve_OnResult(false, text)
+            end
+
+            lua_thread.create(function ()
+                wait(settings.deley.improve_waitResult or 600)
+                improve.step = 1
+                improve.consumedThisTry = false
+            end)
+        end
+    end
+
+    if improve.isOn and text:find('Чтобы установить видеокарту, вы должны находиться в подвале возле одной из специальных стоек') then
+        MI_Say("Недопустимое место заточки!")
+        Improve_LogAdd("ERROR", "Получено сообщение о неверном месте заточки. Сессия остановлена.")
+        Improve_Stop("Неподходящее место заточки")
+    end
 end
+
 
 -- --------------------------------------------------------
 --                           onShowDialog
@@ -380,7 +623,7 @@ function sampev.onShowDialog(dialogId, style, title, button1, button2, text)
         local dep
         if target and target > 0 then
             if cur >= target then
-                -- Ничего пополнять: уже достигли цели
+                -- Ничего пополнять, уже достигли цели
                 DialogUtils.waitAndSendDialogResponse(dialogId, 0, 0, "")
                 return not settings.main.replaceDialog
             end
@@ -390,9 +633,9 @@ function sampev.onShowDialog(dialogId, style, title, button1, button2, text)
             dep = can
         end
 
-        -- Страховочные ограничения (как было): не больше доступного и лимита за раз
+        -- Страховочные ограничения, не больше доступного и лимита за раз
         local PER_OP_LIMIT = 10000000
-        dep = math.minEx(dep,  math.maxEx(0, can - 1))  -- -1 как и раньше, чтобы не упереться в край
+        dep = math.minEx(dep,  math.maxEx(0, can - 1))
         dep = math.minEx(dep, PER_OP_LIMIT)
         if dep <= 0 then
             DialogUtils.waitAndSendDialogResponse(dialogId, 0, 0, "")
@@ -400,7 +643,6 @@ function sampev.onShowDialog(dialogId, style, title, button1, button2, text)
         end
 
         DialogUtils.waitAndSendDialogResponse(dialogId, 1, 0, tostring(dep))
-        -- Обновим локальный «текущий баланс» в очереди домов банка
         stateCrypto.queueHousesBank[stateCrypto.progressHousesBank].bankNow = cur + dep
         return not settings.main.replaceDialog
     end
@@ -427,8 +669,6 @@ function sampev.onShowDialog(dialogId, style, title, button1, button2, text)
         local actions = ParseShelfVideoCardData(text)
 
         for index, value in ipairs(actions) do
-            -- AddChatMessage(value.action.." - "..value.samp_line.." - "..value.count)
-
             if processes.take then
                 if  value.count > 0 and (value.action == "take_btc" or value.action == "take_asc") then
                     stateCrypto.takeCount = value.count
@@ -478,7 +718,6 @@ function sampev.onShowDialog(dialogId, style, title, button1, button2, text)
     if stateCrypto.work and processes.fill and not stateCrypto.waitFill and title:find("Выберите тип жидкости") then
         local actions = ParseLiquidData(text)
 
-        -- Соберём наличие
         local counts = { btc = 0, supper_btc = 0, asc = 0 }
         local lines  = { btc = nil, supper_btc = nil, asc = nil }
 
@@ -492,11 +731,11 @@ function sampev.onShowDialog(dialogId, style, title, button1, button2, text)
         haveLiquid.supper_btc = counts.supper_btc
         haveLiquid.asc        = counts.asc
 
-        -- Тип карты из текущей очереди полок:
+        -- Тип карты из текущей очереди полок
         local cur = stateCrypto.queueShelves[stateCrypto.progressShelves]
         local card = cur and cur.card_type or nil  -- "ASIC" | "BTC" | "ASC" | nil
 
-        -- Фолбэк: если в самом диалоге есть фраза про ASIC — подстрахуемся
+        -- если в самом диалоге есть фраза про ASIC - подстрахуемся
         if (not card or card == "BTC") and (text:find("ASIC") or text:find("Достать ASIC")) then
             card = "ASIC"
         end
@@ -506,13 +745,13 @@ function sampev.onShowDialog(dialogId, style, title, button1, button2, text)
         if card == "ASC" then
             if counts.asc > 0 then choice = "asc" end
         else
-            -- BTC или ASIC (или тип не определён) — не льём ASC для BTC/ASIC
+            -- BTC или ASIC (или тип не определён) - не льём ASC для BTC/ASIC
             if counts.btc > 0 then
                 choice = "btc"
             elseif counts.supper_btc > 0 then
                 choice = "supper_btc"
             elseif not card and counts.asc > 0 then
-                -- Тип не распознан: разрешим asc как крайний случай
+                -- Тип не распознан - разрешим asc как крайний случай
                 choice = "asc"
             end
         end
@@ -540,9 +779,9 @@ function sampev.onShowDialog(dialogId, style, title, button1, button2, text)
 
         -- Не автолить, если зашли через флешку
         local openedViaFlash = (dialogId == idDialogs.selectVideoCardItemFlash)
-        -- Если включена автозаливка и мы не заняты процессом — стартуем заливку
+        -- Если включена автозаливка и мы не заняты процессом - стартуем заливку
         if settings.main.autoFillEnabled and not stateCrypto.work and not openedViaFlash then
-            -- Есть ли вообще смысл заливать (ниже или равно порогу)?
+            -- Есть ли вообще смысл заливать?
             local needFill = false
             for _, s in ipairs(shelves) do
                 if (s.percentage or 0) <= (settings.main.fillFrom or 50.0) then
@@ -552,7 +791,6 @@ function sampev.onShowDialog(dialogId, style, title, button1, button2, text)
             end
 
             if needFill then
-                -- Стартанём с небольшим отложенным запуском, чтобы диалог "устаканился"
                 lua_thread.create(function()
                     wait(50)
                     StartProcessInteracting("fill")
@@ -583,6 +821,91 @@ function sampev.onShowDialog(dialogId, style, title, button1, button2, text)
 
         if settings.main.replaceDialog then
             return false
+        end
+    end
+
+
+    -- Выбор вида улучшения видеокарты:
+    --  - "Улучшить производительность видео-карты [до N уровня]"
+    --  - "Увеличить объем хранения криптовалюты на видео-карте"
+    if improve.isOn and improve.step == 3 and title:find("{BFBBBA}Выберите вид улучшения для видеокарты") then
+        local perfIndex      = nil  -- индекс строки с улучшением производительности
+        local storageIndex   = nil  -- индекс строки с увеличением хранилища
+        local currentIndex   = -1
+
+        for line in (text or ""):gmatch("[^\r\n]+") do
+            currentIndex = currentIndex + 1
+
+            -- любая строка, где есть "Улучшить производительность видео-карты [до N уровня]"
+            if line:find("Улучшить производительность видео-карты", nil, true) then
+                -- просто запоминаем индекс, уровень N может быть любым (2..10)
+                perfIndex = currentIndex
+            end
+
+            -- строка увеличения объёма хранения криптовалюты
+            if line:find("Увеличить объем хранения криптовалюты на видео-карте", nil, true) then
+                storageIndex = currentIndex
+            end
+        end
+
+        local listToClick = 0
+
+        if improve.useStorageUpgrade and storageIndex ~= nil then
+            -- включён режим "хранилище крипты" и опция есть
+            listToClick = storageIndex
+        elseif perfIndex ~= nil then
+            -- жмём улучшение производительности
+            listToClick = perfIndex
+        end
+
+        sampSendDialogResponse(dialogId, 1, listToClick, "")
+        return not settings.main.replaceDialog
+    end
+
+    if improve.isOn and improve.step == 3 and title:find("{BFBBBA}Улучшение видеокарты") then
+        if improve.useStorageUpgrade then
+            -- pass
+        else
+            -- если почему-то к этому моменту смазки уже нет - стоп
+            if not Improve_HasRequiredOils(2) then
+                MI_Say("Недостаточно смазки (нужно 2). Отключаюсь.")
+                improve.isOn = false
+                improve.step = 0
+                return not (settings.main and settings.main.replaceDialog)
+            end
+
+            -- списываем один раз за попытку (анти-дубль при повторном показе диалога)
+            if not improve.consumedThisTry then
+                Improve_ConsumeOils(2)
+                improve.consumedThisTry = true
+            end
+        end
+
+        sampSendDialogResponse(dialogId, 1, 0, "")
+        improve.waitStart = true
+        return not settings.main.replaceDialog
+    end
+
+    if improve.oils.busy then
+        -- первая «крышка» /stats
+        if title:find('Основная статистика') then
+            sampSendDialogResponse(dialogId, 1, 0, '')
+            return false
+        end
+        -- страницы инвентаря «ID: ...»
+        if title:find('ID:') then
+            Improve_ParseInventoryDialogPage(text or '')
+            if (text or ''):find('Следующая%sстраница') then
+                -- листаем дальше
+                sampSendDialogResponse(dialogId, 1, 0, '')
+                return false
+            else
+                -- финал
+                improve.oils.busy = false
+                improve.oils.lastAt = os.date('%H:%M')
+                sampSendDialogResponse(dialogId, 0, 0, '')
+                return false
+            end
         end
     end
 end
@@ -646,6 +969,69 @@ function onWindowMessage(msg, wparam, lparam)
     end
 end
 
+function sampev.onShowTextDraw(id, data)
+    if ISMONETLOADER then
+        TD.cache[id] = data
+    end
+
+    -- Кнопки переключения страниц инвентаря видеокарт
+    if data.text == "LD_BEAT:chit"
+        and data.position.x > 320 and data.position.y > 240
+        and ((imguiWindows.main[0] and activeTabScript == "improve") or improve.isOn) then
+
+        -- первый раз запоминаем id первой кнопки страницы
+        if improve.inv.pageTD == 0 then
+            improve.inv.pageTD   = id
+            improve.inv.activePage = 1
+            Improve_MarkNeedScan()
+        else
+            -- если обновился именно первый TD страницы - считаем, что страницу перелистнули
+            if id == improve.inv.pageTD then
+                improve.inv.activePage = (improve.inv.activePage or 1)
+                Improve_MarkNeedScan()
+            end
+        end
+    end
+
+    -- Появление кнопки USE сигналит о готовности подтверждения крафта
+    if (data.text == 'USE' or Translationtextdraw(data.text) == 'ИСПОЛЬЗОВАТЬ') and improve.step == 2 then
+        -- Переходим на шаг 3 - ожидание клика по "Использовать"
+        improve.step = 3
+
+        -- Сохраняем ID текстдравов, чтобы можно было нажимать ещё раз
+        improve.useClickId = id + 1   -- кликабельный TD
+        improve.useTextId  = id       -- TD с текстом "USE"
+
+        -- Первая автоматическая попытка нажать
+        Improve_ClickUse()
+    end
+end
+
+function sampev.onHideTextDraw(id)
+    if ISMONETLOADER then TD.cache[id] = nil end
+
+    -- Если скрылась кнопка страниц - сбрасываем состояние инвентаря
+    if improve.inv and id == improve.inv.pageTD then
+        improve.inv.pageTD     = 0
+        improve.inv.activePage = 1
+        improve.inv.needScan   = false
+        improve.videoCards     = {}
+        improve.currentIndex   = 0
+    end
+end
+
+function sampev.onTextDrawSetString(id, text)
+    if ISMONETLOADER and TD.cache[id] then TD.cache[id].text = text end
+end
+
+function sampev.onTextDrawSetPreviewModel(id, modelId, rx, ry, rz, zoom)
+    if ISMONETLOADER then 
+        local t = TD.cache[id] or {}
+        t.modelId  = modelId
+        TD.cache[id] = t
+    end
+end
+
 -- =====================================================================================================================
 --                                                          FUNCTIONS
 -- =====================================================================================================================
@@ -659,13 +1045,13 @@ end
 
 -- level            : уровень видеокарты (целое)
 -- cool_percent_opt : (опц.) остаток охлаждения в процентах [0..100]
--- min_percent_opt  : (опц.) порог доливки, если задан — "время" до доливки,
---                    иначе — до полного нуля
+-- min_percent_opt  : (опц.) порог доливки, если задан - "время" до доливки,
+--                    иначе - до полного нуля
 -- Возвращает:
 --   per_hour, per_24h, per_cycle, hours_to_show, income_to_end
 -- где:
---   hours_to_show  — время до доливки (если выше порога) ИЛИ до конца работы (если порог уже пройден)
---   income_to_end  — прибыль до полного окончания охлаждайки (всегда до нуля)
+--   hours_to_show  - время до доливки (если выше порога) ИЛИ до конца работы (если порог уже пройден)
+--   income_to_end  - прибыль до полного окончания охлаждайки (всегда до нуля)
 local function CalcGpuIncome(level, cool_percent_opt, min_percent_opt)
     level = tonumber(level) or 1
     local per_hour  = GPU_HOURLY_BY_LEVEL[level] or 0
@@ -685,8 +1071,8 @@ local function CalcGpuIncome(level, cool_percent_opt, min_percent_opt)
         income_to_end = per_hour * hours_until_zero
 
         -- Логика показа "времени":
-        -- если выше порога — показываем до доливки,
-        -- если на/ниже порога — показываем до конца работы (до нуля)
+        -- если выше порога - показываем до доливки,
+        -- если на/ниже порога - показываем до конца работы (до нуля)
         local threshold = tonumber(min_percent_opt)
         if threshold ~= nil then
             if threshold < 0 then threshold = 0 elseif threshold > 100 then threshold = 100 end
@@ -696,7 +1082,7 @@ local function CalcGpuIncome(level, cool_percent_opt, min_percent_opt)
                 hours_to_show = hours_until_zero
             end
         else
-            -- порога нет — просто до конца работы
+            -- порога нет - просто до конца работы
             hours_to_show = hours_until_zero
         end
     end
@@ -704,6 +1090,58 @@ local function CalcGpuIncome(level, cool_percent_opt, min_percent_opt)
     return per_hour, per_24h, per_cycle, hours_to_show, income_to_end
 end
 
+
+-- ---- Утилиты для очистки кэша при перезапуске заточки/перезаходе ----
+function TD.Reset()
+    for k in pairs(TD.cache) do TD.cache[k] = nil end
+end
+
+-- ---- Простые обёртки, которые ты будешь звать из логики заточки ----
+function TD_IsExists(id)
+    if not ISMONETLOADER then
+        local ok, res = pcall(sampTextdrawIsExists, id)
+        if ok then return res end
+    end
+    local t = TD.cache[id]
+    return t ~= nil
+end
+
+function TD_GetString(id)
+    if not ISMONETLOADER then
+        local ok, res = pcall(sampTextdrawGetString, id)
+        if ok then return res end
+    end
+    local t = TD.cache[id]
+    return t and t.text or nil
+end
+
+-- Возвращает (modelId, rx, ry, rz, zoom, vehColor)
+function TD_GetModelInfo(id)
+    if not ISMONETLOADER then
+        local ok, a,b,c,d,e,f = pcall(sampTextdrawGetModelRotationZoomVehColor, id)
+        if ok then return a,b,c,d,e,f end
+    end
+    local t = TD.cache[id] or {}
+    return t.modelId or 0, 0.0, 0.0, 0.0, 1.0, 0
+end
+
+-- Возвращает (letterColor, boxColor) - во многих скриптах boxColor используют как outline
+function TD_GetOutlineColor(id)
+    if not ISMONETLOADER then
+        local ok, a,b = pcall(sampTextdrawGetOutlineColor, id)
+        if ok then return a,b end
+    end
+    local t = TD.cache[id] or {}
+    return t.letterColor or -1, t.boxColor or -1
+end
+
+function TD_GetBackgroundColor(id)
+    -- Мобайл: из кэша (если есть)
+    if TD and TD.cache and TD.cache[id] then
+        return TD.cache[id].backgroundColor
+    end
+    return nil
+end
 
 -- --------------------------------------------------------
 --                           Dialog Utils
@@ -777,8 +1215,6 @@ function DialogUtils.waitAndSendDialogResponse(dialogId, button, listitem, input
         local timeout = os.clock() + waitRun/1000
         while os.clock() < timeout do
             wait(settings.deley.waitInterval)
-        -- AddChatMessage(os.clock().." - "..timeout)
-
         end
 
         sampSendDialogResponse(dialogId, button, listitem, input or "")
@@ -977,7 +1413,7 @@ function HouseProcessor.processRegularHouses()
         local shelvesLoaded = false
 
         while not shelvesLoaded do
-            wait(10)
+            wait(50)
 
             if #shelves > 0 then
                 shelvesLoaded = true
@@ -1114,6 +1550,626 @@ function DeactivateProcessesInteracting()
 end
 
 -- --------------------------------------------------------
+--                           Improve
+-- --------------------------------------------------------
+
+-- ===== ЛОГИ ЗАТОЧКИ / СТАТИСТИКА =====
+
+-- запись одной строки в файл лога за текущий день: logs/YYYY-MM-DD.log
+function Improve_WriteLogLine(line)
+    if not IMPROVE_LOGS_DIR or not line or line == "" then return end
+
+    local filename = os.date('%Y-%m-%d') .. ".log"
+    local fullPath = IMPROVE_LOGS_DIR .. filename
+
+    local folderPath = fullPath:match("^(.*[/\\])")
+    if folderPath then
+        pcall(EnsureDirectoryExists, folderPath)
+    end
+
+    local ok, fh = pcall(io.open, fullPath, "a")
+    if ok and fh then
+        fh:write(line, "\n")
+        fh:close()
+    end
+end
+
+-- загрузка/инициализация общей статистики из JSON
+function Improve_GetStatsStore()
+    if not IMPROVE_STATS_FILE then return nil end
+
+    if not improve.statsStore then
+        local ok, data = pcall(LoadJSON, IMPROVE_STATS_FILE)
+        if not ok or type(data) ~= 'table' then
+            data = {}
+        end
+        data.days = data.days or {}
+        data.total = data.total or {
+            sessions  = 0,
+            attempts  = 0,
+            success   = 0,
+            fail      = 0,
+            oilsUsed  = 0,
+            time      = 0,
+        }
+        improve.statsStore = data
+    end
+
+    return improve.statsStore
+end
+
+-- сохранение статистики в JSON
+function Improve_SaveStatsStore()
+    if not IMPROVE_STATS_FILE or not improve.statsStore then return end
+    pcall(SaveJSON, IMPROVE_STATS_FILE, improve.statsStore)
+end
+
+-- внутренняя функция добавления записи в лог
+function Improve_LogAdd(evType, text)
+    if not improve.logs then
+        improve.logs = { items = {}, max = 300, autoScroll = true }
+    end
+
+    local ts    = os.date('%d.%m.%Y %H:%M:%S')
+    local ttype = evType or "INFO"
+    local msg   = text or ""
+
+    local line = string.format("[%s] [%s] %s", ts, ttype, msg)
+
+    -- в память (для UI)
+    table.insert(improve.logs.items, {
+        ts   = ts,
+        type = ttype,
+        text = msg,
+        step = improve.step,
+    })
+
+    local maxCount = improve.logs.max or 300
+    while #improve.logs.items > maxCount do
+        table.remove(improve.logs.items, 1)
+    end
+
+    -- опционально в консоль, если включён debug
+    if settings.main.typeChatMessage and settings.main.typeChatMessage.debug then
+        print("[IMPROVE] " .. line)
+    end
+
+    -- в файл по дате
+    Improve_WriteLogLine(line)
+end
+
+-- старт сессии заточки
+function Improve_SessionStart()
+    Improve_GetStatsStore()
+
+    local s = improve.stats or {}
+    s.sessionId  = (s.sessionId or 0) + 1
+    s.active     = true
+    s.startedAt  = os.time()
+    s.finishedAt = 0
+    s.attempts   = 0
+    s.success    = 0
+    s.fail       = 0
+    s.oilsUsed   = 0
+    s.lastReason = ""
+    improve.stats = s
+
+    local modeName  = (settings.improve.mode == 1) and "Последовательное" or "Поочередное"
+    local cardsName = (settings.improve.typeCards == 2) and "Arizona" or "Обычные"
+    local maxLevel  = settings.improve.maxLevel or 2
+    local checkOils = settings.improve.checkOilsOnStart and "Да" or "Нет"
+
+    Improve_LogAdd("INFO", string.format(
+        "Старт сессии #%d. Карты: %s, режим: %s, целевой уровень: %d, проверять смазку: %s.",
+        s.sessionId, cardsName, modeName, maxLevel, checkOils
+    ))
+end
+
+-- завершение сессии заточки + обновление суточной и общей статистики
+function Improve_SessionStop(reason)
+    local s = improve.stats
+    if not s or not s.active then return end
+
+    s.active     = false
+    s.finishedAt = os.time()
+    s.lastReason = reason or s.lastReason or "не указано"
+
+    local duration = 0
+    if s.startedAt and s.startedAt > 0 then
+        duration = math.max(0, s.finishedAt - s.startedAt)
+    end
+
+    -- Обновляем статистику по дням и общую
+    local store = Improve_GetStatsStore()
+    if store then
+        local dayKey
+        if s.startedAt and s.startedAt > 0 then
+            dayKey = os.date('%Y-%m-%d', s.startedAt)
+        else
+            dayKey = os.date('%Y-%m-%d')
+        end
+
+        store.days = store.days or {}
+        local day = store.days[dayKey] or {
+            sessions  = 0,
+            attempts  = 0,
+            success   = 0,
+            fail      = 0,
+            oilsUsed  = 0,
+            time      = 0,
+        }
+
+        day.sessions  = (day.sessions  or 0) + 1
+        day.attempts  = (day.attempts  or 0) + (s.attempts or 0)
+        day.success   = (day.success   or 0) + (s.success  or 0)
+        day.fail      = (day.fail      or 0) + (s.fail     or 0)
+        day.oilsUsed  = (day.oilsUsed  or 0) + (s.oilsUsed or 0)
+        day.time      = (day.time      or 0) + duration
+
+        store.days[dayKey] = day
+
+        local total = store.total or {
+            sessions  = 0,
+            attempts  = 0,
+            success   = 0,
+            fail      = 0,
+            oilsUsed  = 0,
+            time      = 0,
+        }
+
+        total.sessions  = (total.sessions  or 0) + 1
+        total.attempts  = (total.attempts  or 0) + (s.attempts or 0)
+        total.success   = (total.success   or 0) + (s.success  or 0)
+        total.fail      = (total.fail      or 0) + (s.fail     or 0)
+        total.oilsUsed  = (total.oilsUsed  or 0) + (s.oilsUsed or 0)
+        total.time      = (total.time      or 0) + duration
+
+        store.total = total
+
+        Improve_SaveStatsStore()
+    end
+
+    Improve_LogAdd("INFO", string.format(
+        "Окончание сессии #%d (%s). Попыток: %d, успешных: %d, неудачных: %d, смазки потрачено: %d, длительность: %d сек.",
+        s.sessionId or 0,
+        s.lastReason,
+        s.attempts or 0,
+        s.success  or 0,
+        s.fail     or 0,
+        s.oilsUsed or 0,
+        duration
+    ))
+end
+
+function Improve_Stop(reason)
+    -- сначала аккуратно закрываем сессию
+    Improve_SessionStop(reason or "остановлено вручную")
+
+    -- потом чистим флаги автомата
+    improve.isOn          = false
+    improve.step          = 0
+    improve.needCheckOils = false
+    improve.waitOils      = false
+    improve.waitStart     = false
+    improve.consumedThisTry = false
+    improve.currentIndex  = 0
+    improve.useTextId     = 0
+    improve.useClickId    = 0
+end
+
+function Improve_AttemptStart()
+    local s = improve.stats
+    if not (s and s.active) then return end
+
+    s.attempts = (s.attempts or 0) + 1
+
+    local idx            = improve.currentIndex or 0
+    local card           = improve.videoCards[idx]
+    local level          = card and card.level or 0
+    local storageUpgrade = cart and cart.storageUpgrade or false
+
+    Improve_LogAdd("INFO", string.format(
+        "Попытка #%d: карта #%d, уровень %d, улучшенное хранилище: %s.",
+        s.attempts, idx, level, storageUpgrade and "есть" or "нет"
+    ))
+end
+
+-- ===== БАЗОВАЯ ЛОГИКА =====
+
+function Improve_GetOilCountByType()
+    local isAZ = (settings.improve.typeCards == 2)
+    local count = isAZ and (improve.oils.arizona or 0) or (improve.oils.classic or 0)
+    local name  = isAZ and "Смазка для разгона Arizona Video Card" or "Смазка для разгона видеокарты"
+    return count, name
+end
+
+function Improve_HasRequiredOils(n)
+    -- Если выключена галка "проверять смазки перед стартом",
+    -- НЕ блокируем заточку по локальному счётчику смазок
+    if not settings.improve.checkOilsOnStart then
+        return true
+    end
+
+    local count = (settings.improve.typeCards == 2)
+        and (improve.oils.arizona or 0)
+        or  (improve.oils.classic or 0)
+
+    return count >= (n or 2)
+end
+
+function Improve_ConsumeOils(n)
+    n = n or 2
+    if settings.improve.typeCards == 2 then
+        improve.oils.arizona = math.maxEx(0, (improve.oils.arizona or 0) - n)
+    else
+        improve.oils.classic = math.maxEx(0, (improve.oils.classic or 0) - n)
+    end
+
+    if improve.stats and improve.stats.active then
+        improve.stats.oilsUsed = (improve.stats.oilsUsed or 0) + n
+    end
+
+    Improve_LogAdd("INFO", string.format(
+        "Списано %d смазки. Остаток: Arizona=%d, Обычная=%d.",
+        n, improve.oils.arizona or 0, improve.oils.classic or 0
+    ))
+end
+
+function Improve_ResetOilCounters()
+    improve.oils.arizona, improve.oils.classic = 0, 0
+end
+
+function Improve_ParseInventoryDialogPage(text)
+    for line in (text or ''):gmatch("[^\r\n]+") do
+        local indexSlot, name, count = line:match("%[([^%]]+)%]%s(.-)%s%{.-}%[([^%]]+)%sшт%]")
+        count = tonumber(count)
+        if indexSlot and name and count then
+            if name == "Смазка для разгона Arizona Video Card" then
+                improve.oils.arizona = improve.oils.arizona + count
+            elseif name == "Смазка для разгона видеокарты" then
+                improve.oils.classic = improve.oils.classic + count
+            end
+        end
+    end
+end
+
+-- Запуск обновления
+function Improve_RefreshOils(async)
+    if improve.oils.busy then return end
+    Improve_ResetOilCounters()
+    improve.oils.busy = true
+    Improve_LogAdd("INFO", "Запрос /stats для обновления инвентаря смазок.")
+    sampSendChat('/stats')
+
+    local function logResult()
+        Improve_LogAdd("INFO", string.format(
+            "Инвентарь обновлён: Arizona=%d, Обычная=%d.",
+            improve.oils.arizona or 0,
+            improve.oils.classic or 0
+        ))
+    end
+
+    if async then
+        lua_thread.create(function()
+            while improve.oils.busy do wait(10) end
+            logResult()
+        end)
+    else
+        while improve.oils.busy do wait(10) end
+        logResult()
+        return true
+    end
+end
+
+-- Пометить, что нужно перечитать видеокарты на текущей странице
+function Improve_MarkNeedScan()
+    if not improve.inv then return end
+    improve.inv.needScan = true
+    improve.currentIndex = 0
+end
+
+-- Поиск доступных видеокарт на экране (однократный скан)
+function Improve_ScanVideoCards()
+    local cards = {}
+    local page  = improve.inv and improve.inv.activePage or 1
+
+    -- сканируем все текстдроу и собираем только рамки видеокарт
+    for i = 0, 4096 do
+        if TD_IsExists(i) then
+            local pass = false
+
+            -- Фильтр рамки TD по типу карт
+            if ISMONETLOADER then
+                local bg = TD_GetBackgroundColor(i)
+                local wantBG = (settings.improve.typeCards == 2) and -16718603 or -13421773
+                pass = (tostring(bg) == tostring(wantBG))
+            else
+                local _, outline = sampTextdrawGetOutlineColor(i)
+                local wantOutline = (settings.improve.typeCards == 1) and 4281545523 or 4294304768
+                pass = (tostring(outline) == tostring(wantOutline))
+            end
+
+            if pass then
+                -- Рамка видеокарты
+                if TD_GetString(i) == 'LD_SPAC:white' and TD_GetModelInfo(i) == 962 then
+                    local s1 = TD_GetString(i + 1)
+                    if s1 and TD_GetModelInfo(i + 1) == 0 then
+                        local lvlStr = s1:match("(%-?%d+)%s*[lL][vV][lL]")
+
+                        local lvl = tonumber(lvlStr or "") or 0
+
+                        table.insert(cards, {
+                            td             = i,
+                            level          = lvl,
+                            storageUpgrade = false,
+                        })
+                    end
+                end
+            end
+        end
+    end
+
+    -- Сортировка для режима "Последовательное" (низкие уровни вперёд)
+    if settings.improve.mode == 1 and settings.improve.menuAll then
+        table.sort(cards, function(a, b)
+            return (a.level or 0) < (b.level or 0)
+        end)
+    end
+
+    improve.videoCards = cards
+
+    if #cards == 0 then
+        Improve_LogAdd("WARN", string.format(
+            "Сканирование страницы инвентаря #%d: видеокарты не найдены.",
+            page
+        ))
+    else
+        Improve_LogAdd("INFO", string.format(
+            "Сканирование страницы инвентаря #%d: найдено карт: %d.",
+            page, #cards
+        ))
+    end
+end
+
+function Improve_TryClick(td_id)
+    lua_thread.create(function() wait(settings.deley.improve_waitTryClick or 500) sampSendClickTextdraw(td_id) end)
+end
+
+-- Нажать кнопку USE
+function Improve_ClickUse()
+    if improve.useClickId == 0 or improve.useTextId == 0 then return end
+
+    lua_thread.create(function ()
+        local tries    = 0
+        local maxTries = 5
+        local delayMs  = 300
+
+        while improve.isOn and improve.step == 3 and tries < maxTries do
+            tries = tries + 1
+
+            sampSendClickTextdraw(improve.useClickId)
+            wait(delayMs)
+
+            -- Проверяем, все ли еще висит "USE"/"Использовать"
+            local curText = TD_GetString(improve.useTextId)
+            local stillUSE = curText and (curText == 'USE' or Translationtextdraw(curText) == 'ИСПОЛЬЗОВАТЬ')
+
+            -- Если кнопка пропала/изменилась - выходим
+            if not stillUSE then
+                break
+            end
+        end
+    end)
+end
+
+-- Результат заточки (успех/ошибка) - обновляем уровень в кэше
+function Improve_OnResult(success, serverMsg)
+    if not improve.currentIndex or improve.currentIndex <= 0 then return end
+
+    local card = improve.videoCards[improve.currentIndex]
+    if not card then return end
+
+    if improve.useStorageUpgrade then
+
+        if success then
+            card.storageUpgrade = success
+        end
+
+        local s = improve.stats
+        if s and s.active then
+            if success then
+                s.success = (s.success or 0) + 1
+            else
+                s.fail    = (s.fail or 0) + 1
+            end
+        end
+
+        local attemptNo = s and s.attempts or 0
+        if success then
+            Improve_LogAdd("SUCCESS", string.format(
+                "Попытка #%d: УСПЕХ. Карта #%d, улучшенное хранилище.",
+                attemptNo, improve.currentIndex or 0
+            ))
+        else
+            Improve_LogAdd("WARN", string.format(
+                "Попытка #%d: ОШИБКА. Карта #%d, улучшенное хранилище (без изменений).",
+                attemptNo, improve.currentIndex or 0
+            ))
+        end
+    else
+        local oldLvl = card.level or 0
+        local newLvl = oldLvl
+
+        if success then
+            -- Пытаемся вытащить фактический уровень из сообщения:
+            local parsedLvl
+
+            if serverMsg then
+                local lvlText = serverMsg:match("до%s+(%d+)%s+уровн")
+                if lvlText then
+                    parsedLvl = tonumber(lvlText)
+                end
+            end
+
+            newLvl = parsedLvl or (oldLvl + 1)
+            if newLvl > 10 then newLvl = 10 end
+            card.level = newLvl
+        end
+
+        local s = improve.stats
+        if s and s.active then
+            if success then
+                s.success = (s.success or 0) + 1
+            else
+                s.fail    = (s.fail or 0) + 1
+            end
+        end
+
+        local attemptNo = s and s.attempts or 0
+        if success then
+            Improve_LogAdd("SUCCESS", string.format(
+                "Попытка #%d: УСПЕХ. Карта #%d, уровень %d -> %d.",
+                attemptNo, improve.currentIndex or 0, oldLvl, newLvl
+            ))
+        else
+            Improve_LogAdd("WARN", string.format(
+                "Попытка #%d: ОШИБКА. Карта #%d, уровень %d (без изменений).",
+                attemptNo, improve.currentIndex or 0, oldLvl
+            ))
+        end
+
+        -- Для режима "Последовательное" пересортируем по уровню
+        if settings.improve.menuAll and settings.improve.mode == 1 then
+            table.sort(improve.videoCards, function(a, b)
+                return (a.level or 0) < (b.level or 0)
+            end)
+        end
+    end
+end
+
+-- Шаговая машина состояний
+function Improve_Tick()
+    if not improve.isOn then return end
+    if improve.waitOils then return end -- Ждем смазки
+
+    if improve.step == 1 then
+        local targetLevel = settings.improve.maxLevel or 2
+
+        if not Improve_HasRequiredOils(2) and not improve.useStorageUpgrade then
+            MI_Say("Смазка закончилась. Отключаюсь.")
+            Improve_LogAdd("WARN", "Смазка закончилась. Сессия заточки будет остановлена.")
+            Improve_Stop("Закончилась смазка в процессе")
+            return
+        end
+        improve.consumedThisTry = false
+
+        -- если в кэше нет карт, смысла продолжать нет
+        if #improve.videoCards == 0 then
+            MI_Say("На текущей странице инвентаря видеокарт не найдено.")
+            Improve_LogAdd("WARN", "На текущей странице инвентаря видеокарт не найдено. Сессия остановлена.")
+            Improve_Stop("Нет видеокарт на странице")
+            return
+        end
+
+        if settings.improve.menuAll then
+            -- Работаем по всем картам
+            local candidate, idxCandidate
+            for idx, v in ipairs(improve.videoCards) do
+                if improve.useStorageUpgrade then
+                    if not v.storageUpgrade then
+                        candidate    = v
+                        idxCandidate = idx
+                        break
+                    end
+                else
+                    if v.level < targetLevel then
+                        candidate    = v
+                        idxCandidate = idx
+                        break
+                    end
+                end
+            end
+
+            if candidate then
+                improve.currentIndex = idxCandidate
+                if improve.useStorageUpgrade then
+                    Improve_LogAdd("INFO", string.format(
+                        "Выбрана карта #%d для улучшения хранилища.",
+                        idxCandidate
+                    ))
+                else
+                    Improve_LogAdd("INFO", string.format(
+                        "Выбрана карта #%d для заточки (уровень %d, целевой уровень %d).",
+                        idxCandidate, candidate.level or 0, targetLevel
+                    ))
+                end
+                Improve_TryClick(candidate.td)
+                improve.step = 2
+            else
+                local page = improve.inv and improve.inv.activePage or 1
+                MI_Say("Подходящих видеокарт не найдено. Отключаюсь.")
+                if improve.useStorageUpgrade then
+                    Improve_LogAdd("INFO", string.format(
+                        "Подходящих видеокарт для улучшения хранилища на странице #%d не найдено.",
+                        page
+                    ))
+                    Improve_Stop("Все видеокарты уже расширены по хранилищу")
+                else
+                    Improve_LogAdd("INFO", string.format(
+                        "Подходящих видеокарт для улучшения до уровня %d на странице #%d не найдено.",
+                        targetLevel, page
+                    ))
+                    Improve_Stop("Все видеокарты уже достигли целевого уровня")
+                end
+            end
+        else
+            -- Режим одной выбранной карты
+            if improve.select == 0 then
+                MI_Say("Выбери видеокарту внизу списка.")
+                Improve_LogAdd("WARN", "Не выбрана видеокарта для заточки в режиме одиночной карты.")
+                Improve_Stop("Не выбрана видеокарта")
+                return
+            end
+
+            local v = improve.videoCards[improve.select]
+            if not v then return end
+            if (improve.useStorageUpgrade and not v.storageUpgrade) or v.level < targetLevel then
+                if improve.useStorageUpgrade then
+                    Improve_LogAdd("INFO", string.format(
+                        "Выбрана видеокарта #%d для улучшения хранилища.",
+                        improve.select
+                    ))
+                else
+                    Improve_LogAdd("INFO", string.format(
+                        "Выбрана видеокарта #%d для заточки (уровень %d -> целевой %d).",
+                        improve.select, v.level or 0, targetLevel
+                    ))
+                end
+                improve.currentIndex = improve.select
+                Improve_TryClick(v.td)
+                improve.step = 2
+            else
+                if improve.useStorageUpgrade then
+                    MI_Say("Выбранная видеокарта уже имеет улучшение хранилища.")
+                    Improve_LogAdd("INFO", string.format(
+                        "Выбранная видеокарта уже имеет улучшение хранилища. Сессия остановлена."
+                    ))
+                    Improve_Stop("Выбранная видеокарта уже имеет улучшение хранилища.")
+                else
+                    MI_Say("Выбранная видеокарта уже достигла целевого уровня.")
+                    Improve_LogAdd("INFO", string.format(
+                        "Выбранная видеокарта уже достигла целевого уровня (%d). Сессия остановлена.",
+                        targetLevel
+                    ))
+                    Improve_Stop("Выбранная видеокарта уже достигла целевого уровня")
+                end
+            end
+        end
+    end
+end
+
+
+-- --------------------------------------------------------
 --                           Load
 -- --------------------------------------------------------
 
@@ -1160,6 +2216,12 @@ end
 
 LoadSettings()
 
+if ISMONETLOADER and settings.style.scaleUI ~= 1.0 then
+    MONET_DPI_SCALE = settings.style.scaleUI
+elseif ISMONETLOADER then
+    settings.style.scaleUI = MONET_DPI_SCALE
+end
+
 -- --------------------------------------------------------
 --                           Save
 -- --------------------------------------------------------
@@ -1203,10 +2265,10 @@ function ParseHouseData(text)
     end
 
     -- Паттерн для извлечения данных о доме с налогом (поддержка разных валют)
-    local patternWithTax = "Дом №(%d+)%s*([^%d]+)%s*{%w+}([%d]+)%s*([%d]+)%s*циклов%s*%(([VC]*%$)([%d,]+) / [VC]*%$([%d%.,]+)%)"
+    local patternWithTax = "Дом №(%d+)%s*([^%d]+)%s*{%w+}([%d]+)%s*([%d]+)%s*циклов%s*%(([VC]*%$)([%d%.,]+) / [VC]*%$([%d%.,]+)%)"
 
     -- Паттерн для извлечения данных о доме без налога (поддержка разных валют)
-    local patternWithoutTax = "Дом №(%d+)%s*([^%d]+)%s*([%d]+)%s*циклов%s*%(([VC]*%$)([%d,]+) / [VC]*%$([%d%.,]+)%)"
+    local patternWithoutTax = "Дом №(%d+)%s*([^%d]+)%s*([%d]+)%s*циклов%s*%(([VC]*%$)([%d%.,]+) / [VC]*%$([%d%.,]+)%)"
 
     for lineIndex, line in ipairs(lines) do
         local found = false
@@ -1480,6 +2542,12 @@ local function clamp_bank_target(v)
     return math.maxEx(10000, math.minEx(19999999 - 10000, v))
 end
 
+function imgui.GetMiddleButtonX(count)
+    local width = imgui.GetWindowContentRegionWidth()
+    local space = imgui.GetStyle().ItemSpacing.x
+    return (count == 1) and width or (width / count - ((space * (count - 1)) / count))
+end
+
 -- =====================================================================================================================
 --                                                          UTLITES
 -- =====================================================================================================================
@@ -1523,7 +2591,7 @@ end
 function IsEnterPressed()
     -- пробуем ImGui Enter
     if ImGuiKeyPressed(imgui.Key.Enter) then return true end
-    -- фолбэк: системная клавиша Enter
+    -- системная клавиша Enter
     if isKeyJustPressed then
         local ok, pressed = pcall(isKeyJustPressed, VK_RETURN)
         if ok and pressed then return true end
@@ -1531,9 +2599,9 @@ function IsEnterPressed()
     return false
 end
 
--- current  – текущий индекс (1..max)
--- max      – количество элементов
--- onEnter  – колбэк при нажатии Enter на текущем элементе
+-- current  - текущий индекс (1..max)
+-- max      - количество элементов
+-- onEnter  - при нажатии Enter на текущем элементе
 function HandleListNavigation(current, max, onEnter)
     if max <= 0 or not settings.main.arrowsMove then return current end
 
@@ -1571,6 +2639,15 @@ function math.minEx(a, b)
     return a < b and a or b
 end
 
+
+function Translationtextdraw(text) -- https://pawn-wiki.ru/index.php?/topic/24249-ispolzuem-russkie-simvoli-v-teksdravah/
+	text = string.gsub(text, "a", "а")  text = string.gsub(text, "A", "А")  text = string.gsub(text, "—", "б")  text = string.gsub(text, "Ђ", "Б")  text = string.gsub(text, "ў", "в")  text = string.gsub(text, "‹", "В")  text = string.gsub(text, "™", "г")  text = string.gsub(text, "‚", "Г")  text = string.gsub(text, "љ", "д")  text = string.gsub(text, "ѓ", "Д")  text = string.gsub(text, "e", "е")	text = string.gsub(text, "E", "Е")	text = string.gsub(text, "e", "ё")	text = string.gsub(text, "E", "Ё")	text = string.gsub(text, "›", "ж")	text = string.gsub(text, "„", "Ж")	text = string.gsub(text, "џ", "з")	text = string.gsub(text, "€", "З")	text = string.gsub(text, "њ", "и")
+	text = string.gsub(text, "…", "И")	text = string.gsub(text, "ќ", "й")	text = string.gsub(text, "…", "И")	text = string.gsub(text, "k", "к")	text = string.gsub(text, "K", "К")	text = string.gsub(text, "ћ", "л")	text = string.gsub(text, "‡", "Л")	text = string.gsub(text, "Ї", "м")	text = string.gsub(text, "M", "М")	text = string.gsub(text, "®", "н")	text = string.gsub(text, "H", "Н")	text = string.gsub(text, "o", "о")	text = string.gsub(text, "O", "О")	text = string.gsub(text, "Ј", "п")	text = string.gsub(text, "Њ", "П")	text = string.gsub(text, "p", "р")
+	text = string.gsub(text, "P", "Р")	text = string.gsub(text, "c", "с")	text = string.gsub(text, "C", "С")	text = string.gsub(text, "¦", "т")	text = string.gsub(text, "Џ", "Т")	text = string.gsub(text, "y", "у")	text = string.gsub(text, "Y", "У")	text = string.gsub(text, "?", "ф")	text = string.gsub(text, "Ѓ", "Ф")	text = string.gsub(text, "x", "х")	text = string.gsub(text, "X", "Х")	text = string.gsub(text, "*", "ц")	text = string.gsub(text, "‰", "Ц")	text = string.gsub(text, "¤", "ч")	text = string.gsub(text, "Ќ", "Ч")	text = string.gsub(text, "Ґ", "ш")
+	text = string.gsub(text, "Ћ", "Ш")	text = string.gsub(text, "Ў", "щ")	text = string.gsub(text, "Љ", "Щ")	text = string.gsub(text, "©", "ь")	text = string.gsub(text, "’", "Ь")	text = string.gsub(text, "ђ", "ъ'")	text = string.gsub(text, "§", "Ъ")	text = string.gsub(text, "Ё", "ы")	text = string.gsub(text, "‘", "Ы")	text = string.gsub(text, "Є", "э")	text = string.gsub(text, "“", "Э")	text = string.gsub(text, "«", "ю")	text = string.gsub(text, "”", "Ю")	text = string.gsub(text, "¬", "я")	text = string.gsub(text, "•", "Я")
+    return text
+end
+
 -- =====================================================================================================================
 --                                                          INGUI FRAMES
 -- =====================================================================================================================
@@ -1581,9 +2658,17 @@ local mainFrame = imgui.OnFrame( function() return imguiWindows.main[0] end, fun
     else
         imgui.SetNextWindowPos(imgui.ImVec2(sizeScreanX, sizeScreanY / 2), imgui.Cond.Appearing, imgui.ImVec2(1, 0.5))
     end
+
+    -- если мы уже когда-то двигали окно - задаём позицию на этот кадр
+    if windowPos then
+        imgui.SetNextWindowPos(windowPos, imgui.Cond_Always)
+    end
+
     imgui.SetNextWindowSize(imgui.ImVec2(settings.style.sizeWindow.x, settings.style.sizeWindow.y), imgui.Cond.Appearing)
 
-    imgui.Begin(u8("Main Window"), imguiWindows.main, imgui.WindowFlags.NoCollapse + imgui.WindowFlags.NoTitleBar)
+    imgui.Begin(u8("Main Window"), imguiWindows.main, imgui.WindowFlags.NoCollapse + imgui.WindowFlags.NoTitleBar + imgui.WindowFlags.NoMove)
+
+        imgui.MoveOnTitleBar()
 
         if settings.style.sizeWindow.x ~= imgui.GetWindowSize().x or settings.style.sizeWindow.y ~= imgui.GetWindowSize().y then
             settings.style.sizeWindow.x = imgui.GetWindowSize().x
@@ -1611,9 +2696,13 @@ local mainFrame = imgui.OnFrame( function() return imguiWindows.main[0] end, fun
 
         imgui.Separator()
 
-        local _widthButtons = (imgui.GetWindowWidth() - ScaleUI(30)) / 2
+        local _widthButtons = (imgui.GetWindowWidth() - ScaleUI(30)) / 3
         if imgui.ButtonClickable(activeTabScript ~= "main", u8"Основное", imgui.ImVec2(_widthButtons, 0)) then
             activeTabScript = "main"
+        end
+        imgui.SameLine()
+        if imgui.ButtonClickable(activeTabScript ~= "improve", u8"Улучшить", imgui.ImVec2(_widthButtons, 0)) then
+            activeTabScript = "improve"
         end
         imgui.SameLine()
         if imgui.ButtonClickable(activeTabScript ~= "settings", u8"Настройки", imgui.ImVec2(-1, 0)) then
@@ -1624,12 +2713,11 @@ local mainFrame = imgui.OnFrame( function() return imguiWindows.main[0] end, fun
 
         if activeTabScript == "main" then
             DrawMainMenu()
+        elseif activeTabScript == "improve" then
+            DrawImproveSharp()
         elseif activeTabScript == "settings" then
             DrawSettings()
         end
-
-
-        posMainFraim = imgui.GetWindowPos()
     imgui.End()
 end)
 
@@ -1648,6 +2736,291 @@ function DrawMainMenu()
         DrawShelves()
     end
 end
+
+function DrawImproveSharp()
+    if imgui.BeginTabBar("ImproveTabs") then
+
+        if imgui.BeginTabItem(u8"Процесс") then
+            DrawImproveProcessTab()
+            imgui.EndTabItem()
+        end
+
+        if imgui.BeginTabItem(u8"Настройки") then
+            DrawImproveSettingsTab()
+            imgui.EndTabItem()
+        end
+
+        if imgui.BeginTabItem(u8"Логи") then
+            DrawImproveLogsTab()
+            imgui.EndTabItem()
+        end
+
+        imgui.EndTabBar()
+    end
+end
+
+function DrawImproveProcessTab()
+    imgui.Columns(3, nil, false)
+        imgui.Text(u8("Материалы для улучшения:"))
+    imgui.NextColumn()
+        imgui.Text(u8("Arizona VC:"))
+        imgui.SameLine()
+        imgui.TextColored(imgui.ImVec4(0.8,0.9,1,1), u8(tostring(improve.oils.arizona)))
+    imgui.NextColumn()
+        imgui.Text(u8("Обычная VC:"))
+        imgui.SameLine()
+        imgui.TextColored(imgui.ImVec4(0.8,0.9,1,1), u8(tostring(improve.oils.classic)))
+    imgui.Columns(1)
+    imgui.Spacing()
+
+    if imgui.Button(u8(improve.oils.busy and "Сканирую…" or "Обновить инвентарь"), imgui.ImVec2(-1, ScaleUI(26))) then
+        Improve_RefreshOils(true)
+    end
+
+    imgui.Separator()
+
+    imgui.CenterText(u8("Этап: " .. (improveSteps[improve.step] or "?")))
+
+    -- Краткая текущая статистика сессии
+    local s = improve.stats
+    if s and (s.sessionId or 0) > 0 then
+        local status = s.active and "идёт" or "завершена"
+        imgui.Text(u8(string.format(
+            "Сессия #%d (%s). Попыток: %d, успехов: %d, ошибок: %d, смазки: %d",
+            s.sessionId or 0,
+            status,
+            s.attempts or 0,
+            s.success or 0,
+            s.fail or 0,
+            s.oilsUsed or 0
+        )))
+    else
+        imgui.TextDisabled(u8"Сессия заточки ещё не запускалась.")
+    end
+
+    if imgui.Button(u8(improve.isOn and "Выключить" or "Включить"), imgui.ImVec2(-1, ScaleUI(30))) then
+        if improve.isOn then
+            -- стоп заточки
+            Improve_Stop("Остановлено вручную через UI")
+            MI_Say("Заточка остановлена вручную.")
+        else
+            -- старт заточки
+            improve.isOn            = true
+            improve.consumedThisTry = false
+
+            if settings.improve.checkOilsOnStart then
+                -- сначала проверяем смазку
+                improve.step          = 0
+                improve.needCheckOils = true
+                improve.waitOils      = false
+            else
+                -- сразу начинаем с первого шага без проверки
+                improve.step          = 1
+                improve.needCheckOils = false
+                improve.waitOils      = false
+            end
+
+            Improve_MarkNeedScan()
+            Improve_SessionStart()
+            MI_Say("Заточка видеокарт запущена.")
+        end
+    end
+
+    -- Кнопка выбора режима улучшения: производительность / хранилище крипты
+    local modeLabel = improve.useStorageUpgrade
+        and "Режим улучшения: ХРАНИЛИЩЕ криптовалюты"
+        or  "Режим улучшения: ПРОИЗВОДИТЕЛЬНОСТЬ"
+
+    if imgui.Button(u8(modeLabel), imgui.ImVec2(-1, ScaleUI(24))) then
+        improve.useStorageUpgrade = not improve.useStorageUpgrade
+        if improve.useStorageUpgrade then
+            MI_Say("Теперь в диалоге будет выбираться улучшение объёма хранения криптовалюты")
+        else
+            MI_Say("Теперь в диалоге будет выбираться улучшение производительности видеокарты")
+        end
+    end
+
+    imgui.Spacing()
+
+
+    imgui.BeginChild("improve_bottom_proc", imgui.ImVec2(-1, -1), true)
+        imgui.ScrollMouse()
+        imgui.CenterText(u8("Найденные видеокарты:"))
+
+        for i, v in ipairs(improve.videoCards) do
+            local btnW  = imgui.GetMiddleButtonX(4)
+            local label = string.format("%d LVL##%d", v.level, i)
+            local canClick = improve.useStorageUpgrade and true or (v.level < (settings.improve.maxLevel or 2))
+            if imgui.ButtonClickable(canClick, label, imgui.ImVec2(btnW, 0)) then
+                if not settings.improve.menuAll then
+                    improve.select = i
+                    MI_Say("Выбрана видеокарта #" .. i .. " (ур. " .. v.level .. ")")
+                end
+            end
+            if i % 4 ~= 0 and i ~= #improve.videoCards then imgui.SameLine() end
+        end
+    imgui.EndChild()
+end
+
+function DrawImproveSettingsTab()
+    imgui.CenterText(u8("Режим работы:"))
+    if imgui.Button(u8(settings.improve.menuAll and "Улучшение всех видеокарт" or "Улучшение определенной видеокарты"), imgui.ImVec2(-1, ScaleUI(30))) then
+        settings.improve.menuAll = not settings.improve.menuAll
+        SaveSettings()
+        if settings.improve.menuAll then improve.select = 0 end
+    end
+
+    imgui.Separator()
+
+    imgui.CenterText(u8("Вид улучшаемых видеокарт:"))
+    local w = (imgui.GetWindowWidth() - ScaleUI(6)) / 2
+    if imgui.ButtonClickable(settings.improve.typeCards ~= 1, u8("Обычные"), imgui.ImVec2(w, 0)) then
+        settings.improve.typeCards = 1; SaveSettings()
+    end
+    imgui.SameLine()
+    if imgui.ButtonClickable(settings.improve.typeCards ~= 2, "Arizona", imgui.ImVec2(-1, 0)) then
+        settings.improve.typeCards = 2; SaveSettings()
+    end
+
+    imgui.Separator()
+
+    imgui.CenterText(u8("Вид улучшения:"))
+    if imgui.ButtonClickable(settings.improve.mode ~= 1, u8("Последовательное"), imgui.ImVec2(w, 0)) then
+        settings.improve.mode = 1; SaveSettings()
+    end
+    imgui.SameLine()
+    if imgui.ButtonClickable(settings.improve.mode ~= 2, u8("Поочередное"), imgui.ImVec2(-1, 0)) then
+        settings.improve.mode = 2; SaveSettings()
+    end
+    imgui.TextDisabled(u8"Последовательное (сначала низкий уровень) | Поочередное (как на экране)")
+
+    imgui.Separator()
+
+    imgui.CenterText(u8("Уровень улучшения видеокарт:"))
+    imgui.PushItemWidth(-1)
+    local _maxLevel = imgui.new.int(settings.improve.maxLevel or 2)
+    if imgui.SliderInt("##maximumValueLevel", _maxLevel, 2, 10, u8("%d ур.")) then
+        settings.improve.maxLevel = _maxLevel[0]; SaveSettings()
+    end
+    imgui.PopItemWidth()
+
+    imgui.Separator()
+
+    -- проверять ли смазку при старте заточки
+    local _checkOils = imgui.new.bool(settings.improve.checkOilsOnStart)
+    if imgui.Checkbox(u8"Проверять смазку при старте заточки", _checkOils) then
+        settings.improve.checkOilsOnStart = not settings.improve.checkOilsOnStart
+        SaveSettings()
+    end
+    imgui.TextDisabled(u8"Если выключено, заточка стартует без принудительной проверки /stats")
+end
+
+function DrawImproveLogsTab()
+    -- ===== Сводная статистика по дням / общая =====
+    local store = Improve_GetStatsStore()
+    local todayKey = os.date('%Y-%m-%d')
+
+    local today = store and store.days and store.days[todayKey] or {
+        sessions  = 0,
+        attempts  = 0,
+        success   = 0,
+        fail      = 0,
+        oilsUsed  = 0,
+        time      = 0,
+    }
+
+    local total = store and store.total or {
+        sessions  = 0,
+        attempts  = 0,
+        success   = 0,
+        fail      = 0,
+        oilsUsed  = 0,
+        time      = 0,
+    }
+
+    imgui.Columns(2, nil, false)
+        imgui.Text(u8(string.format("Сегодня (%s):", todayKey)))
+        imgui.Text(u8(string.format("  Сессий:   %d", today.sessions or 0)))
+        imgui.Text(u8(string.format("  Попыток:  %d (успехов: %d, ошибок: %d)", today.attempts or 0, today.success or 0, today.fail or 0)))
+        imgui.Text(u8(string.format("  Смазки:   %d", today.oilsUsed or 0)))
+        imgui.Text(u8(string.format("  Время:    %d сек.", today.time or 0)))
+    imgui.NextColumn()
+        imgui.Text(u8("За всё время:"))
+        imgui.Text(u8(string.format("  Сессий:   %d", total.sessions or 0)))
+        imgui.Text(u8(string.format("  Попыток:  %d (успехов: %d, ошибок: %d)", total.attempts or 0, total.success or 0, total.fail or 0)))
+        imgui.Text(u8(string.format("  Смазки:   %d", total.oilsUsed or 0)))
+        imgui.Text(u8(string.format("  Время:    %d сек.", total.time or 0)))
+    imgui.Columns(1)
+
+    imgui.Separator()
+
+    -- Информация по последней сессии
+    local s = improve.stats
+    if s and (s.sessionId or 0) > 0 then
+        local startedStr  = (s.startedAt  and s.startedAt  > 0) and os.date('%d.%m.%Y %H:%M:%S', s.startedAt)  or "-"
+        local finishedStr = (s.finishedAt and s.finishedAt > 0) and os.date('%d.%m.%Y %H:%M:%S', s.finishedAt) or (s.active and "идёт…" or "-")
+
+        imgui.Text(u8(string.format("Последняя сессия #%d:", s.sessionId)))
+        imgui.Text(u8("  Старт:      " .. startedStr))
+        imgui.Text(u8("  Завершение: " .. finishedStr))
+        imgui.Text(u8(string.format("  Попыток:    %d (успехов: %d, ошибок: %d)", s.attempts or 0, s.success or 0, s.fail or 0)))
+        imgui.Text(u8(string.format("  Смазки потрачено: %d", s.oilsUsed or 0)))
+        if s.lastReason and s.lastReason ~= "" then
+            imgui.Text(u8("  Причина завершения: " .. s.lastReason))
+        end
+    else
+        imgui.TextDisabled(u8"Сессий заточки ещё не было.")
+    end
+
+    imgui.Separator()
+
+    if imgui.Button(u8"Очистить лог", imgui.ImVec2(ScaleUI(120), 0)) then
+        improve.logs.items = {}
+    end
+    imgui.SameLine()
+    local autoScrollPtr = imgui.new.bool(improve.logs.autoScroll ~= false)
+    if imgui.Checkbox(u8"Автопрокрутка вниз", autoScrollPtr) then
+        improve.logs.autoScroll = autoScrollPtr[0]
+    end
+    imgui.SameLine()
+    if imgui.Button(u8"Сбросить статистику", imgui.ImVec2(ScaleUI(160), 0)) then
+        improve.statsStore = {
+            days = {},
+            total = {
+                sessions  = 0,
+                attempts  = 0,
+                success   = 0,
+                fail      = 0,
+                oilsUsed  = 0,
+                time      = 0,
+            }
+        }
+        Improve_SaveStatsStore()
+    end
+
+    imgui.Separator()
+
+    imgui.BeginChild("improve_logs_scroll", imgui.ImVec2(-1, -1), true)
+        imgui.ScrollMouse()
+        for i, entry in ipairs(improve.logs.items or {}) do
+            local line = string.format("[%s] [%s] %s", entry.ts or "?", entry.type or "INFO", entry.text or "")
+            local etype = entry.type or "INFO"
+            if etype == "ERROR" or etype == "WARN" then
+                imgui.TextColored(imgui.ImVec4(1, 0.4, 0.4, 1), u8(line))
+            elseif etype == "SUCCESS" then
+                imgui.TextColored(imgui.ImVec4(0.6, 1.0, 0.6, 1), u8(line))
+            else
+                imgui.Text(u8(line))
+            end
+        end
+
+        if improve.logs.autoScroll ~= false then
+            imgui.SetScrollHereY(1.0)
+        end
+
+    imgui.EndChild()
+end
+
 
 function DrawSettings()
     -- Верхняя панель статуса (если включена)
@@ -1675,6 +3048,7 @@ function DrawSettings()
         -- ТАБ 1: Основное
         if imgui.BeginTabItem(u8"Основное") then
             imgui.BeginChild("tab_main", imgui.ImVec2(-1, -1))
+            imgui.ScrollMouse()
             imgui.Spacing()
 
             if imgui.Checkbox(u8"Заменять окно диалога на окно скрипта", new.bool(settings.main.replaceDialog)) then
@@ -1703,6 +3077,13 @@ function DrawSettings()
             end
             imgui.TextDisabled(u8"Отображать информацию о работающих процессах вверху окна")
 
+            if imgui.Checkbox(u8"Проверять смазку при старте заточки", new.bool(settings.improve.checkOilsOnStart)) then
+                settings.improve.checkOilsOnStart = not settings.improve.checkOilsOnStart
+                SaveSettings()
+            end
+            imgui.TextDisabled(u8"Если выключено, заточка стартует без принудительной проверки")
+
+
             imgui.Spacing()
             imgui.Separator()
             imgui.Spacing()
@@ -1723,6 +3104,7 @@ function DrawSettings()
         -- ТАБ 2: Доходность
         if imgui.BeginTabItem(u8"Доходность") then
             imgui.BeginChild("tab_income", imgui.ImVec2(-1, -1))
+            imgui.ScrollMouse()
             imgui.Spacing()
 
             local inc = settings.main.income or { 
@@ -1780,6 +3162,7 @@ function DrawSettings()
         -- ТАБ 3: Банк
         if imgui.BeginTabItem(u8"Банк") then
             imgui.BeginChild("tab_bank", imgui.ImVec2(-1, -1))
+            imgui.ScrollMouse()
             imgui.Spacing()
 
             imgui.TextWrapped(u8"Настройки автоматического пополнения банка:")
@@ -1820,7 +3203,7 @@ function DrawSettings()
             end
             imgui.PopItemWidth()
             imgui.TextDisabled(u8"Нажмите Enter для сохранения")
-            
+
             imgui.EndChild()
             imgui.EndTabItem()
         end
@@ -1828,14 +3211,20 @@ function DrawSettings()
         -- ТАБ 4: Задержки
         if imgui.BeginTabItem(u8"Задержки") then
             imgui.BeginChild("tab_delays", imgui.ImVec2(-1, -1))
+            imgui.ScrollMouse()
+
             imgui.Spacing()
-            
+
             imgui.TextWrapped(u8"Настройка временных интервалов для стабильной работы скрипта:")
             imgui.Spacing()
             imgui.Separator()
             imgui.Spacing()
-            
+
             imgui.PushItemWidth(-1)
+
+            imgui.CenterText(u8"Для работы с полками")
+
+            imgui.Spacing()
 
             imgui.Text(u8"Ожидание ответа диалога:")
             local _timeoutDialog = new.int(settings.deley.timeoutDialog)
@@ -1875,8 +3264,32 @@ function DrawSettings()
             end
             imgui.TextDisabled(u8"Пауза перед отправкой ответа в диалог")
 
+            imgui.Spacing()
+            imgui.Separator()
+            imgui.Spacing()
+
+            imgui.CenterText(u8"Для улучшения видеокарт")
+
+            imgui.Spacing()
+
+            imgui.Text(u8"Задержка после получения результата улучшения:")
+            local _improve_waitResult = new.int(settings.deley.improve_waitResult)
+            if imgui.SliderInt("##improve_waitResult", _improve_waitResult, 10, 1000, u8"%d мс") then
+                settings.deley.improve_waitResult = _improve_waitResult[0]
+                SaveSettings()
+            end
+            imgui.TextDisabled(u8"Пауза после получения результата улучшения")
+
+            imgui.Text(u8"Ожидание перед нажатием на видеокарту:")
+            local _improve_waitTryClick = new.int(settings.deley.improve_waitTryClick)
+            if imgui.SliderInt("##improve_waitResult", _improve_waitTryClick, 10, 1000, u8"%d мс") then
+                settings.deley.improve_waitTryClick = _improve_waitTryClick[0]
+                SaveSettings()
+            end
+            imgui.TextDisabled(u8"Пауза перед тем, как нажать на видеокарту")
+
             imgui.PopItemWidth()
-            
+
             imgui.EndChild()
             imgui.EndTabItem()
         end
@@ -1885,12 +3298,12 @@ function DrawSettings()
         if imgui.BeginTabItem(u8"Черный список") then
             imgui.BeginChild("tab_blacklist", imgui.ImVec2(-1, -1))
             imgui.Spacing()
-            
+
             imgui.TextWrapped(u8"Добавьте номера домов, которые нужно исключить из обработки:")
             imgui.Spacing()
             imgui.Separator()
             imgui.Spacing()
-            
+
             imgui.Text(u8"Номер дома:")
             imgui.PushItemWidth(200)
             imgui.InputInt("##numberHouse", inputBlackHouse, 0, 0)
@@ -1912,6 +3325,7 @@ function DrawSettings()
                 imgui.Text(u8(string.format("Домов в черном списке: %d", #settings.main.blackListHouses)))
                 imgui.Spacing()
                 imgui.BeginChild("blacklist_scroll", imgui.ImVec2(-1, -1), true)
+                imgui.ScrollMouse()
                 for index, blackHouse in ipairs(settings.main.blackListHouses) do
                     if imgui.Button(u8"Удалить##"..index, imgui.ImVec2(ScaleUI(80), 0)) then
                         table.remove(settings.main.blackListHouses, index)
@@ -1927,7 +3341,7 @@ function DrawSettings()
             else
                 imgui.TextDisabled(u8"Список пуст. Добавьте первый дом.")
             end
-            
+
             imgui.EndChild()
             imgui.EndTabItem()
         end
@@ -1935,15 +3349,16 @@ function DrawSettings()
         -- ТАБ 6: Интерфейс
         if imgui.BeginTabItem(u8"Интерфейс") then
             imgui.BeginChild("tab_interface", imgui.ImVec2(-1, -1))
+            imgui.ScrollMouse()
             imgui.Spacing()
-            
+
             imgui.TextWrapped(u8"Настройка внешнего вида и масштаба интерфейса:")
             imgui.Spacing()
             imgui.Separator()
             imgui.Spacing()
-            
+
             imgui.PushItemWidth(-1)
-            
+
             imgui.Text(u8"Размер полосы прокрутки:")
             local _scrollbarSizeStyle = new.int(settings.style.scrollbarSizeStyle)
             if imgui.SliderInt("##scrollbarSize", _scrollbarSizeStyle, 10, 50, "%d px") then
@@ -1957,28 +3372,28 @@ function DrawSettings()
             imgui.Text(u8"Масштаб интерфейса (DPI):")
             local _MONET_DPI_SCALE = new.float(settings.style.scaleUI)
             if imgui.SliderFloat("##scaleUI", _MONET_DPI_SCALE, 0.5, 3.0, "%.2f") then
-                settings.style.scaleUI = _MONET_DPI_SCALE[0] 
+                settings.style.scaleUI = _MONET_DPI_SCALE[0]
                 SaveSettings()
             end
             imgui.TextDisabled(u8"Рекомендуемые значения: 1.0 - 2.0")
-            
+
             imgui.PopItemWidth()
-            
+
             imgui.Spacing()
             imgui.Separator()
             imgui.Spacing()
-            
+
             if imgui.Button(u8"Перезапустить скрипт", imgui.ImVec2(-1, ScaleUI(40))) then
                 thisScript():reload()
             end
-            
+
             imgui.Spacing()
             imgui.TextWrapped(u8"Для применения изменения масштаба необходимо перезапустить скрипт.")
             imgui.Spacing()
             imgui.Text(u8"Полезные команды:")
             imgui.BulletText(u8"/mmtr - перезапустить скрипт")
             imgui.BulletText(u8"/mmtsr - сбросить масштаб к значению по умолчанию")
-            
+
             imgui.EndChild()
             imgui.EndTabItem()
         end
@@ -1988,21 +3403,21 @@ function DrawSettings()
             if imgui.BeginTabItem(u8"Тех. состояние") then
                 imgui.BeginChild("tab_techstate", imgui.ImVec2(-1, -1))
                 imgui.Spacing()
-                
+
                 imgui.Text(u8(string.format("Количество активных полок: %d", #stateCrypto.queueShelves)))
                 imgui.Spacing()
                 imgui.Separator()
                 imgui.Spacing()
-                
+
                 imgui.BeginChild("tech_state_scroll", imgui.ImVec2(-1, -1), true)
-                
-                -- Заголовки таблицы
+                imgui.ScrollMouse()
+
                 imgui.Columns(4, "tech_columns", true)
                 imgui.SetColumnWidth(0, 100)
                 imgui.SetColumnWidth(1, 100)
                 imgui.SetColumnWidth(2, 100)
                 imgui.SetColumnWidth(3, 150)
-                
+
                 imgui.Text(u8"Строка")
                 imgui.NextColumn()
                 imgui.Text(u8"Заливка")
@@ -2012,7 +3427,7 @@ function DrawSettings()
                 imgui.Text(u8"Состояние")
                 imgui.NextColumn()
                 imgui.Separator()
-                
+
                 -- Данные
                 for index, value in ipairs(stateCrypto.queueShelves) do
                     imgui.Text(u8(tostring(value.samp_line)))
@@ -2027,10 +3442,10 @@ function DrawSettings()
                         imgui.Separator()
                     end
                 end
-                
+
                 imgui.Columns(1)
                 imgui.EndChild()
-                
+
                 imgui.EndChild()
                 imgui.EndTabItem()
             end
@@ -2053,6 +3468,7 @@ function DrawHousesBank()
     end
 
     imgui.BeginChild("list", imgui.ImVec2(-1, -1))
+    imgui.ScrollMouse()
     lastOpenHouse = HandleListNavigation(
         (lastOpenHouse > 0 and lastOpenHouse or 1),
         #housesBanks,
@@ -2085,14 +3501,14 @@ function DrawHousesBank()
             GetCommaValue(house.bankNow)
         )
 
-        if imgui.SelectableEx(i, house_text, lastOpenHouse == i, imgui.SelectableFlags.SpanAllColumns) then
+        if imgui.SelectableEx(i, house_text, lastOpenHouse == i, imgui.SelectableFlags.SpanAllColumns) and IsClick() then
             lastOpenHouse = i
             sampSendDialogResponse(idDialogs.selectHouse, 1, house.samp_line, "")
             housesBanks = {}
             SwitchMainWindow()
         end
 
-        -- Добавляем небольшой отступ между домами
+        -- небольшой отступ между домами
         if i < #houses then
             imgui.Spacing()
         end
@@ -2142,6 +3558,7 @@ function DrawHouses()
     imgui.Separator()
 
     imgui.BeginChild("list", imgui.ImVec2(-1, -1))
+    imgui.ScrollMouse()
     lastOpenHouse = HandleListNavigation(
          math.maxEx(1, math.minEx(lastOpenHouse, #houses)),
         #houses,
@@ -2183,13 +3600,13 @@ function DrawHouses()
             house.currency
         )
 
-        if imgui.SelectableEx(i, house_text, lastOpenHouse == i, imgui.SelectableFlags.SpanAllColumns) then
+        if imgui.SelectableEx(i, house_text, lastOpenHouse == i, imgui.SelectableFlags.SpanAllColumns) and IsClick() then
             lastOpenHouse = i
             sampSendDialogResponse(idDialogs.selectHouse, 1, house.samp_line, "")
             houses = {}
         end
 
-        -- Добавляем небольшой отступ между домами
+        -- небольшой отступ между домами
         if i < #houses then
             imgui.Spacing()
         end
@@ -2228,7 +3645,6 @@ function DrawShelves()
 
     imgui.Spacing()
 
-    -- Первая строка кнопок: Собрать и Залить
     local totalWidth = (imgui.GetWindowWidth() - ScaleUI(30))
     local half    = totalWidth / 2
     local quarter = totalWidth / 4
@@ -2243,7 +3659,6 @@ function DrawShelves()
 
     imgui.SameLine()
 
-    -- 1/4 ширины — новый переключатель
     local autoIcon  = settings.main.autoFillEnabled and fa.TOGGLE_ON or fa.TOGGLE_OFF
     local autoTitle = settings.main.autoFillEnabled and u8"Автозаливка: вкл" or u8"Автозаливка: выкл"
     if imgui.Button(autoIcon .. "\t" .. autoTitle, imgui.ImVec2(-1, 0)) then
@@ -2252,7 +3667,6 @@ function DrawShelves()
         AddChatMessage("Автозаливка: " .. (settings.main.autoFillEnabled and "включена" or "выключена"), TYPECHATMESSAGES.SECONDARY)
     end
 
-    -- Вторая строка кнопок: Включить и Отключить
     if imgui.ButtonClickable(not stateCrypto.work, fa.TOGGLE_ON .. u8"\tВключить карты", imgui.ImVec2(half, 0)) then
         StartProcessInteracting("on")
     end
@@ -2268,6 +3682,7 @@ function DrawShelves()
     imgui.Separator()
 
     imgui.BeginChild("list", imgui.ImVec2(-1, -1))
+    imgui.ScrollMouse()
     lastOpenShelves = HandleListNavigation(
          math.maxEx(1, math.minEx(lastOpenShelves, #shelves)),
         #shelves,
@@ -2330,7 +3745,7 @@ function DrawShelves()
             income_suffix = income_suffix .. string.format(" | Принесет: %.2f %s", income_left, shelf.currency)
         end
 
-        -- Итоговая строка (для ASIC и не-ASIC используем один и тот же суффикс)
+        -- Итоговая строка
         local _text = ""
         if shelf.profit2 then
             _text = string.format(
@@ -2354,7 +3769,7 @@ function DrawShelves()
             )
         end
 
-        if imgui.SelectableEx(i, _text, lastOpenShelves == i, imgui.SelectableFlags.SpanAllColumns) then
+        if imgui.SelectableEx(i, _text, lastOpenShelves == i, imgui.SelectableFlags.SpanAllColumns) and IsClick() then
             lastOpenShelves = i
             sampSendDialogResponse(lastIDDialog, 1, shelf.samp_line, "")
             imguiWindows.main[0] = false
@@ -2366,6 +3781,90 @@ end
 -- --------------------------------------------------------
 --                           Extension
 -- --------------------------------------------------------
+
+function IsClick()
+    return not ui_state.swipe.is_gesture
+end
+
+function imgui.MoveOnTitleBar()
+    local io = imgui.GetIO()
+    local win_pos = imgui.GetWindowPos()
+    local win_sz  = imgui.GetWindowSize()
+
+    local grab_height = ScaleUI(28)
+    local grab_offset = 6
+
+    -- Новый ЛКМ-клик -> сбрасываем информацию о свайпе
+    if io.MouseClicked[0] then
+        ui_state.swipe.is_gesture = false
+    end
+
+    -- Если во время зажатой ЛКМ мышь ушла дальше порога - это свайп
+    if io.MouseDown[0] then
+        local drag_vec = io.MouseDragMaxDistanceAbs[0]
+        if drag_vec.x > ui_state.swipe.DRAG_THRESHOLD or drag_vec.y > ui_state.swipe.DRAG_THRESHOLD then
+            ui_state.swipe.is_gesture = true
+        end
+    end
+
+    local mouse_over_grab =
+        imgui.IsWindowHovered() and
+        io.MousePos.x >= win_pos.x and
+        io.MousePos.x <= win_pos.x + win_sz.x and
+        io.MousePos.y >= win_pos.y + grab_offset and
+        io.MousePos.y <= win_pos.y + grab_offset + grab_height
+
+    if mouse_over_grab and io.MouseClicked[0] then
+        ui_state.drag.active = true
+        ui_state.drag.mx, ui_state.drag.my = io.MousePos.x, io.MousePos.y
+
+        -- стартовая позиция окна - либо текущая, либо последняя сохранённая
+        ui_state.drag.wx = windowPos and windowPos.x or win_pos.x
+        ui_state.drag.wy = windowPos and windowPos.y or win_pos.y
+    end
+
+    if ui_state.drag.active then
+        if not io.MouseDown[0] then
+            ui_state.drag.active = false
+        else
+            local dx = io.MousePos.x - ui_state.drag.mx
+            local dy = io.MousePos.y - ui_state.drag.my
+
+            -- обновляем желаемую позицию окна; применится в следующем кадре через SetNextWindowPos
+            windowPos = imgui.ImVec2(ui_state.drag.wx + dx, ui_state.drag.wy + dy)
+        end
+    end
+end
+
+function imgui.ScrollMouse()
+    local io = imgui.GetIO()
+    -- Ховер именно по дочернему окну
+    local hovered = imgui.IsWindowHovered()
+
+    -- Нажали ЛКМ над списком - начинаем свайп
+    if hovered and io.MouseClicked[0] then
+        ui_state.swipe.active = true
+    end
+
+    -- Отпустили ЛКМ - заканчиваем свайп
+    if not io.MouseDown[0] then
+        ui_state.swipe.active = false
+    end
+
+    -- Если свайп активен - крутим скролл по delta мыши
+    if ui_state.swipe.active then
+        local current = imgui.GetScrollY()
+        local maxy    = imgui.GetScrollMaxY()
+
+        local newY = current - io.MouseDelta.y
+
+        -- Кламп по диапазону скролла
+        if newY < 0 then newY = 0 end
+        if newY > maxy then newY = maxy end
+
+        imgui.SetScrollY(newY)
+    end
+end
 
 function imgui.ButtonClickable(clickable, ...)
     if clickable then
