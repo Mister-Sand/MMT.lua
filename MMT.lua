@@ -5,7 +5,7 @@
 script_authors('Sand')
 script_name('MMT | Mining Tool')
 script_description('Mining assistant TG: @Mister_Sand')
-script_version("1.4")
+script_version("1.5")
 
 -- =====================================================================================================================
 --                                                          Import
@@ -149,6 +149,8 @@ local defaultSettings = {
         improve_waitTryClick = 500,
     },
     style = {
+        -- Скрол пальцем
+        swipeScroll = ISMONETLOADER,
         -- масштаб интерфейса
         scaleUI = 1.0,
         -- Цвет в тексте
@@ -240,6 +242,7 @@ local stateCrypto = {
     -- Идентификатор текущего дома (номер) и валюта текущего take
     currentHouseId = nil,
     takeCurrency = nil,
+    activeHouseID = "-1"
 }
 
 local processes = {
@@ -271,6 +274,9 @@ local collectStats = {
 local shelves = {}
 
 local houses = {}
+-- Дома с информацией о полках
+--[id_house <string>] = { work_vc = <int> количество рабочих видеокарт, max_collect = <int> макс крипты в доме, min_liquid = <number> минимально охлаждайки в доме}
+local housesData = {}
 
 local housesBanks = {}
 
@@ -770,6 +776,7 @@ function sampev.onShowDialog(dialogId, style, title, button1, button2, text)
 
     if title:find("Выберите видеокарту") then
         if title:find("дом") then
+            stateCrypto.activeHouseID = title:match("дом №(%d+)") or "-1"
             idDialogs.selectVideoCardItemFlash = dialogId
         end
         idDialogs.selectVideoCard = dialogId
@@ -2346,6 +2353,8 @@ end
 
 function ParseShelfData(text)
     shelves = {}
+    housesData[stateCrypto.activeHouseID] = { work_vc = 0, max_collect = 0, min_liquid = 0}
+    local house_data = housesData[tostring(stateCrypto.activeHouseID)]
 
     local results = {}
     local lines = {}
@@ -2380,6 +2389,13 @@ function ParseShelfData(text)
                 raw_line = line
             })
             found = true
+
+            -- Заполнение данными о доме
+            house_data = {
+                work_vc = house_data.work_vc + 1,
+                max_collect = tonumber(profit1) > house_data.max_collect and tonumber(profit1) or house_data.max_collect,
+                min_liquid = house_data.min_liquid == 0 and tonumber(percentage) or (tonumber(percentage) < house_data.min_liquid and tonumber(percentage) or house_data.min_liquid),
+            }
         end
 
         -- Если не найдено, пробуем паттерн с одной валютой
@@ -2397,10 +2413,17 @@ function ParseShelfData(text)
                     card_type = (currency == "ASC") and "ASC" or "BTC",
                     raw_line = line
                 })
+
+                -- Заполнение данными о доме
+                house_data = {
+                    work_vc = house_data.work_vc + 1,
+                    max_collect = tonumber(profit) > house_data.max_collect and tonumber(profit) or house_data.max_collect,
+                    min_liquid = house_data.min_liquid == 0 and tonumber(percentage) or (tonumber(percentage) < house_data.min_liquid and tonumber(percentage) or house_data.min_liquid),
+                }
             end
         end
     end
-
+    housesData[stateCrypto.activeHouseID] = house_data
     return results
 end
 
@@ -2558,7 +2581,15 @@ function GetTimeNow()
 end
 
 function OpenUrl(url)
-    os.execute("explorer " .. url)
+    if MONET_VERSION then
+        local gta = ffi.load('GTASA')
+        ffi.cdef[[
+            void _Z12AND_OpenLinkPKc(const char* link);
+        ]]
+    	gta._Z12AND_OpenLinkPKc(url)
+	else
+		os.execute("explorer " .. url)
+	end
 end
 
 function EnsureDirectoryExists(path)
@@ -2666,7 +2697,7 @@ local mainFrame = imgui.OnFrame( function() return imguiWindows.main[0] end, fun
 
     imgui.SetNextWindowSize(imgui.ImVec2(settings.style.sizeWindow.x, settings.style.sizeWindow.y), imgui.Cond.Appearing)
 
-    imgui.Begin(u8("Main Window"), imguiWindows.main, imgui.WindowFlags.NoCollapse + imgui.WindowFlags.NoTitleBar + imgui.WindowFlags.NoMove)
+    imgui.Begin(u8("Main Window"), imguiWindows.main, imgui.WindowFlags.NoCollapse + imgui.WindowFlags.NoTitleBar + (settings.style.swipeScroll and imgui.WindowFlags.NoMove or 0))
 
         imgui.MoveOnTitleBar()
 
@@ -2731,7 +2762,7 @@ function DrawMainMenu()
     elseif #houses > 0 then
         DrawHouses()
     else
-        imgui.Text(u8(string.format("Охлада: BTC - %s | supper BTC - %s | ASC - %s", haveLiquid.btc, haveLiquid.supper_btc, haveLiquid.asc)))
+        imgui.Text(u8(string.format("Охлаждаек в инвентаре: BTC - %s | Supper BTC - %s | ASC - %s", haveLiquid.btc, haveLiquid.supper_btc, haveLiquid.asc)))
         imgui.Separator()
         DrawShelves()
     end
@@ -2763,13 +2794,13 @@ function DrawImproveProcessTab()
     imgui.Columns(3, nil, false)
         imgui.Text(u8("Материалы для улучшения:"))
     imgui.NextColumn()
-        imgui.Text(u8("Arizona VC:"))
-        imgui.SameLine()
-        imgui.TextColored(imgui.ImVec4(0.8,0.9,1,1), u8(tostring(improve.oils.arizona)))
-    imgui.NextColumn()
-        imgui.Text(u8("Обычная VC:"))
+        imgui.Text(u8("BTC вид-карты:"))
         imgui.SameLine()
         imgui.TextColored(imgui.ImVec4(0.8,0.9,1,1), u8(tostring(improve.oils.classic)))
+    imgui.NextColumn()
+        imgui.Text(u8("Arizona вид-карты:"))
+        imgui.SameLine()
+        imgui.TextColored(imgui.ImVec4(0.8,0.9,1,1), u8(tostring(improve.oils.arizona)))
     imgui.Columns(1)
     imgui.Spacing()
 
@@ -3091,7 +3122,7 @@ function DrawSettings()
             imgui.Text(u8(string.format("Заливать при %.0f%%%% или ниже:", settings.main.fillFrom)))
             imgui.PushItemWidth(-1)
             local _fillFrom = new.float(settings.main.fillFrom)
-            if imgui.SliderFloat("##fillFrom", _fillFrom, 0, 100, "%.0f%%") then
+            if imgui.SliderFloat("##fillFrom", _fillFrom, 0, 99, "%.0f%%") then
                 settings.main.fillFrom = Round(_fillFrom[0], 2)
                 SaveSettings()
             end
@@ -3352,9 +3383,12 @@ function DrawSettings()
             imgui.ScrollMouse()
             imgui.Spacing()
 
-            imgui.TextWrapped(u8"Настройка внешнего вида и масштаба интерфейса:")
-            imgui.Spacing()
-            imgui.Separator()
+            if imgui.Checkbox(u8"Скролл пальцем", imgui.new.bool(settings.style.swipeScroll)) then
+                settings.style.swipeScroll = not settings.style.swipeScroll
+                SaveSettings()
+            end
+            imgui.TextDisabled(u8"Если включено - списки можно прокручивать свайпом (требуется перезагрузка скрипта).\nНо перемещение окна только за заголовок скрипта")
+
             imgui.Spacing()
 
             imgui.PushItemWidth(-1)
@@ -3398,7 +3432,45 @@ function DrawSettings()
             imgui.EndTabItem()
         end
 
-        -- ТАБ 7: Техническая информация (только если есть данные)
+        -- ТАБ 7: Автор
+        if imgui.BeginTabItem(u8"Автор") then
+            imgui.BeginChild("tab_author", imgui.ImVec2(-1, -1))
+            imgui.ScrollMouse()
+            imgui.Spacing()
+
+            imgui.Text(u8"Канал разработчика в ТГ: ") imgui.SameLine()
+            if imgui.ClickableText("MR.Sand | ARZ MCR & Mobile") then
+                OpenUrl("https://t.me/arz_mcr")
+            end
+
+            imgui.Text(u8"ТГ разработчика: ") imgui.SameLine()
+            if imgui.ClickableText("@Mister_Sand") then
+                OpenUrl("https://t.me/Mister_Sand")
+            end
+            imgui.Spacing()
+            imgui.Text(u8"Помощь монеткой разработчику: ") imgui.SameLine()
+            if imgui.ClickableText("Boosty") then
+                OpenUrl("https://boosty.to/sand-mcr")
+            end
+            imgui.Text(u8"Тема на Blast.hk: ") imgui.SameLine()
+            if imgui.ClickableText("MMT | Mining Tool") then
+                OpenUrl("https://www.blast.hk/threads/242059/")
+            end
+
+            imgui.Spacing()
+            imgui.Separator()
+            imgui.Spacing()
+
+            imgui.TextWrapped(u8"Вы можете предлагать свои идеи для улучшения скрипта на Blast.hk или прямо в личные сообщения мне в ТГ")
+
+            imgui.Spacing()
+            imgui.Separator()
+
+            imgui.EndChild()
+            imgui.EndTabItem()
+        end
+
+        -- ТАБ 8: Техническая информация (только если есть данные)
         if #stateCrypto.queueShelves > 0 then
             if imgui.BeginTabItem(u8"Тех. состояние") then
                 imgui.BeginChild("tab_techstate", imgui.ImVec2(-1, -1))
@@ -3584,10 +3656,21 @@ function DrawHouses()
             bank_color = COLORS.YELLOW
         end
 
+        local house_data = housesData[tostring(house.house_number)]
+        local house_data_str = house_data and string.format("Раб. вид-карт: %s  Мкс. крипты: {%s}%d{%s}  Мин. охлада: {%s}%d{%s}",
+            house_data.work_vc,
+            house_data.max_collect > 8 and COLORS.RED or house_data.max_collect > 1 and COLORS.GREEN or COLORS.WHITE,
+            tonumber(house_data.max_collect),
+            COLORS.WHITE,
+            house_data.min_liquid == 0 and COLORS.RED or house_data.min_liquid < settings.main.fillFrom and COLORS.YELLOW or COLORS.WHITE,
+            house_data.min_liquid,
+            COLORS.WHITE
+        ) or "-"
         -- Формируем текст для строки
-        local house_text = string.format("Дом №%s (%s) - Налог: %s  {%s}Циклов: {%s}%s  {%s}Банк: {%s}%s{%s}/%s%s",
+        local house_text = string.format("№%s  {%s}%s  Налог: %s  {%s}Циклов: {%s}%s  {%s}Банк: {%s}%s%s",
             house.house_number,
-            house.city,
+            COLORS.WHITE,
+            house_data_str,
             house.tax,
             COLORS.WHITE,
             cycles_color,
@@ -3595,8 +3678,6 @@ function DrawHouses()
             COLORS.WHITE,
             bank_color,
             GetCommaValue(house.bankNow),
-            COLORS.WHITE,
-            GetCommaValue(house.bankMax),
             house.currency
         )
 
@@ -3749,7 +3830,7 @@ function DrawShelves()
         local _text = ""
         if shelf.profit2 then
             _text = string.format(
-                "Полка №%d Ур.%d {%s}%s {%s}%.6f %s | %.6f %s {%s}%.1f%%%s",
+                "№%d Ур.%d {%s}%s {%s}%.6f %s | %.6f %s {%s}%.1f%%%s",
                 shelf.shelf_number,
                 shelf.level,
                 gpu_color, shelf.status,
@@ -3759,7 +3840,7 @@ function DrawShelves()
             )
         else
             _text = string.format(
-                "Полка №%d Ур.%d {%s}%s {%s}%.6f %s {%s}%.1f%%%s",
+                "№%d Ур.%d {%s}%s {%s}%.6f %s {%s}%.1f%%%s",
                 shelf.shelf_number,
                 shelf.level,
                 gpu_color, shelf.status,
@@ -3787,6 +3868,8 @@ function IsClick()
 end
 
 function imgui.MoveOnTitleBar()
+    if not settings.style.swipeScroll then return end
+
     local io = imgui.GetIO()
     local win_pos = imgui.GetWindowPos()
     local win_sz  = imgui.GetWindowSize()
@@ -3837,6 +3920,8 @@ function imgui.MoveOnTitleBar()
 end
 
 function imgui.ScrollMouse()
+    if not settings.style.swipeScroll then return end
+
     local io = imgui.GetIO()
     -- Ховер именно по дочернему окну
     local hovered = imgui.IsWindowHovered()
@@ -3967,6 +4052,52 @@ function imgui.SelectableEx(id, label, selected, flags, imVecSize)
     imgui.SameLine()
     imgui.SetCursorPosX(imgui.GetCursorPosX() + imgui.GetStyle().ItemInnerSpacing.x)
     imgui.TextColoredRGB(label)
+end
+
+function imgui.ClickableText(text, url)
+    -- Цвет ссылки
+    local linkColor = imgui.ImVec4(0.4, 0.7, 1.0, 1.0)
+    local hoverColor = imgui.ImVec4(0.6, 0.85, 1.0, 1.0)
+
+    local isHovered = false
+
+    -- Определяем цвет в зависимости от состояния
+    imgui.PushStyleColor(imgui.Col.Text, linkColor)
+
+    -- Добавляем иконку ссылки перед текстом
+    imgui.Text(text)
+
+    isHovered = imgui.IsItemHovered()
+
+    if isHovered then
+        imgui.SetMouseCursor(imgui.MouseCursor.Hand)
+
+        -- Подчёркивание
+        local min = imgui.GetItemRectMin()
+        local max = imgui.GetItemRectMax()
+        imgui.GetWindowDrawList():AddLine(
+            imgui.ImVec2(min.x, max.y),
+            imgui.ImVec2(max.x, max.y),
+            imgui.GetColorU32Vec4(hoverColor),
+            1.0
+        )
+
+        imgui.PopStyleColor(1)
+
+        -- Всплывающая подсказка с URL
+        if url then
+            imgui.SetTooltip(u8"Нажмите, чтобы открыть:\n" .. url)
+        else
+            imgui.SetTooltip(u8"Нажмите для перехода")
+        end
+    else
+        imgui.PopStyleColor(1)
+    end
+
+    if imgui.IsItemClicked() then
+        return true
+    end
+    return false
 end
 
 -- --------------------------------------------------------
