@@ -5,7 +5,7 @@
 script_authors('Sand')
 script_name('MMT | Mining Tool')
 script_description('Mining assistant TG: @Mister_Sand')
-script_version("1.6")
+script_version("1.7")
 
 -- =====================================================================================================================
 --                                                          Import
@@ -27,6 +27,7 @@ local lfsSuccess,       lfs         = CheckLibrary('lfs')
 local faSuccess,        fa          = CheckLibrary('fAwesome6_solid')
 local keysSuccess,      vkeys       = CheckLibrary('vkeys')
 local ffiSuccess,       ffi         = CheckLibrary('ffi')
+local notifySuccess,    notify      = pcall(require, 'session_notifications')
 
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
@@ -39,6 +40,11 @@ end
 local VK_RETURN = (keysSuccess and vkeys.VK_RETURN) or 0x0D
 local VK_UP     = (keysSuccess and vkeys.VK_UP)     or 0x26
 local VK_DOWN   = (keysSuccess and vkeys.VK_DOWN)   or 0x28
+
+local REQUIRED_NOTIFY_VERSION = '1.0'
+local NOTIFY_MANAGER_REPO_URL = 'https://github.com/Mister-Sand/session_notifications'
+local NOTIFY_MANAGER_RAW_URL = 'https://raw.githubusercontent.com/Mister-Sand/session_notifications/main/NotificationManager.lua'
+local NOTIFY_LIBRARY_RAW_URL = 'https://raw.githubusercontent.com/Mister-Sand/session_notifications/main/lib/session_notifications.lua'
 
 -- =====================================================================================================================
 --                                                          GLOBAL VARIABLES
@@ -58,6 +64,7 @@ local PATCHCONFIG = folderConfig..'MMT CFGs'..SEPORATORPATCH
 -- === Логи / статистика заточки видеокарт ===
 local IMPROVE_LOGS_DIR   = PATCHCONFIG .. 'logs' .. SEPORATORPATCH     -- папка для текстовых логов
 local IMPROVE_STATS_FILE = PATCHCONFIG .. 'ImproveStats.json'          -- файл со сводной статистикой
+local COLLECT_STATS_FILE = PATCHCONFIG .. 'CollectStats.json'          -- лог сбора криптовалюты по датам / домам
 
 
 local COLORS = {
@@ -77,8 +84,8 @@ local TYPECHATMESSAGES = {
 
 -- Доходность видеокарт по уровням в час
 local GPU_HOURLY_BY_LEVEL = {
-    [1]=0.029999, [2]=0.059999, [3]=0.090000, [4]=0.119990, [5]=0.150000,
-    [6]=0.180000, [7]=0.209999, [8]=0.239999, [9]=0.270000, [10]=0.300000,
+    [1]=0.050325, [2]=0.100650, [3]=0.150975, [4]=0.201300, [5]=0.503250,
+    [6]=0.631349, [7]=0.736575, [8]=0.876874, [9]=1.052250, [10]=1.227625,
 }
 
 -- Сколько часов видеокарта отработает за полный цикл при 100% охлаждения
@@ -127,8 +134,12 @@ local defaultSettings = {
         hideMessagesCollect = true,
         -- автозаливка
         autoFillEnabled = false,
+        -- автоматически включать видеокарты после сбора
+        autoEnableCards = false,
         -- Панель статуса
         showStatusPanel = false,
+        -- Напоминание, если давно не было сбора крипты (в минутах, 0 = выкл)
+        collectNotifyMinutes = 0,
         -- Отображение доходности (что показывать в списке полок)
         income = {
             showPerHour             = true,  -- "/ч"
@@ -136,6 +147,8 @@ local defaultSettings = {
             showPerCycle            = true,  -- "/цикл"
             showTillThresholdHours  = true,  -- "до доливки" (часы и прибыль)
             showTillThresholdProfit = true,  -- "до доливки" (часы и прибыль)
+            houseBonuses            = {},
+            onlineHours             = 0,
         },
     },
     improve = {
@@ -213,6 +226,7 @@ local windowPos = nil
 local activeTabScript = "main"
 
 local inputBlackHouse = new.int()
+local inputIncomeHouse = new.int()
 local ui_bank = { buf = new.char[32]("") }
 
 -- Состояния для элеметов в ui
@@ -290,6 +304,17 @@ local collectStats = {
     total = { BTC = 0, ASC = 0 },
     house = {}  -- [house_number] = { BTC = 0, ASC = 0 }
 }
+local collectLogStore = { days = {}, meta = {} }
+local collectReminder = {
+    lastNotifiedCollectAt = 0,
+    notifyPending = false,
+    retryAfterAt = 0,
+    lastTickAt = 0,
+    managerEnsurePending = false,
+    managerDownloadPending = false,
+    managerStatusMessage = "",
+}
+local collectReminderAction = nil
 
 -- Доступные полки
 local shelves = {}
@@ -425,6 +450,33 @@ local function Improve_SendCef(payload)
     return true
 end
 
+local function Improve_SendCefInterfaceClick(iface, sub, reqid, payload)
+    iface = tonumber(iface or 0) or 0
+    sub = tonumber(sub or 0) or 0
+    reqid = tonumber(reqid or -1) or -1
+    payload = payload ~= nil and tostring(payload) or ''
+
+    local bs = raknetNewBitStream()
+    if not bs then return false end
+
+    raknetBitStreamWriteInt8(bs, 220)
+    raknetBitStreamWriteInt8(bs, 0x3F)
+    raknetBitStreamWriteInt8(bs, iface)
+    raknetBitStreamWriteInt32(bs, reqid)
+    raknetBitStreamWriteInt32(bs, sub)
+
+    if payload ~= '' then
+        raknetBitStreamWriteInt16(bs, #payload)
+        raknetBitStreamWriteString(bs, payload)
+    else
+        raknetBitStreamWriteInt16(bs, 0)
+    end
+
+    raknetSendBitStream(bs)
+    raknetDeleteBitStream(bs)
+    return true
+end
+
 local function Improve_SendCefClickOnSlot(slot, action, clickType)
     slot = tonumber(slot or 0) or 0
     action = tonumber(action or 1) or 1
@@ -437,6 +489,250 @@ local function Improve_SendCefClickOnSlot(slot, action, clickType)
     return Improve_SendCef(packet)
 end
 
+local flashCollect = {
+    active = false,
+    inventoryOpened = false,
+    waitHouseDialog = false,
+    houseDialogReady = false,
+    failed = false,
+    error = "",
+    statsBusy = false,
+    lastStatsAt = "-",
+    slot = 0,
+    count = 0,
+    name = "",
+}
+
+local function FlashCollect_ResetFlags()
+    flashCollect.active = false
+    flashCollect.inventoryOpened = false
+    flashCollect.waitHouseDialog = false
+    flashCollect.houseDialogReady = false
+    flashCollect.failed = false
+    flashCollect.error = ""
+    flashCollect.statsBusy = false
+end
+
+local function FlashCollect_ResetItem()
+    flashCollect.slot = 0
+    flashCollect.count = 0
+    flashCollect.name = ""
+end
+
+local function FlashCollect_Cancel()
+    local wasPreparing = flashCollect.active
+    local wasCollecting = stateCrypto.work and processes.take
+
+    if wasPreparing then
+        FlashCollect_ResetFlags()
+    end
+
+    if wasCollecting then
+        DeactivateProcessesInteracting()
+    end
+
+    if wasPreparing or wasCollecting then
+        AddChatMessage("Сбор через флешку: отменен", TYPECHATMESSAGES.WARNING)
+        return true
+    end
+
+    return false
+end
+
+local function FlashCollect_IsFlashItem(name)
+    local lowerName = tostring(name or "")
+    return lowerName:find("Флешка майнера", 1, true) ~= nil
+end
+
+local function FlashCollect_RegisterItem(name, count, slot)
+    slot = tonumber(slot or 0) or 0
+    count = tonumber(count or 0) or 0
+    if slot <= 0 or count <= 0 then return end
+    if not FlashCollect_IsFlashItem(name) then return end
+
+    flashCollect.slot = slot
+    flashCollect.count = count
+    flashCollect.name = tostring(name or "")
+end
+
+local function FlashCollect_ParseStatsInventoryPage(text)
+    for line in (text or ''):gmatch("[^\r\n]+") do
+        local indexSlot, name, count = line:match("%[([^%]]+)%]%s(.-)%s%{.-}%[([^%]]+)%sшт%]")
+        local slotNum = tonumber(indexSlot)
+        count = tonumber(count)
+        if indexSlot and name and count then
+            FlashCollect_RegisterItem(name, count, slotNum)
+        end
+    end
+end
+
+local function FlashCollect_RequestStatsScan(async)
+    if flashCollect.statsBusy or improve.oils.busy then
+        return false
+    end
+
+    FlashCollect_ResetItem()
+    flashCollect.statsBusy = true
+    sampSendChat('/stats')
+
+    local function finish()
+        flashCollect.lastStatsAt = os.date('%H:%M')
+    end
+
+    if async then
+        lua_thread.create(function()
+            while flashCollect.statsBusy do wait(10) end
+            finish()
+        end)
+    else
+        while flashCollect.statsBusy do wait(10) end
+        finish()
+        return true
+    end
+end
+
+local function FlashCollect_SendUseSlot(slot)
+    slot = tonumber(slot or 0) or 0
+    if slot <= 0 then
+        return false
+    end
+
+    if ISMONETLOADER then
+        local payload = string.format('{"action":1,"id":0,"slot":%d,"type":1}', slot)
+        improve.cef.lastPacketId = 220
+        improve.cef.lastPacket = payload
+        return Improve_SendCefInterfaceClick(52, 3, -1, payload)
+    end
+
+    local packet = string.format('clickOnButton|{"type": 1,"slot": %d, "action": 1}', slot)
+    improve.cef.lastPacketId = 220
+    improve.cef.lastPacket = packet
+    return Improve_SendCef(packet)
+end
+
+local function FlashCollect_CloseInventoryAfterUse()
+    if not ISMONETLOADER then
+        return
+    end
+
+    wait(100)
+    if flashCollect.active then
+        sampSendClickTextdraw(65535)
+    end
+end
+
+local function FlashCollect_GetUseDelayAfterInventoryOpen()
+    local delayMs = tonumber(settings.deley and settings.deley.improve_waitTryClick or 500) or 500
+    if delayMs < 800 then
+        delayMs = 800
+    end
+    return delayMs
+end
+
+local function FlashCollect_Fail(reason, chatType)
+    flashCollect.failed = true
+    flashCollect.error = tostring(reason or "")
+    flashCollect.active = false
+    flashCollect.waitHouseDialog = false
+    flashCollect.houseDialogReady = false
+    flashCollect.inventoryOpened = false
+    flashCollect.statsBusy = false
+    AddChatMessage(reason or "Сбор через флешку: ошибка", chatType or TYPECHATMESSAGES.CRITICAL)
+end
+
+local function FlashCollect_FindFlashViaStats()
+    AddChatMessage("Сбор через флешку: открываю список предметов в /stats", TYPECHATMESSAGES.DEBUG)
+    if not FlashCollect_RequestStatsScan(false) then
+        FlashCollect_Fail("Сбор через флешку: сканирование /stats уже выполняется", TYPECHATMESSAGES.WARNING)
+        return false
+    end
+
+    if (flashCollect.count or 0) <= 0 or (flashCollect.slot or 0) <= 0 then
+        FlashCollect_Fail("Сбор через флешку: флешка не найдена в списке предметов /stats", TYPECHATMESSAGES.CRITICAL)
+        return false
+    end
+
+    return true
+end
+
+local function StartCollectViaFlash()
+    if stateCrypto.work then
+        AddChatMessage("Сбор через флешку: процесс уже запущен", TYPECHATMESSAGES.WARNING)
+        return false
+    end
+
+    if improve.isOn or improve.oils.busy or flashCollect.statsBusy then
+        AddChatMessage("Сбор через флешку: дождитесь окончания сканирования /stats", TYPECHATMESSAGES.WARNING)
+        return false
+    end
+
+    if flashCollect.active then
+        AddChatMessage("Сбор через флешку: запуск уже выполняется", TYPECHATMESSAGES.WARNING)
+        return false
+    end
+
+    lua_thread.create(function()
+        FlashCollect_ResetFlags()
+        FlashCollect_ResetItem()
+        flashCollect.active = true
+
+        if not FlashCollect_FindFlashViaStats() then
+            return
+        end
+
+        flashCollect.inventoryOpened = false
+        flashCollect.waitHouseDialog = false
+        flashCollect.houseDialogReady = false
+
+        AddChatMessage("Сбор через флешку: открываю /invent", TYPECHATMESSAGES.DEBUG)
+        sampSendChat('/invent')
+
+        local useDelayMs = FlashCollect_GetUseDelayAfterInventoryOpen()
+        local inventoryTimeout = os.clock() + (useDelayMs / 1000)
+        while flashCollect.active and not flashCollect.inventoryOpened and os.clock() < inventoryTimeout do
+            wait(25)
+        end
+
+        AddChatMessage(string.format("Сбор через флешку: жду %d мс после /invent перед использованием", useDelayMs), TYPECHATMESSAGES.DEBUG)
+        wait(useDelayMs)
+        if not flashCollect.active then
+            return
+        end
+
+        flashCollect.waitHouseDialog = true
+        if not FlashCollect_SendUseSlot(flashCollect.slot) then
+            FlashCollect_Fail("Сбор через флешку: не удалось отправить пакет использования предмета", TYPECHATMESSAGES.CRITICAL)
+            return
+        end
+
+        FlashCollect_CloseInventoryAfterUse()
+
+        local dialogTimeout = os.clock() + 8
+        while flashCollect.active and not flashCollect.houseDialogReady and not flashCollect.failed and os.clock() < dialogTimeout do
+            wait(25)
+        end
+
+        if not flashCollect.active then
+            return
+        end
+
+        if flashCollect.failed then
+            return
+        end
+
+        if not flashCollect.houseDialogReady or #houses == 0 then
+            FlashCollect_Fail("Сбор через флешку: список домов не открылся", TYPECHATMESSAGES.CRITICAL)
+            return
+        end
+
+        FlashCollect_ResetFlags()
+        AddChatMessage("Сбор через флешку: запускаю сбор со всех домов", TYPECHATMESSAGES.DEBUG)
+        wait(100)
+        StartProcessInteracting("take")
+    end)
+
+    return true
+end
 local function Improve_ResetCefInventory()
     improve.cef.cards = {}
     improve.cef.probing = false
@@ -493,6 +789,31 @@ local function Improve_AddCefCardSlot(slot, itemName, hasStorageUpgrade, cardTyp
     })
 end
 
+local function Improve_MoveMaxLevelCardsToEnd(cards)
+    if type(cards) ~= "table" or #cards <= 1 then return cards end
+
+    local activeCards = {}
+    local maxLevelCards = {}
+
+    for _, card in ipairs(cards) do
+        if tonumber(card.level or 0) >= 10 then
+            table.insert(maxLevelCards, card)
+        else
+            table.insert(activeCards, card)
+        end
+    end
+
+    if #maxLevelCards == 0 or #activeCards == 0 then
+        return cards
+    end
+
+    for _, card in ipairs(maxLevelCards) do
+        table.insert(activeCards, card)
+    end
+
+    return activeCards
+end
+
 local function Improve_SyncVideoCardsFromCef()
     local cards = {}
     local selectedType = tonumber(settings.improve.typeCards or 1) or 1
@@ -515,10 +836,18 @@ local function Improve_SyncVideoCardsFromCef()
         end)
     end
 
+    cards = Improve_MoveMaxLevelCardsToEnd(cards)
     improve.videoCards = cards
 end
 local function Improve_ParseCardLevelFromDialog(text)
-    for line in tostring(text or ''):gmatch('[^\r\n]+') do
+    local dialogText = tostring(text or '')
+
+    local currentLvl = dialogText:match('Сейчас%s+уровень%s+производительности%s+видеокарты:%s*(%d+)%s*из%s*10')
+    if currentLvl then
+        return math.maxEx(0, tonumber(currentLvl) or 0)
+    end
+
+    for line in dialogText:gmatch('[^\r\n]+') do
         if line:find('Улучшить производительность видео-карты', 1, true) then
             local maxLvl = tonumber(line:match('до%s+(%d+)%s+уровн'))
             if maxLvl then
@@ -526,6 +855,7 @@ local function Improve_ParseCardLevelFromDialog(text)
             end
         end
     end
+
     return nil
 end
 
@@ -660,9 +990,15 @@ end
 
 function Improve_HandleNewStyleChooseDialog(dialogId, title, text)
     if not Improve_IsNewStyleMode() then return false end
-    if not title:find('{BFBBBA}Выберите вид улучшения для видеокарты') then return false end
 
+    local dialogTitle = tostring(title or '')
     local dialogText = tostring(text or '')
+    local isChooseDialog = dialogTitle:find('{BFBBBA}Выберите вид улучшения для видеокарты', 1, true) ~= nil
+    local isUpgradeDialog = dialogTitle:find('{BFBBBA}Улучшение видеокарты', 1, true) ~= nil
+
+    if not isChooseDialog and not (improve.cef.probing and isUpgradeDialog) then
+        return false
+    end
 
     if improve.cef.probing and improve.cef.pendingSlot then
         local card = nil
@@ -681,7 +1017,7 @@ function Improve_HandleNewStyleChooseDialog(dialogId, title, text)
 
             if dialogText:find('Увеличить объем хранения криптовалюты на видео-карте', 1, true) then
                 card.storageUpgrade = false
-            else
+            elseif isChooseDialog then
                 card.storageUpgrade = true
             end
         end
@@ -689,6 +1025,10 @@ function Improve_HandleNewStyleChooseDialog(dialogId, title, text)
         improve.cef.probeDone = true
         sampSendDialogResponse(dialogId, 0, 0, '')
         return true
+    end
+
+    if not isChooseDialog then
+        return false
     end
 
     if not (improve.isOn and improve.step == 3) then
@@ -891,14 +1231,29 @@ function main()
     end)
     sampRegisterChatCommand("mmtsr", function ()
         settings.style.scaleUI = 1.0
+        settings.style.sizeWindow = defaultSettings.style.sizeWindow
         SaveSettings()
         thisScript():reload()
     end)
+    sampRegisterChatCommand("mmtflash", function ()
+        StartCollectViaFlash()
+    end)
+
+    if notifySuccess and type(notify) == 'table' and type(notify.register_action) == 'function' then
+        collectReminderAction = notify.register_action(u8("Запустить сбор"), function()
+            StartCollectViaFlash()
+        end)
+    end
 
     -- Фоновый поток заточки
     lua_thread.create(function()
         while true do
-            wait(0)
+            wait(10)
+
+            if notifySuccess and type(notify) == 'table' and type(notify.process_actions) == 'function' then
+                notify.process_actions()
+            end
+
             -- автообновление инвентаря при старте заточки (если включено)
             if improve.isOn and improve.needCheckOils then
                 improve.needCheckOils = false
@@ -945,6 +1300,7 @@ function main()
             end
 
             Improve_Tick()
+            Collect_ReminderTick()
         end
     end)
 
@@ -961,144 +1317,169 @@ end
 --                           onServerMessage
 -- --------------------------------------------------------
 
-function sampev.onServerMessage(color, text)
-    if stateCrypto.work then
-        if text:find("Вы залили") and text:find("охлаждающей жидкости в видеокарту") and color == 1941201407 then
-            local nowFillLiquid = text:match("восстановлено до ([%d%.]+)%%")
+local function HandleFlashCollectServerMessage(text)
+    if flashCollect.active and text:find("Эта функция недоступна через флешку", 1, true) then
+        FlashCollect_Fail("Сбор через флешку: сервер отклонил использование флешки", TYPECHATMESSAGES.CRITICAL)
+    end
+end
 
-            if nowFillLiquid then
-                stateCrypto.queueShelves[stateCrypto.progressShelves].fill = tonumber(nowFillLiquid)
-                stateCrypto.waitFill = false
-            end
+local function HandleStateCryptoServerMessage(color, text)
+    if not stateCrypto.work then
+        return nil
+    end
+
+    if text:find("Вы залили") and text:find("охлаждающей жидкости в видеокарту") and color == 1941201407 then
+        local nowFillLiquid = text:match("восстановлено до ([%d%.]+)%%")
+
+        if nowFillLiquid then
+            stateCrypto.queueShelves[stateCrypto.progressShelves].fill = tonumber(nowFillLiquid)
+            stateCrypto.waitFill = false
         end
+    end
 
-        if text:find("Чтобы запустить видеокарту в работу, необходимо вывести всю прибыль этой видеокарты") and color == -1104335361 then
-            DeactivateProcessesInteracting()
-        end
+    if text:find("Чтобы запустить видеокарту в работу, необходимо вывести всю прибыль этой видеокарты") and color == -1104335361 then
+        DeactivateProcessesInteracting()
+    end
 
-        if text:find("Эта функция недоступна через флешку") and color == -1104335361 then
-            DeactivateProcessesInteracting()
-        end
+    if text:find("Эта функция недоступна через флешку") and color == -1104335361 then
+        DeactivateProcessesInteracting()
+    end
 
-        if text:find("Вы успешно пополнили счёт дома за электроэнергию на ") and color == 1941201407 then
-            stateCrypto.waitDep = false
-        end
+    if text:find("Вы успешно пополнили счёт дома за электроэнергию на ") and color == 1941201407 then
+        stateCrypto.waitDep = false
+    end
 
-        if text:find("В этом доме нет подвала с вентиляцией или он еще не достроен") and color == -1104335361 then
-            DeactivateProcessesInteracting()
-            AddChatMessage("Вы можете добавить данный дом в чёрный список, чтобы его скрыть", TYPECHATMESSAGES.SECONDARY)
-        end
+    if text:find("В этом доме нет подвала с вентиляцией или он еще не достроен") and color == -1104335361 then
+        DeactivateProcessesInteracting()
+        AddChatMessage("Вы можете добавить данный дом в чёрный список, чтобы его скрыть", TYPECHATMESSAGES.SECONDARY)
+    end
 
-        if text:find("У Вас недостаточно денежных средств!") and color == -1104335361 then
-            DeactivateProcessesInteracting()
-        end
+    if text:find("У Вас недостаточно денежных средств!") and color == -1104335361 then
+        DeactivateProcessesInteracting()
+    end
 
-        if  text:find("осталось на счету видеокарты:") or (
+    if processes.take and (
+            text:find("осталось на счету видеокарты:") or (
                 text:find("Вам был добавлен предмет") and (
                     text:find(":item1811:", nil, true) or
-                    text:find(":item5996:", nil, true)
+                    text:find(":item5996:", nil, true) or
+                    text:find("Bitcoin (BTC)", nil, true)
                 )
-            ) and
-            color == -65281 and
-            settings.main.hideMessagesCollect then
-            return false
-        end
+            )
+        ) and color == -65281 and settings.main.hideMessagesCollect then
+        return false
     end
 
-    -- Старт заточки видеокарты:
-    if improve.isOn and improve.waitStart then
-        if improve.useStorageUpgrade then
-            if text:find('Вы начали процесс улучшения увеличения объема хранение видеокарты') then
-                improve.waitStart = false
-                improve.waitStartAt = 0
-                improve.waitResultAt = os.clock()
-                improve.step = 4      -- заточка запущена
-                Improve_LogAdd("INFO", "Сервер подтвердил начало процесса улучшения хранилища видеокарты.")
-                Improve_AttemptStart()
-            end
-        else
-            if text:find('Вы начали процесс улучшения производительности видеокарты') then
-                improve.waitStart = false
-                improve.waitStartAt = 0
-                improve.waitResultAt = os.clock()
-                improve.step = 4      -- заточка запущена
-                Improve_LogAdd("INFO", "Сервер подтвердил начало процесса улучшения уровня видеокарты.")
-                Improve_AttemptStart()
-            end
-        end
+    return nil
+end
+
+local function Improve_HandleWaitStartServerMessage(text)
+    if not (improve.isOn and improve.waitStart) then
+        return
     end
 
-    if improve.isOn and improve.step == 3 then
-        -- Если жмём "Использовать" слишком рано и сервер пишет "Подождите немного."
-        if text:find('Подождите немного') then
-            Improve_LogAdd("WARN", "Сервер ответил \"Подождите немного.\" - повторяем нажатие кнопки \"Использовать\".")
-            lua_thread.create(function ()
-                wait(1000)
-                if improve.isOn and improve.step == 3 then
-                    Improve_ClickUse()
-                end
-            end)
-        end
+    local startPattern
+    local logMessage
 
-        if improve.useStorageUpgrade then
-            if text:find('[Ошибка] {ffffff}У вас нет увеличителя пропускной способности', nil, true) then
-                MI_Say("У вас нет увеличителя пропускной способности!")
-                Improve_LogAdd("ERROR", "Получено сообщение об отсутствии увеличителя пропускной способности. Сессия остановлена.")
-                Improve_Stop("Нет увеличителя пропускной способности")
-            end
-            if text:find('[Ошибка] {ffffff}На выбранной видео-карте уже увеличен объём хранение криптовалюты', nil, true) then
-                MI_Say("Видеокарта уже улучшена, переходим к следующей")
-                Improve_LogAdd("ERROR", "Получено сообщение о уже увеличен объём хранение криптовалюты")
-
-                lua_thread.create(function ()
-                    wait(settings.deley.improve_waitResult or 600)
-                    local card = improve.videoCards[improve.currentIndex]
-                    if card then
-                        card.storageUpgrade = true
-                    end
-                    improve.step = 1
-                    improve.consumedThisTry = false
-                end)
-            end
-        end
+    if improve.useStorageUpgrade then
+        startPattern = 'Вы начали процесс улучшения увеличения объема хранение видеокарты'
+        logMessage = 'Сервер подтвердил начало процесса улучшения хранилища видеокарты.'
+    else
+        startPattern = 'Вы начали процесс улучшения производительности видеокарты'
+        logMessage = 'Сервер подтвердил начало процесса улучшения уровня видеокарты.'
     end
 
-    -- Результат заточки видеокарты (успех/ошибка)
-    if improve.isOn and improve.step == 4 then
-        local isFail = nil
-        local isSuccess = nil
+    if text:find(startPattern) then
+        improve.waitStart = false
+        improve.waitStartAt = 0
+        improve.waitResultAt = os.clock()
+        improve.step = 4
+        Improve_LogAdd("INFO", logMessage)
+        Improve_AttemptStart()
+    end
+end
 
-        if improve.useStorageUpgrade then
-            isFail = text:find('^%[Информация%] {ffffff}При улучшении выбранной видеокарты вы допустили техническую ошибку, попробуйте еще раз%.$')
-            isSuccess = text:find('^%[Информация%] {ffffff}Вы успешно увеличили объем хранения криптовалюты')
-        else
-            isFail = text:find('^%[Информация%] {ffffff}При улучшении выбранной видеокарты вы допустили техническую ошибку, попробуйте еще раз%.$')
-            isSuccess = text:find('^%[Информация%] {ffffff}Вы успешно улучшили выбранную')
-        end
-
-        if isFail or isSuccess then
-            if isSuccess then
-                Improve_OnResult(true, text)
-            else
-                Improve_OnResult(false, text)
-            end
-
-            lua_thread.create(function ()
-                wait(settings.deley.improve_waitResult or 600)
-                improve.waitResultAt = 0
-                improve.lastUseAt = 0
-                improve.step = 1
-                improve.consumedThisTry = false
-            end)
-        end
+local function Improve_HandleUseRetryServerMessage(text)
+    if not (improve.isOn and improve.step == 3) then
+        return
     end
 
+    if text:find('Подождите немного') then
+        Improve_LogAdd("WARN", "Сервер ответил \"Подождите немного.\" - повторяем нажатие кнопки \"Использовать\".")
+        lua_thread.create(function ()
+            wait(1000)
+            if improve.isOn and improve.step == 3 then
+                Improve_ClickUse()
+            end
+        end)
+    end
+end
+
+local function Improve_HandleStorageUpgradeServerMessage(text)
+    if not (improve.isOn and improve.step == 3 and improve.useStorageUpgrade) then
+        return
+    end
+
+    if text:find('[Ошибка] {ffffff}У вас нет увеличителя пропускной способности', nil, true) then
+        MI_Say("У вас нет увеличителя пропускной способности!")
+        Improve_LogAdd("ERROR", "Получено сообщение об отсутствии увеличителя пропускной способности. Сессия остановлена.")
+        Improve_Stop("Нет увеличителя пропускной способности")
+    end
+
+    if text:find('[Ошибка] {ffffff}На выбранной видео-карте уже увеличен объём хранение криптовалюты', nil, true) then
+        MI_Say("Видеокарта уже улучшена, переходим к следующей")
+        Improve_LogAdd("ERROR", "Получено сообщение о уже увеличен объём хранение криптовалюты")
+
+        lua_thread.create(function ()
+            wait(settings.deley.improve_waitResult or 600)
+            local card = improve.videoCards[improve.currentIndex]
+            if card then
+                card.storageUpgrade = true
+            end
+            improve.step = 1
+            improve.consumedThisTry = false
+        end)
+    end
+end
+
+local function Improve_HandleResultServerMessage(text)
+    if not (improve.isOn and improve.step == 4) then
+        return
+    end
+
+    local isFail
+    local isSuccess
+
+    if improve.useStorageUpgrade then
+        isFail = text:find('^%[Информация%] {ffffff}При улучшении выбранной видеокарты вы допустили техническую ошибку, попробуйте еще раз%.$')
+        isSuccess = text:find('^%[Информация%] {ffffff}Вы успешно увеличили объем хранения криптовалюты')
+    else
+        isFail = text:find('^%[Информация%] {ffffff}При улучшении выбранной видеокарты вы допустили техническую ошибку, попробуйте еще раз%.$')
+        isSuccess = text:find('^%[Информация%] {ffffff}Вы успешно улучшили выбранную')
+    end
+
+    if isFail or isSuccess then
+        Improve_OnResult(isSuccess == true, text)
+
+        lua_thread.create(function ()
+            wait(settings.deley.improve_waitResult or 600)
+            improve.waitResultAt = 0
+            improve.lastUseAt = 0
+            improve.step = 1
+            improve.consumedThisTry = false
+        end)
+    end
+end
+
+local function Improve_HandleProbeServerMessage(text)
     if improve.cef.probing and text:find('Чтобы установить видеокарту, вы должны находиться в подвале возле одной из специальных стоек') then
         improve.cef.probeAbort = true
         improve.cef.probeAbortReason = 'нужно находиться в подвале возле стойки'
         improve.cef.probeDone = true
     end
+end
 
+local function Improve_HandleInvalidPlaceServerMessage(text)
     if improve.isOn and text:find('Чтобы установить видеокарту, вы должны находиться в подвале возле одной из специальных стоек') then
         MI_Say("Недопустимое место заточки!")
         Improve_LogAdd("ERROR", "Получено сообщение о неверном месте заточки. Сессия остановлена.")
@@ -1106,326 +1487,442 @@ function sampev.onServerMessage(color, text)
     end
 end
 
+function sampev.onServerMessage(color, text)
+    HandleFlashCollectServerMessage(text)
+
+    local handled = HandleStateCryptoServerMessage(color, text)
+    if handled ~= nil then
+        return handled
+    end
+
+    Improve_HandleWaitStartServerMessage(text)
+    Improve_HandleUseRetryServerMessage(text)
+    Improve_HandleStorageUpgradeServerMessage(text)
+    Improve_HandleResultServerMessage(text)
+    Improve_HandleProbeServerMessage(text)
+    Improve_HandleInvalidPlaceServerMessage(text)
+end
+
 
 -- --------------------------------------------------------
 --                           onShowDialog
 -- --------------------------------------------------------
 
-function sampev.onShowDialog(dialogId, style, title, button1, button2, text)
-    lastIDDialog = dialogId
+local function DialogReturnVisibility()
+    return not settings.main.replaceDialog
+end
 
-    if stateCrypto.work and processes.dep and title:find("{73B461}Баланс домашнего счёта") then
-        -- Сколько можно пополнить по данным диалога (остаток до максимума банка)
-        local can_str = text:match("Можно пополнить счёт ещё на:%s*{%w+}%$([%d%.,]+)")
-        local can = 0
-        if can_str then
-            can = tonumber((can_str:gsub("[^%d]", ""))) or 0
-        end
+local function HandleBankDepositDialog(dialogId, title, text)
+    if not (stateCrypto.work and processes.dep and title:find("{73B461}Баланс домашнего счёта")) then
+        return nil
+    end
 
-        -- Текущий баланс по данным очереди (парсится ранее)
-        local cur = tonumber(stateCrypto.queueHousesBank[stateCrypto.progressHousesBank].bankNow) or 0
+    local can_str = text:match("Можно пополнить счёт ещё на:%s*{%w+}%$([%d%.,]+)")
+    local can = 0
+    if can_str then
+        can = tonumber((can_str:gsub("[^%d]", ""))) or 0
+    end
 
-        -- Цель (если включена), иначе nil => льём до максимума диалога
-        local target = (settings.main.bankFillToTarget and settings.main.bankTargetAmount) or nil
+    local cur = tonumber(stateCrypto.queueHousesBank[stateCrypto.progressHousesBank].bankNow) or 0
+    local target = (settings.main.bankFillToTarget and settings.main.bankTargetAmount) or nil
 
-        local dep
-        if target and target > 0 then
-            if cur >= target then
-                -- Ничего пополнять, уже достигли цели
-                DialogUtils.waitAndSendDialogResponse(dialogId, 0, 0, "")
-                return not settings.main.replaceDialog
-            end
-            dep = target - cur
-        else
-            -- По умолчанию льём до максимума
-            dep = can
-        end
-
-        -- Страховочные ограничения, не больше доступного и лимита за раз
-        local PER_OP_LIMIT = 10000000
-        dep = math.minEx(dep,  math.maxEx(0, can - 1))
-        dep = math.minEx(dep, PER_OP_LIMIT)
-        if dep <= 0 then
+    local dep
+    if target and target > 0 then
+        if cur >= target then
             DialogUtils.waitAndSendDialogResponse(dialogId, 0, 0, "")
-            return not settings.main.replaceDialog
+            return DialogReturnVisibility()
         end
-
-        DialogUtils.waitAndSendDialogResponse(dialogId, 1, 0, tostring(dep))
-        stateCrypto.queueHousesBank[stateCrypto.progressHousesBank].bankNow = cur + dep
-        return not settings.main.replaceDialog
+        dep = target - cur
+    else
+        dep = can
     end
 
-    if stateCrypto.work and processes.take and title:find("Вывод прибыли видеокарты") then
-        local continue = stateCrypto.queueShelves[stateCrypto.progressShelves].count - stateCrypto.takeCount
-        stateCrypto.queueShelves[stateCrypto.progressShelves].count = continue
-        if stateCrypto.takeCount and stateCrypto.takeCount > 0 and stateCrypto.takeCurrency then
-            local cur = stateCrypto.takeCurrency
-            -- итого по всем домам
-            collectStats.total[cur] = (collectStats.total[cur] or 0) + stateCrypto.takeCount
-            -- итого по текущему дому (если он известен)
-            local hid = stateCrypto.currentHouseId or 0
-            collectStats.house[hid] = collectStats.house[hid] or { BTC = 0, ASC = 0 }
-            collectStats.house[hid][cur] = (collectStats.house[hid][cur] or 0) + stateCrypto.takeCount
-        end
-        DialogUtils.waitAndSendDialogResponse(dialogId, 1, 0, "")
-        stateCrypto.takeCount = 0
-        stateCrypto.takeCurrency = nil
-        return not settings.main.replaceDialog
+    local PER_OP_LIMIT = 10000000
+    dep = math.minEx(dep,  math.maxEx(0, can - 1))
+    dep = math.minEx(dep, PER_OP_LIMIT)
+    if dep <= 0 then
+        DialogUtils.waitAndSendDialogResponse(dialogId, 0, 0, "")
+        return DialogReturnVisibility()
     end
 
-    if stateCrypto.work and title:find("Стойка") and title:find("Полка") then
-        local actions = ParseShelfVideoCardData(text)
+    DialogUtils.waitAndSendDialogResponse(dialogId, 1, 0, tostring(dep))
+    stateCrypto.queueHousesBank[stateCrypto.progressHousesBank].bankNow = cur + dep
+    return DialogReturnVisibility()
+end
 
-        for index, value in ipairs(actions) do
-            if processes.take then
-                if  value.count > 0 and (value.action == "take_btc" or value.action == "take_asc") then
-                    stateCrypto.takeCount = value.count
-                    stateCrypto.takeCurrency = (value.action == "take_btc") and "BTC" or "ASC"
-                    DialogUtils.waitAndSendDialogResponse(dialogId, 1, value.samp_line, "")
-                    return not settings.main.replaceDialog
-                elseif math.floor(stateCrypto.queueShelves[stateCrypto.progressShelves].count) <= 0 then
-                    stateCrypto.progressShelves = stateCrypto.progressShelves +1
-                    DialogUtils.waitAndSendDialogResponse(dialogId, 0, 0, "")
-                    return not settings.main.replaceDialog
-                end
-            end
+local function HandleTakeProfitDialog(dialogId, title)
+    if not (stateCrypto.work and processes.take and title:find("Вывод прибыли видеокарты")) then
+        return nil
+    end
 
-            if processes.fill and value.action == "fill" then
-                if stateCrypto.queueShelves[stateCrypto.progressShelves].fill > settings.main.fillFrom then
-                    stateCrypto.progressShelves = stateCrypto.progressShelves +1
-                    DialogUtils.waitAndSendDialogResponse(dialogId, 0, 0, "")
-                    return not settings.main.replaceDialog
-                end
+    local queueShelf = stateCrypto.queueShelves[stateCrypto.progressShelves]
+    if queueShelf then
+        queueShelf.count = (queueShelf.count or 0) - (stateCrypto.takeCount or 0)
+    end
+
+    if stateCrypto.takeCount and stateCrypto.takeCount > 0 and stateCrypto.takeCurrency then
+        local cur = stateCrypto.takeCurrency
+        local hid = stateCrypto.currentHouseId or 0
+
+        collectStats.total[cur] = (collectStats.total[cur] or 0) + stateCrypto.takeCount
+        collectStats.house[hid] = collectStats.house[hid] or { BTC = 0, ASC = 0 }
+        collectStats.house[hid][cur] = (collectStats.house[hid][cur] or 0) + stateCrypto.takeCount
+
+        AddCollectLogEntry(hid, cur, stateCrypto.takeCount)
+    end
+
+    DialogUtils.waitAndSendDialogResponse(dialogId, 1, 0, "")
+    stateCrypto.takeCount = 0
+    stateCrypto.takeCurrency = nil
+    return DialogReturnVisibility()
+end
+
+local function HandleShelfDialog(dialogId, title, text)
+    if not (stateCrypto.work and title:find("Стойка") and title:find("Полка")) then
+        return nil
+    end
+
+    local actions = ParseShelfVideoCardData(text)
+    local queueShelf = stateCrypto.queueShelves[stateCrypto.progressShelves]
+    local onAction = nil
+
+    for _, value in ipairs(actions) do
+        if value.action == "on" and not onAction then
+            onAction = value
+        end
+
+        if processes.take then
+            if value.count > 0 and (value.action == "take_btc" or value.action == "take_asc") then
+                stateCrypto.takeCount = value.count
+                stateCrypto.takeCurrency = (value.action == "take_btc") and "BTC" or "ASC"
                 DialogUtils.waitAndSendDialogResponse(dialogId, 1, value.samp_line, "")
-                return not settings.main.replaceDialog
+                return DialogReturnVisibility()
             end
+        end
 
-            if processes.on and value.action == "on" then
-                DialogUtils.waitAndSendDialogResponse(dialogId, 1, value.samp_line, "")
-                return not settings.main.replaceDialog
-            elseif processes.on and value.action == "off" then
-                stateCrypto.queueShelves[stateCrypto.progressShelves].work = true
-                stateCrypto.progressShelves = stateCrypto.progressShelves +1
+        if processes.fill and value.action == "fill" then
+            if queueShelf and (queueShelf.fill or 0) > settings.main.fillFrom then
+                stateCrypto.progressShelves = stateCrypto.progressShelves + 1
                 DialogUtils.waitAndSendDialogResponse(dialogId, 0, 0, "")
-                return not settings.main.replaceDialog
+                return DialogReturnVisibility()
             end
+            DialogUtils.waitAndSendDialogResponse(dialogId, 1, value.samp_line, "")
+            return DialogReturnVisibility()
+        end
 
-            if processes.off and value.action == "off" then
-                DialogUtils.waitAndSendDialogResponse(dialogId, 1, value.samp_line, "")
-                return not settings.main.replaceDialog
-            elseif processes.off and value.action == "on" then
-                stateCrypto.queueShelves[stateCrypto.progressShelves].work = false
-                stateCrypto.progressShelves = stateCrypto.progressShelves +1
-                DialogUtils.waitAndSendDialogResponse(dialogId, 0, 0, "")
-                return not settings.main.replaceDialog
+        if processes.on and value.action == "on" then
+            DialogUtils.waitAndSendDialogResponse(dialogId, 1, value.samp_line, "")
+            return DialogReturnVisibility()
+        elseif processes.on and value.action == "off" then
+            if queueShelf then
+                queueShelf.work = true
             end
-        end
-        return not settings.main.replaceDialog
-    end
-
-    if stateCrypto.work and processes.fill and not stateCrypto.waitFill and title:find("Выберите тип жидкости") then
-        local actions = ParseLiquidData(text)
-
-        local counts = { btc = 0, supper_btc = 0, asc = 0 }
-        local lines  = { btc = nil, supper_btc = nil, asc = nil }
-
-        for _, v in ipairs(actions) do
-            if v.action == "btc"         then counts.btc        = v.count or 0; lines.btc        = v.samp_line end
-            if v.action == "supper_btc"  then counts.supper_btc = v.count or 0; lines.supper_btc = v.samp_line end
-            if v.action == "asc"         then counts.asc        = v.count or 0; lines.asc        = v.samp_line end
+            stateCrypto.progressShelves = stateCrypto.progressShelves + 1
+            DialogUtils.waitAndSendDialogResponse(dialogId, 0, 0, "")
+            return DialogReturnVisibility()
         end
 
-        haveLiquid.btc        = counts.btc
-        haveLiquid.supper_btc = counts.supper_btc
-        haveLiquid.asc        = counts.asc
-
-        -- Тип карты из текущей очереди полок
-        local cur = stateCrypto.queueShelves[stateCrypto.progressShelves]
-        local card = cur and cur.card_type or nil  -- "ASIC" | "BTC" | "ASC" | nil
-
-        -- если в самом диалоге есть фраза про ASIC - подстрахуемся
-        if (not card or card == "BTC") and (text:find("ASIC") or text:find("Достать ASIC")) then
-            card = "ASIC"
-        end
-
-        -- Выбор по типу карты
-        local choice = nil
-        if card == "ASC" then
-            if counts.asc > 0 then choice = "asc" end
-        else
-            -- BTC или ASIC (или тип не определён) - не льём ASC для BTC/ASIC
-            if counts.btc > 0 then
-                choice = "btc"
-            elseif counts.supper_btc > 0 then
-                choice = "supper_btc"
-            elseif not card and counts.asc > 0 then
-                -- Тип не распознан - разрешим asc как крайний случай
-                choice = "asc"
+        if processes.off and value.action == "off" then
+            DialogUtils.waitAndSendDialogResponse(dialogId, 1, value.samp_line, "")
+            return DialogReturnVisibility()
+        elseif processes.off and value.action == "on" then
+            if queueShelf then
+                queueShelf.work = false
             end
-        end
-
-        if choice then
-            stateCrypto.waitFill = true
-            DialogUtils.waitAndSendDialogResponse(dialogId, 1, lines[choice], "")
-            return not settings.main.replaceDialog
-        else
-            processes.fill = false
-            local reason = (card == "ASC") and "нет охлаждайки ASC" or "нет охлаждайки BTC/super"
-            AddChatMessage("Охлаждение: " .. reason .. " для текущей карты", TYPECHATMESSAGES.CRITICAL)
+            stateCrypto.progressShelves = stateCrypto.progressShelves + 1
+            DialogUtils.waitAndSendDialogResponse(dialogId, 0, 0, "")
+            return DialogReturnVisibility()
         end
     end
 
-
-    if title:find("Выберите видеокарту") then
-        if title:find("дом") then
-            stateCrypto.activeHouseID = title:match("дом №(%d+)") or "-1"
-            idDialogs.selectVideoCardItemFlash = dialogId
-        end
-        idDialogs.selectVideoCard = dialogId
-        imguiWindows.main[0] = true
-
-        shelves = ParseShelfData(text)
-
-        -- Не автолить, если зашли через флешку
-        local openedViaFlash = (dialogId == idDialogs.selectVideoCardItemFlash)
-        -- Если включена автозаливка и мы не заняты процессом - стартуем заливку
-        if settings.main.autoFillEnabled and not stateCrypto.work and not openedViaFlash then
-            -- Есть ли вообще смысл заливать?
-            local needFill = false
-            for _, s in ipairs(shelves) do
-                if (s.percentage or 0) <= (settings.main.fillFrom or 50.0) then
-                    needFill = true
-                    break
-                end
-            end
-
-            if needFill then
-                lua_thread.create(function()
-                    wait(50)
-                    StartProcessInteracting("fill")
-                end)
-            end
+    if processes.take and queueShelf and math.floor(queueShelf.count or 0) <= 0 then
+        if settings.main.autoEnableCards and not queueShelf.work and (queueShelf.fill or 0) > 0 and onAction then
+            queueShelf.work = true
+            DialogUtils.waitAndSendDialogResponse(dialogId, 1, onAction.samp_line, "")
+            return DialogReturnVisibility()
         end
 
-        if settings.main.replaceDialog then
-            return false
+        stateCrypto.progressShelves = stateCrypto.progressShelves + 1
+        DialogUtils.waitAndSendDialogResponse(dialogId, 0, 0, "")
+        return DialogReturnVisibility()
+    end
+
+    return DialogReturnVisibility()
+end
+
+local function HandleLiquidChoiceDialog(dialogId, title, text)
+    if not (stateCrypto.work and processes.fill and not stateCrypto.waitFill and title:find("Выберите тип жидкости")) then
+        return nil
+    end
+
+    local actions = ParseLiquidData(text)
+    local counts = { btc = 0, supper_btc = 0, asc = 0 }
+    local lines  = { btc = nil, supper_btc = nil, asc = nil }
+
+    for _, v in ipairs(actions) do
+        if v.action == "btc"         then counts.btc        = v.count or 0; lines.btc        = v.samp_line end
+        if v.action == "supper_btc"  then counts.supper_btc = v.count or 0; lines.supper_btc = v.samp_line end
+        if v.action == "asc"         then counts.asc        = v.count or 0; lines.asc        = v.samp_line end
+    end
+
+    haveLiquid.btc        = counts.btc
+    haveLiquid.supper_btc = counts.supper_btc
+    haveLiquid.asc        = counts.asc
+
+    local cur = stateCrypto.queueShelves[stateCrypto.progressShelves]
+    local card = cur and cur.card_type or nil
+
+    if (not card or card == "BTC") and (text:find("ASIC") or text:find("Достать ASIC")) then
+        card = "ASIC"
+    end
+
+    local choice = nil
+    if card == "ASC" then
+        if counts.asc > 0 then choice = "asc" end
+    else
+        if counts.btc > 0 then
+            choice = "btc"
+        elseif counts.supper_btc > 0 then
+            choice = "supper_btc"
+        elseif not card and counts.asc > 0 then
+            choice = "asc"
         end
     end
 
-    if title:find("Выбор дома") then
+    if choice then
+        stateCrypto.waitFill = true
+        DialogUtils.waitAndSendDialogResponse(dialogId, 1, lines[choice], "")
+        return DialogReturnVisibility()
+    end
+
+    processes.fill = false
+    local reason = (card == "ASC") and "нет охлаждайки ASC" or "нет охлаждайки BTC/super"
+    AddChatMessage("Охлаждение: " .. reason .. " для текущей карты", TYPECHATMESSAGES.CRITICAL)
+    return nil
+end
+
+local function HandleVideoCardSelectionDialog(dialogId, title, text)
+    if not title:find("Выберите видеокарту") then
+        return nil
+    end
+
+    if title:find("дом") then
+        stateCrypto.activeHouseID = title:match("дом №(%d+)") or "-1"
+        idDialogs.selectVideoCardItemFlash = dialogId
+    end
+    idDialogs.selectVideoCard = dialogId
+    imguiWindows.main[0] = true
+
+    local openedViaFlash = (dialogId == idDialogs.selectVideoCardItemFlash)
+    if openedViaFlash then
+        housesBanks = {}
+    else
         houses = {}
-        housesBanks ={}
-
-        if text:find("Энергия") then
-            houses = ParseHouseData(text)
-        elseif text:find("Баланс") then
-            housesBanks = ParseHouseBankData(text)
-        else
-            return true
-        end
-
-        idDialogs.selectHouse = dialogId
-
-        imguiWindows.main[0] = true
-
-        if settings.main.replaceDialog then
-            return false
-        end
+        housesBanks = {}
     end
+    shelves = ParseShelfData(text)
 
-
-    if Improve_HandleNewStyleChooseDialog(dialogId, title, text) then
-        return not settings.main.replaceDialog
-    end
-
-    if Improve_HandleNewStyleConfirmDialog(dialogId, title) then
-        return not settings.main.replaceDialog
-    end
-
-    -- Выбор вида улучшения видеокарты:
-    --  - "Улучшить производительность видео-карты [до N уровня]"
-    --  - "Увеличить объем хранения криптовалюты на видео-карте"
-    if Improve_IsClassicMode() and improve.isOn and improve.step == 3 and title:find("{BFBBBA}Выберите вид улучшения для видеокарты") then
-        local perfIndex      = nil  -- индекс строки с улучшением производительности
-        local storageIndex   = nil  -- индекс строки с увеличением хранилища
-        local currentIndex   = -1
-
-        for line in (text or ""):gmatch("[^\r\n]+") do
-            currentIndex = currentIndex + 1
-
-            -- любая строка, где есть "Улучшить производительность видео-карты [до N уровня]"
-            if line:find("Улучшить производительность видео-карты", nil, true) then
-                -- просто запоминаем индекс, уровень N может быть любым (2..10)
-                perfIndex = currentIndex
-            end
-
-            -- строка увеличения объёма хранения криптовалюты
-            if line:find("Увеличить объем хранения криптовалюты на видео-карте", nil, true) then
-                storageIndex = currentIndex
+    if settings.main.autoFillEnabled and not stateCrypto.work and not openedViaFlash then
+        local needFill = false
+        for _, s in ipairs(shelves) do
+            if (s.percentage or 0) <= (settings.main.fillFrom or 50.0) then
+                needFill = true
+                break
             end
         end
 
-        local listToClick = 0
-
-        if improve.useStorageUpgrade and storageIndex ~= nil then
-            -- включён режим "хранилище крипты" и опция есть
-            listToClick = storageIndex
-        elseif perfIndex ~= nil then
-            -- жмём улучшение производительности
-            listToClick = perfIndex
+        if needFill then
+            lua_thread.create(function()
+                wait(50)
+                StartProcessInteracting("fill")
+            end)
         end
-
-        sampSendDialogResponse(dialogId, 1, listToClick, "")
-        return not settings.main.replaceDialog
     end
 
-    if Improve_IsClassicMode() and improve.isOn and improve.step == 3 and title:find("{BFBBBA}Улучшение видеокарты") then
-        if improve.useStorageUpgrade then
-            -- pass
-        else
-            -- если почему-то к этому моменту смазки уже нет - стоп
-            if not Improve_HasRequiredOils(2) then
-                MI_Say("Недостаточно смазки (нужно 2). Отключаюсь.")
-                improve.isOn = false
-                improve.step = 0
-                return not (settings.main and settings.main.replaceDialog)
-            end
+    return DialogReturnVisibility()
+end
 
-            -- списываем один раз за попытку (анти-дубль при повторном показе диалога)
-            if not improve.consumedThisTry then
-                Improve_ConsumeOils(2)
-                improve.consumedThisTry = true
-            end
+local function HandleHouseSelectionDialog(dialogId, title, text)
+    if not title:find("Выбор дома") then
+        return nil
+    end
+
+    shelves = {}
+    houses = {}
+    housesBanks ={}
+
+    if text:find("Энергия") then
+        houses = ParseHouseData(text)
+    elseif text:find("Баланс") then
+        housesBanks = ParseHouseBankData(text)
+    else
+        return true
+    end
+
+    idDialogs.selectHouse = dialogId
+    if flashCollect.waitHouseDialog and #houses > 0 then
+        flashCollect.houseDialogReady = true
+        flashCollect.waitHouseDialog = false
+    end
+
+    imguiWindows.main[0] = true
+    return DialogReturnVisibility()
+end
+
+local function HandleImproveClassicChooseDialog(dialogId, title, text)
+    if not (Improve_IsClassicMode() and improve.isOn and improve.step == 3 and title:find("{BFBBBA}Выберите вид улучшения для видеокарты")) then
+        return nil
+    end
+
+    local perfIndex = nil
+    local storageIndex = nil
+    local currentIndex = -1
+
+    for line in (text or ""):gmatch("[^\r\n]+") do
+        currentIndex = currentIndex + 1
+
+        if line:find("Улучшить производительность видео-карты", nil, true) then
+            perfIndex = currentIndex
         end
 
-        sampSendDialogResponse(dialogId, 1, 0, "")
-        improve.waitStart = true
-        improve.waitStartAt = os.clock()
-        return not settings.main.replaceDialog
+        if line:find("Увеличить объем хранения криптовалюты на видео-карте", nil, true) then
+            storageIndex = currentIndex
+        end
+    end
+
+    local listToClick = 0
+    if improve.useStorageUpgrade and storageIndex ~= nil then
+        listToClick = storageIndex
+    elseif perfIndex ~= nil then
+        listToClick = perfIndex
+    end
+
+    sampSendDialogResponse(dialogId, 1, listToClick, "")
+    return DialogReturnVisibility()
+end
+
+local function HandleImproveClassicConfirmDialog(dialogId, title)
+    if not (Improve_IsClassicMode() and improve.isOn and improve.step == 3 and title:find("{BFBBBA}Улучшение видеокарты")) then
+        return nil
+    end
+
+    if not improve.useStorageUpgrade then
+        if not Improve_HasRequiredOils(2) then
+            MI_Say("Недостаточно смазки (нужно 2). Отключаюсь.")
+            improve.isOn = false
+            improve.step = 0
+            return DialogReturnVisibility()
+        end
+
+        if not improve.consumedThisTry then
+            Improve_ConsumeOils(2)
+            improve.consumedThisTry = true
+        end
+    end
+
+    sampSendDialogResponse(dialogId, 1, 0, "")
+    improve.waitStart = true
+    improve.waitStartAt = os.clock()
+    return DialogReturnVisibility()
+end
+
+local function HandleStatsInventoryDialog(dialogId, title, text)
+    if not (improve.oils.busy or flashCollect.statsBusy) then
+        return nil
+    end
+
+    if title:find('Основная статистика') then
+        sampSendDialogResponse(dialogId, 1, 0, '')
+        return false
+    end
+
+    if not title:find('ID:') then
+        return nil
     end
 
     if improve.oils.busy then
-        -- первая «крышка» /stats
-        if title:find('Основная статистика') then
-            sampSendDialogResponse(dialogId, 1, 0, '')
-            return false
-        end
-        -- страницы инвентаря «ID: ...»
-        if title:find('ID:') then
-            Improve_ParseInventoryDialogPage(text or '')
-            if (text or ''):find('Следующая%sстраница') then
-                -- листаем дальше
-                sampSendDialogResponse(dialogId, 1, 0, '')
-                return false
-            else
-                -- финал
-                improve.oils.busy = false
-                improve.oils.lastAt = os.date('%H:%M')
-                sampSendDialogResponse(dialogId, 0, 0, '')
-                return false
-            end
-        end
+        Improve_ParseInventoryDialogPage(text or '')
     end
+    if flashCollect.statsBusy then
+        FlashCollect_ParseStatsInventoryPage(text or '')
+    end
+
+    if (text or ''):find('Следующая%sстраница') then
+        sampSendDialogResponse(dialogId, 1, 0, '')
+        return false
+    end
+
+    if improve.oils.busy then
+        improve.oils.busy = false
+        improve.oils.lastAt = os.date('%H:%M')
+    end
+    if flashCollect.statsBusy then
+        flashCollect.statsBusy = false
+        flashCollect.lastStatsAt = os.date('%H:%M')
+    end
+    sampSendDialogResponse(dialogId, 0, 0, '')
+    return false
+end
+
+function sampev.onShowDialog(dialogId, style, title, button1, button2, text)
+    lastIDDialog = dialogId
+
+    local handled = HandleBankDepositDialog(dialogId, title, text)
+    if handled ~= nil then
+        return handled
+    end
+
+    handled = HandleTakeProfitDialog(dialogId, title)
+    if handled ~= nil then
+        return handled
+    end
+
+    handled = HandleShelfDialog(dialogId, title, text)
+    if handled ~= nil then
+        return handled
+    end
+
+    handled = HandleLiquidChoiceDialog(dialogId, title, text)
+    if handled ~= nil then
+        return handled
+    end
+
+    handled = HandleVideoCardSelectionDialog(dialogId, title, text)
+    if handled ~= nil then
+        return handled
+    end
+
+    handled = HandleHouseSelectionDialog(dialogId, title, text)
+    if handled ~= nil then
+        return handled
+    end
+
+    if Improve_HandleNewStyleChooseDialog(dialogId, title, text) then
+        return DialogReturnVisibility()
+    end
+
+    if Improve_HandleNewStyleConfirmDialog(dialogId, title) then
+        return DialogReturnVisibility()
+    end
+
+    handled = HandleImproveClassicChooseDialog(dialogId, title, text)
+    if handled ~= nil then
+        return handled
+    end
+
+    handled = HandleImproveClassicConfirmDialog(dialogId, title)
+    if handled ~= nil then
+        return handled
+    end
+
+    handled = HandleStatsInventoryDialog(dialogId, title, text)
+    if handled ~= nil then
+        return handled
+    end
+
+    -- if not stateCrypto.work then
+    --     imguiWindows.main[0] = false
+    -- end
 end
 
 -- --------------------------------------------------------
@@ -1451,6 +1948,47 @@ end
 --                           onWindowMessage
 -- --------------------------------------------------------
 
+function sampev.onReceiveRpc(id, bs)
+    if not flashCollect.active then
+        return
+    end
+
+    if id ~= 220 then
+        return
+    end
+
+    raknetBitStreamIgnoreBits(bs, 8)
+    if raknetBitStreamReadInt8(bs) ~= 17 then
+        raknetBitStreamResetReadPointer(bs)
+        return
+    end
+
+    raknetBitStreamIgnoreBits(bs, 32)
+    local length = raknetBitStreamReadInt16(bs)
+    local encoded = raknetBitStreamReadInt8(bs)
+    local str = (encoded ~= 0)
+        and raknetBitStreamDecodeString(bs, length + encoded)
+        or raknetBitStreamReadString(bs, length)
+
+    if flashCollect.active and str and str:find('event.inventory.playerInventory', 1, true) then
+        flashCollect.inventoryOpened = true
+    end
+
+    raknetBitStreamResetReadPointer(bs)
+end
+
+function IsArrowNavigationAvailable()
+    if activeTabScript ~= "main" then
+        return false
+    end
+    if #housesBanks > 0 then
+        return true
+    end
+    if #houses > 0 then
+        return true
+    end
+    return #shelves > 0
+end
 function onWindowMessage(msg, wparam, lparam)
     if not keysSuccess then return end
 
@@ -1460,6 +1998,7 @@ function onWindowMessage(msg, wparam, lparam)
     if (msg == 0x0100 or msg == 0x0101)
        and isMainWindowActive and isPauseInactive
        and settings.main.arrowsMove
+       and IsArrowNavigationAvailable()
     then
         local io = imgui.GetIO()
         local wantkbd = io and io.WantCaptureKeyboard
@@ -1482,7 +2021,9 @@ function onWindowMessage(msg, wparam, lparam)
             SwitchMainWindow()
             DeactivateProcessesInteracting()
             sampSendDialogResponse(lastIDDialog, 0, 0, "")
+            shelves = {}
             houses = {}
+            housesBanks = {}
         end
     end
 end
@@ -1570,9 +2111,14 @@ end
 -- где:
 --   hours_to_show  - время до доливки (если выше порога) ИЛИ до конца работы (если порог уже пройден)
 --   income_to_end  - прибыль до полного окончания охлаждайки (всегда до нуля)
-local function CalcGpuIncome(level, cool_percent_opt, min_percent_opt)
+local function CalcGpuIncome(level, cool_percent_opt, min_percent_opt, bonus_percent_opt)
     level = tonumber(level) or 1
     local per_hour  = GPU_HOURLY_BY_LEVEL[level] or 0
+    local bonus_percent = tonumber(bonus_percent_opt) or 0
+    if bonus_percent < 0 then
+        bonus_percent = 0
+    end
+    per_hour = per_hour * (1 + bonus_percent / 100)
     local per_24h   = per_hour * 24
     local per_cycle = per_hour * GPU_CYCLE_HOURS
 
@@ -1608,6 +2154,68 @@ local function CalcGpuIncome(level, cool_percent_opt, min_percent_opt)
     return per_hour, per_24h, per_cycle, hours_to_show, income_to_end
 end
 
+local function GetIncomeSettings()
+    settings.main.income = settings.main.income or {}
+    settings.main.income.houseBonuses = settings.main.income.houseBonuses or {}
+    settings.main.income.onlineHours = math.minEx(24, math.maxEx(0, math.floor(tonumber(settings.main.income.onlineHours) or 0)))
+    return settings.main.income
+end
+
+local function NormalizeIncomeHouseBonusConfig(config)
+    config = (type(config) == "table") and config or {}
+    config.creativitySet = config.creativitySet == true
+    config.customPercent = math.maxEx(0, tonumber(config.customPercent) or 0)
+    config.onlineHours = nil
+    return config
+end
+
+local function GetIncomeHouseBonusConfig(houseId)
+    local numericHouseId = tonumber(houseId)
+    if not numericHouseId or numericHouseId <= 0 then
+        return nil, nil
+    end
+
+    local houseKey = tostring(math.floor(numericHouseId))
+    local houseBonuses = GetIncomeSettings().houseBonuses
+    local config = houseBonuses[houseKey]
+    if type(config) ~= "table" then
+        return nil, houseKey
+    end
+
+    config = NormalizeIncomeHouseBonusConfig(config)
+    houseBonuses[houseKey] = config
+    return config, houseKey
+end
+
+local function CalcHouseIncomeBonusPercent(houseId)
+    local onlineHours = GetIncomeSettings().onlineHours or 0
+    local bonusPercent = 20 * (onlineHours / 24)
+
+    local config = GetIncomeHouseBonusConfig(houseId)
+    if not config then
+        return bonusPercent
+    end
+
+    bonusPercent = bonusPercent + (tonumber(config.customPercent) or 0)
+    if config.creativitySet then
+        bonusPercent = bonusPercent + 20
+    end
+
+    return bonusPercent
+end
+
+local function GetSortedIncomeHouseBonusKeys()
+    local keys = {}
+    for houseKey in pairs(GetIncomeSettings().houseBonuses) do
+        table.insert(keys, tostring(houseKey))
+    end
+
+    table.sort(keys, function(a, b)
+        return (tonumber(a) or 0) < (tonumber(b) or 0)
+    end)
+
+    return keys
+end
 
 -- ---- Утилиты для очистки кэша при перезапуске заточки/перезаходе ----
 function TD.Reset()
@@ -1964,7 +2572,7 @@ function HouseProcessor.processRegularHouses()
 
         stateCrypto.progressHouses = stateCrypto.progressHouses + 1
 
-        if stateCrypto.currentHouseId and collectStats.house[stateCrypto.currentHouseId] then
+        if processes.take and stateCrypto.currentHouseId and collectStats.house[stateCrypto.currentHouseId] then
             local s = collectStats.house[stateCrypto.currentHouseId]
             AddChatMessage(string.format(
                 "Дом №%s: собрано %s BTC и %s ASC",
@@ -1980,6 +2588,9 @@ end
 function StartProcessInteracting(action)
     if stateCrypto.work then AddChatMessage("Процесс уже запущен", TYPECHATMESSAGES.WARNING) end
     DeactivateProcessesInteracting()
+
+    collectStats = { total = { BTC = 0, ASC = 0 }, house = {} }
+    stateCrypto.currentHouseId = nil
 
     if action == "fill" then
         processes.fill = true
@@ -2053,7 +2664,10 @@ end
 function DeactivateProcessesInteracting()
     stateCrypto.work = false
     stateCrypto.waitFill = false
+    stateCrypto.waitDep = false
     stateCrypto.takeCount = 0
+    stateCrypto.takeCurrency = nil
+    stateCrypto.currentHouseId = nil
     stateCrypto.progressHouses = 0
     stateCrypto.queueHouses = {}
     stateCrypto.progressShelves = 0
@@ -2561,6 +3175,7 @@ function Improve_ScanVideoCards()
         end)
     end
 
+    cards = Improve_MoveMaxLevelCardsToEnd(cards)
     improve.videoCards = cards
 
     if #cards == 0 then
@@ -2703,6 +3318,7 @@ function Improve_OnResult(success, serverMsg)
                 return (a.level or 0) < (b.level or 0)
             end)
         end
+        improve.videoCards = Improve_MoveMaxLevelCardsToEnd(improve.videoCards)
     end
 end
 
@@ -2993,6 +3609,413 @@ function SaveSettings()
     end
 end
 
+function LoadCollectLogStore()
+    local data = LoadJSON(COLLECT_STATS_FILE)
+    if type(data) ~= "table" then
+        data = {}
+    end
+    data.days = data.days or {}
+    data.meta = data.meta or {}
+    if type(data.meta.lastCollect) ~= "table" then
+        data.meta.lastCollect = nil
+    end
+    collectLogStore = data
+end
+
+function SaveCollectLogStore()
+    collectLogStore.days = collectLogStore.days or {}
+    collectLogStore.meta = collectLogStore.meta or {}
+    return SaveJSON(COLLECT_STATS_FILE, collectLogStore)
+end
+
+local function Collect_NormalizeCryptoAmount(amount)
+    amount = tonumber(amount) or 0
+    return math.floor(amount * 1000 + 0.5) / 1000
+end
+
+local function Collect_FormatCryptoAmount(amount)
+    local value = Collect_NormalizeCryptoAmount(amount)
+    local text = string.format("%.3f", value)
+    text = text:gsub("(%..-)0+$", "%1")
+    text = text:gsub("%.$", "")
+    return GetCommaValue(text)
+end
+
+function Collect_GetLastCollectInfo()
+    local meta = collectLogStore.meta or {}
+    local info = meta.lastCollect
+    if type(info) ~= "table" then return nil end
+
+    local timestamp = tonumber(info.timestamp or 0) or 0
+    if timestamp <= 0 then return nil end
+
+    info.timestamp = timestamp
+    info.amount = Collect_NormalizeCryptoAmount(info.amount)
+    info.houseId = tostring(info.houseId or "0")
+    info.currency = tostring(info.currency or "BTC")
+    return info
+end
+
+function Collect_UpdateLastCollectInfo(houseId, currency, amount)
+    collectLogStore.meta = collectLogStore.meta or {}
+    collectLogStore.meta.lastCollect = {
+        timestamp = os.time(),
+        houseId = tostring(houseId or 0),
+        currency = tostring(currency or "BTC"),
+        amount = Collect_NormalizeCryptoAmount(amount),
+    }
+    collectReminder.lastNotifiedCollectAt = 0
+    collectReminder.retryAfterAt = 0
+end
+
+function Collect_GetReminderThresholdSeconds()
+    local minutes = tonumber(settings.main and settings.main.collectNotifyMinutes or 0) or 0
+    if minutes <= 0 then
+        return 0
+    end
+    return math.floor(minutes * 60)
+end
+
+function Collect_FormatDuration(seconds)
+    seconds = math.max(0, math.floor(tonumber(seconds) or 0))
+    local days = math.floor(seconds / 86400)
+    seconds = seconds % 86400
+    local hours = math.floor(seconds / 3600)
+    seconds = seconds % 3600
+    local minutes = math.floor(seconds / 60)
+    local secs = seconds % 60
+
+    if days > 0 then
+        return string.format("%d д. %02d:%02d:%02d", days, hours, minutes, secs)
+    end
+    if hours > 0 then
+        return string.format("%02d:%02d:%02d", hours, minutes, secs)
+    end
+    return string.format("%02d:%02d", minutes, secs)
+end
+
+function Collect_FormatLastCollectText(info)
+    if type(info) ~= "table" then
+        return "ещё не зафиксирован"
+    end
+
+    local timestamp = tonumber(info.timestamp or 0) or 0
+    if timestamp <= 0 then
+        return "ещё не зафиксирован"
+    end
+
+    return os.date('%d.%m.%Y %H:%M:%S', timestamp)
+end
+
+function Collect_GetNotifySystemState()
+    local state = {
+        available = false,
+        ready = false,
+        installed = false,
+        running = false,
+        compatible = false,
+        canInstall = false,
+        message = "Система уведомлений недоступна.",
+    }
+
+    if not notifySuccess or type(notify) ~= 'table' then
+        state.message = "Библиотека session_notifications не установлена."
+        return state
+    end
+
+    state.available = true
+    state.canInstall = type(notify.ensure_manager) == 'function'
+
+    if type(notify.status) == 'function' then
+        local ok, status = pcall(notify.status, REQUIRED_NOTIFY_VERSION)
+        if ok and type(status) == 'table' then
+            state.installed = not not status.installed
+            state.running = not not status.running
+            state.compatible = not not status.compatible
+            state.ready = state.installed and state.running and state.compatible and type(notify.send) == 'function'
+
+            if not state.installed then
+                state.message = "Система уведомлений не установлена."
+            elseif not state.running then
+                state.message = "Менеджер уведомлений найден, но не запущен."
+            elseif not state.compatible then
+                state.message = "Менеджер уведомлений требует обновления."
+            else
+                state.message = "Система уведомлений готова."
+            end
+
+            return state
+        end
+    end
+
+    state.ready = type(notify.send) == 'function'
+    state.installed = state.ready
+    state.running = state.ready
+    state.compatible = state.ready
+    state.message = state.ready and "Система уведомлений готова." or "Система уведомлений недоступна."
+    return state
+end
+
+function Collect_GetNotifyInstallButtonText(state)
+    if type(state) ~= 'table' then
+        return "Открыть страницу установки"
+    end
+    if not state.available then
+        return "Открыть страницу установки"
+    end
+    if not state.installed then
+        return "Установить менеджер уведомлений"
+    end
+    if not state.running then
+        return "Запустить менеджер уведомлений"
+    end
+    if not state.compatible then
+        return "Обновить менеджер уведомлений"
+    end
+    return "Подготовить менеджер уведомлений"
+end
+
+function Collect_DownloadNotificationSystem()
+    if collectReminder.managerDownloadPending or collectReminder.managerEnsurePending then
+        return false
+    end
+
+    collectReminder.managerDownloadPending = true
+    collectReminder.managerStatusMessage = "Скачиваю менеджер уведомлений и библиотеку..."
+
+    lua_thread.create(function()
+        local function fail(message, debugInfo)
+            collectReminder.managerDownloadPending = false
+            collectReminder.managerStatusMessage = message
+            AddChatMessage(message, TYPECHATMESSAGES.WARNING)
+            if debugInfo and debugInfo ~= "" then
+                AddChatMessage('Уведомления: ' .. tostring(debugInfo), TYPECHATMESSAGES.DEBUG)
+            end
+        end
+
+        local okRequests, requests = pcall(require, 'requests')
+        if not okRequests or type(requests) ~= 'table' or type(requests.get) ~= 'function' then
+            fail("Не удалось скачать систему уведомлений.", okRequests and 'requests.get недоступен' or requests)
+            return
+        end
+
+        local function download_text(url)
+            local ok, response = pcall(function()
+                return requests.get(url, {
+                    headers = {
+                        ['Accept-Encoding'] = 'identity',
+                        ['Connection'] = 'close'
+                    },
+                    timeout = 20
+                })
+            end)
+
+            if not ok or type(response) ~= 'table' then
+                return nil, tostring(response or 'ошибка requests')
+            end
+            if not tonumber(response.status_code) or response.status_code < 200 or response.status_code >= 300 then
+                return nil, 'HTTP ' .. tostring(response.status_code or 'unknown')
+            end
+            return tostring(response.text or ''), nil
+        end
+
+        local managerText, managerErr = download_text(NOTIFY_MANAGER_RAW_URL)
+        if not managerText or managerText == '' then
+            fail("Не удалось скачать менеджер уведомлений.", managerErr)
+            return
+        end
+
+        local libraryText, libraryErr = download_text(NOTIFY_LIBRARY_RAW_URL)
+        if not libraryText or libraryText == '' then
+            fail("Не удалось скачать библиотеку уведомлений.", libraryErr)
+            return
+        end
+
+        local managerPath = getWorkingDirectory() .. SEPORATORPATCH .. 'NotificationManager.lua'
+        local libraryPath = getWorkingDirectory() .. SEPORATORPATCH .. 'lib' .. SEPORATORPATCH .. 'session_notifications.lua'
+
+        local okSaveManager, saveManagerErr = pcall(function()
+            local file = assert(io.open(managerPath, 'w'))
+            file:write(managerText)
+            file:close()
+        end)
+        if not okSaveManager then
+            fail("Не удалось сохранить менеджер уведомлений.", saveManagerErr)
+            return
+        end
+
+        local okSaveLibrary, saveLibraryErr = pcall(function()
+            EnsureDirectoryExists(getWorkingDirectory() .. SEPORATORPATCH .. 'lib')
+            local file = assert(io.open(libraryPath, 'w'))
+            file:write(libraryText)
+            file:close()
+        end)
+        if not okSaveLibrary then
+            fail("Не удалось сохранить библиотеку уведомлений.", saveLibraryErr)
+            return
+        end
+
+        collectReminder.managerDownloadPending = false
+        collectReminder.managerStatusMessage = "Система уведомлений скачана. Перезагружаю скрипт..."
+        AddChatMessage("Менеджер уведомлений и библиотека скачаны. Перезагружаю скрипт", TYPECHATMESSAGES.SUCCESS)
+
+        wait(300)
+        thisScript():reload()
+    end)
+
+    return true
+end
+
+function Collect_EnsureNotificationManager()
+    if collectReminder.managerEnsurePending or collectReminder.managerDownloadPending then
+        return false
+    end
+
+    local state = Collect_GetNotifySystemState()
+    if not state.available or type(notify) ~= 'table' or type(notify.ensure_manager) ~= 'function' then
+        collectReminder.managerStatusMessage = "Открыта страница установки менеджера уведомлений."
+        OpenUrl(NOTIFY_MANAGER_REPO_URL)
+        AddChatMessage("Открыта страница установки менеджера уведомлений", TYPECHATMESSAGES.SECONDARY)
+        return true
+    end
+
+    collectReminder.managerEnsurePending = true
+    collectReminder.managerStatusMessage = "Подготавливаю менеджер уведомлений..."
+
+    notify.ensure_manager({ required_version = REQUIRED_NOTIFY_VERSION }, function(success, info)
+        collectReminder.managerEnsurePending = false
+        if success then
+            collectReminder.managerStatusMessage = "Менеджер уведомлений готов к работе."
+            AddChatMessage("Менеджер уведомлений готов к работе", TYPECHATMESSAGES.SUCCESS)
+            return
+        end
+
+        collectReminder.managerStatusMessage = "Не удалось подготовить менеджер уведомлений. Перезапустите игру или перезагрузите все скрипты."
+        AddChatMessage("Не удалось подготовить менеджер уведомлений. Перезапустите игру или перезагрузите все скрипты.", TYPECHATMESSAGES.WARNING)
+        AddChatMessage(
+            'Менеджер уведомлений: ' .. tostring(info and info.message or 'неизвестная ошибка'),
+            TYPECHATMESSAGES.DEBUG
+        )
+    end)
+
+    return true
+end
+
+function Collect_SendReminderNotification(info, elapsedSeconds)
+    if not (notifySuccess and type(notify) == 'table' and type(notify.send) == 'function') then
+        collectReminder.retryAfterAt = os.time() + 300
+        AddChatMessage("Напоминание о сборе: система session_notifications недоступна", TYPECHATMESSAGES.DEBUG)
+        return false
+    end
+
+    collectReminder.notifyPending = true
+    local lastCollectAt = tonumber(info.timestamp or 0) or 0
+    local lastCollectText = Collect_FormatLastCollectText(info)
+    local overdueText = Collect_FormatDuration(elapsedSeconds)
+
+    notify.send(REQUIRED_NOTIFY_VERSION, {
+        script_id = 'MMT',
+        title = u8("Давно не было сбора крипты"),
+        text = u8("С последнего сбора прошло " .. overdueText .. "."),
+        description = u8("Последний сбор: " .. lastCollectText),
+        sticky = true,
+        theme = 'emerald',
+        action = collectReminderAction
+    }, function(success, notifyInfo)
+        collectReminder.notifyPending = false
+        if success then
+            collectReminder.lastNotifiedCollectAt = lastCollectAt
+            collectReminder.retryAfterAt = 0
+            return
+        end
+
+        collectReminder.retryAfterAt = os.time() + 60
+        AddChatMessage(
+            'Напоминание о сборе не отправлено: ' .. tostring(notifyInfo and notifyInfo.message or 'неизвестная ошибка'),
+            TYPECHATMESSAGES.DEBUG
+        )
+    end)
+
+    return true
+end
+
+function Collect_ReminderTick()
+    local nowClock = os.clock()
+    if (nowClock - (collectReminder.lastTickAt or 0)) < 1 then
+        return
+    end
+    collectReminder.lastTickAt = nowClock
+
+    if collectReminder.notifyPending then
+        return
+    end
+
+    local nowTime = os.time()
+    if nowTime < (collectReminder.retryAfterAt or 0) then
+        return
+    end
+
+    local thresholdSeconds = Collect_GetReminderThresholdSeconds()
+    if thresholdSeconds <= 0 then
+        return
+    end
+
+    if flashCollect.active or (stateCrypto.work and processes.take) then
+        return
+    end
+
+    local info = Collect_GetLastCollectInfo()
+    if not info then
+        return
+    end
+
+    if collectReminder.lastNotifiedCollectAt == info.timestamp then
+        return
+    end
+
+    local elapsedSeconds = nowTime - info.timestamp
+    if elapsedSeconds < thresholdSeconds then
+        return
+    end
+
+    Collect_SendReminderNotification(info, elapsedSeconds)
+end
+
+function AddCollectLogEntry(houseId, currency, amount)
+    houseId = tostring(houseId or 0)
+    currency = tostring(currency or "BTC")
+    amount = Collect_NormalizeCryptoAmount(amount)
+    if amount <= 0 then return end
+
+    local dateKey = os.date('%Y-%m-%d')
+    local timeKey = os.date('%H:%M:%S')
+
+    collectLogStore.days[dateKey] = collectLogStore.days[dateKey] or {
+        total = { BTC = 0, ASC = 0 },
+        houses = {}
+    }
+
+    local dayData = collectLogStore.days[dateKey]
+    dayData.total[currency] = (dayData.total[currency] or 0) + amount
+    dayData.houses[houseId] = dayData.houses[houseId] or {
+        total = { BTC = 0, ASC = 0 },
+        items = {}
+    }
+
+    local houseData = dayData.houses[houseId]
+    houseData.total[currency] = (houseData.total[currency] or 0) + amount
+    table.insert(houseData.items, {
+        time = timeKey,
+        currency = currency,
+        amount = amount,
+    })
+
+    Collect_UpdateLastCollectInfo(houseId, currency, amount)
+    SaveCollectLogStore()
+end
+
+LoadCollectLogStore()
+
 -- --------------------------------------------------------
 --                           Parsers
 -- --------------------------------------------------------
@@ -3134,7 +4157,7 @@ function ParseShelfData(text)
 
             -- Заполнение данными о доме
             house_data = {
-                work_vc = house_data.work_vc + 1,
+                work_vc = house_data.work_vc + ((status:find("Работает") and 1) or 0),
                 max_collect = maxProfit > house_data.max_collect and maxProfit or house_data.max_collect,
                 min_liquid = house_data.min_liquid == 0 and tonumber(percentage) or (tonumber(percentage) < house_data.min_liquid and tonumber(percentage) or house_data.min_liquid),
             }
@@ -3159,7 +4182,7 @@ function ParseShelfData(text)
 
                 -- Заполнение данными о доме
                 house_data = {
-                    work_vc = house_data.work_vc + 1,
+                    work_vc = house_data.work_vc + ((status:find("Работает") and 1) or 0),
                     max_collect = tonumber(profit) > house_data.max_collect and tonumber(profit) or house_data.max_collect,
                     min_liquid = house_data.min_liquid == 0 and tonumber(percentage) or (tonumber(percentage) < house_data.min_liquid and tonumber(percentage) or house_data.min_liquid),
                 }
@@ -3191,7 +4214,7 @@ function ParseShelfVideoCardData(text)
     for lineIndex, line in ipairs(lines) do
         for _, pattern in ipairs(patterns) do
             for countCrypto in string.gmatch(line, pattern.pater) do
-                local _countInt = tonumber(countCrypto:match("%d+%.")) or 0
+                local _countInt = math.floor(tonumber(countCrypto) or 0)
                 table.insert(results, {
                     action = pattern.action,
                     count = _countInt,
@@ -3377,7 +4400,7 @@ end
 -- max      - количество элементов
 -- onEnter  - при нажатии Enter на текущем элементе
 function HandleListNavigation(current, max, onEnter)
-    if max <= 0 or not settings.main.arrowsMove then return current end
+    if max <= 0 or not settings.main.arrowsMove or not IsArrowNavigationAvailable() then return current end
 
     if imgui.IsWindowFocused(imgui.FocusedFlags.RootAndChildWindows)
        and not imgui.IsAnyItemActive() then
@@ -3465,14 +4488,21 @@ local mainFrame = imgui.OnFrame( function() return imguiWindows.main[0] end, fun
             SwitchMainWindow()
             DeactivateProcessesInteracting()
             sampSendDialogResponse(lastIDDialog, 0, 0, "")
+            shelves = {}
             houses = {}
+            housesBanks = {}
         end
 
         imgui.Separator()
 
-        local _widthButtons = (imgui.GetWindowWidth() - ScaleUI(30)) / 3
+        local _widthButtons = (imgui.GetWindowWidth() - ScaleUI(36)) / 4
         if imgui.ButtonClickable(activeTabScript ~= "main", u8"Основное", imgui.ImVec2(_widthButtons, 0)) then
             activeTabScript = "main"
+        end
+        imgui.SameLine()
+        if imgui.ButtonClickable(activeTabScript ~= "logs", u8"Логи", imgui.ImVec2(_widthButtons, 0)) then
+            activeTabScript = "logs"
+            LoadCollectLogStore()
         end
         imgui.SameLine()
         if imgui.ButtonClickable(activeTabScript ~= "improve", u8"Улучшить", imgui.ImVec2(_widthButtons, 0)) then
@@ -3487,6 +4517,8 @@ local mainFrame = imgui.OnFrame( function() return imguiWindows.main[0] end, fun
 
         if activeTabScript == "main" then
             DrawMainMenu()
+        elseif activeTabScript == "logs" then
+            DrawCollectLogs()
         elseif activeTabScript == "improve" then
             DrawImproveSharp()
         elseif activeTabScript == "settings" then
@@ -3500,17 +4532,142 @@ end)
 -- =====================================================================================================================
 
 function DrawMainMenu()
+    local canCancelFlashCollect = flashCollect.active or (stateCrypto.work and processes.take)
+    if canCancelFlashCollect then
+        if imgui.Button(fa.CIRCLE_XMARK .. u8"\tОтменить сбор", imgui.ImVec2(-1, 0)) then
+            FlashCollect_Cancel()
+        end
+        imgui.Separator()
+    end
+
+    local lastCollectInfo = Collect_GetLastCollectInfo()
+    if lastCollectInfo then
+        imgui.Text(u8("Последний сбор: " .. Collect_FormatLastCollectText(lastCollectInfo)))
+    else
+        imgui.TextDisabled(u8"Последний сбор: ещё не зафиксирован.")
+    end
+
+    imgui.SameLine()
+
+    local thresholdSeconds = Collect_GetReminderThresholdSeconds()
+    if thresholdSeconds > 0 then
+        if lastCollectInfo then
+            local elapsedSeconds = math.max(0, os.time() - (lastCollectInfo.timestamp or 0))
+            local remainSeconds = thresholdSeconds - elapsedSeconds
+            if remainSeconds > 0 then
+                imgui.Text(u8("Напоминание через: " .. Collect_FormatDuration(remainSeconds)))
+            elseif collectReminder.lastNotifiedCollectAt == (lastCollectInfo.timestamp or 0) then
+                imgui.Text(u8("Напоминание: уведомление уже отправлено"))
+            else
+                imgui.Text(u8("Напоминание: время ожидания истекло"))
+            end
+        else
+            imgui.TextDisabled(u8"Напоминание: таймер начнется после первого сбора.")
+        end
+    else
+        imgui.TextDisabled(u8"Напоминание о долгом отсутствии сбора выключено.")
+    end
+    imgui.Separator()
     if #housesBanks > 0 then
         DrawHousesBank()
     elseif #houses > 0 then
         DrawHouses()
     else
-        imgui.Text(u8(string.format("Охлаждаек в инвентаре: BTC - %s | Supper BTC - %s | ASC - %s", haveLiquid.btc, haveLiquid.supper_btc, haveLiquid.asc)))
-        imgui.Separator()
+        if #shelves == 0 then
+            local canStartFlashCollect = (not stateCrypto.work) and (not flashCollect.active) and (not flashCollect.statsBusy) and (not improve.isOn) and (not improve.oils.busy)
+            if imgui.ButtonClickable(canStartFlashCollect, u8"Открыть флешку и собрать", imgui.ImVec2(-1, 0)) then
+                StartCollectViaFlash()
+            end
+            if flashCollect.active then
+                imgui.Text(u8"Сбор через флешку: ожидание инвентаря/диалога дома...")
+            elseif (flashCollect.slot or 0) > 0 and settings.main.showStatusPanel then
+                imgui.Text(string.format("Сбор через флешку: слот %d, количество %d", flashCollect.slot or 0, flashCollect.count or 0))
+            end
+            imgui.Separator()
+            imgui.Text(u8(string.format("Охлаждаек в инвентаре: BTC - %s | Supper BTC - %s | ASC - %s", haveLiquid.btc, haveLiquid.supper_btc, haveLiquid.asc)))
+            imgui.Separator()
+        end
         DrawShelves()
     end
 end
 
+local function CollectLogCompareDesc(a, b)
+    return tostring(a or '') > tostring(b or '')
+end
+
+local function CollectLogSortedKeys(map)
+    local keys = {}
+    for key in pairs(map or {}) do
+        table.insert(keys, key)
+    end
+    table.sort(keys, CollectLogCompareDesc)
+    return keys
+end
+
+local function FormatCryptoAmount(value)
+    return tostring(math.floor(tonumber(value) or 0))
+end
+
+function DrawCollectLogs()
+    LoadCollectLogStore()
+
+    local days = collectLogStore.days or {}
+    local dayKeys = CollectLogSortedKeys(days)
+
+    imgui.Text(u8(string.format('Дней с логами: %d', #dayKeys)))
+    imgui.SameLine()
+    if imgui.RightButton(u8'Обновить', imgui.ImVec2(ScaleUI(110), 0)) then
+        LoadCollectLogStore()
+        days = collectLogStore.days or {}
+        dayKeys = CollectLogSortedKeys(days)
+    end
+
+    imgui.Separator()
+    imgui.BeginChild('collect_logs_list', imgui.ImVec2(-1, -1), true)
+    imgui.ScrollMouse()
+
+    if #dayKeys == 0 then
+        imgui.TextDisabled(u8'Логи сбора пока пустые.')
+        imgui.EndChild()
+        return
+    end
+
+    for _, dayKey in ipairs(dayKeys) do
+        local dayData = days[dayKey] or {}
+        local dayTotal = dayData.total or {}
+        local dayLabel = string.format('%s | BTC: %s | ASC: %s', dayKey, FormatCryptoAmount(dayTotal.BTC), FormatCryptoAmount(dayTotal.ASC))
+
+        if imgui.TreeNodeStr(u8(dayLabel .. '##collect_day_' .. tostring(dayKey))) then
+            local houseKeys = CollectLogSortedKeys(dayData.houses or {})
+
+            if #houseKeys == 0 then
+                imgui.TextDisabled(u8'Нет данных по домам.')
+            else
+                for _, houseId in ipairs(houseKeys) do
+                    local houseData = dayData.houses[houseId] or {}
+                    local houseTotal = houseData.total or {}
+                    local houseLabel = string.format('Дом №%s | BTC: %s | ASC: %s', tostring(houseId), FormatCryptoAmount(houseTotal.BTC), FormatCryptoAmount(houseTotal.ASC))
+
+                    if imgui.TreeNodeStr(u8(houseLabel .. '##collect_house_' .. tostring(dayKey) .. '_' .. tostring(houseId))) then
+                        local items = houseData.items or {}
+                        if #items == 0 then
+                            imgui.TextDisabled(u8'Нет детальных записей.')
+                        else
+                            for _, item in ipairs(items) do
+                                local line = string.format('%s | %s | %s', tostring(item.time or '--:--:--'), tostring(item.currency or '-'), FormatCryptoAmount(item.amount))
+                                imgui.BulletText(u8(line))
+                            end
+                        end
+                        imgui.TreePop()
+                    end
+                end
+            end
+
+            imgui.TreePop()
+        end
+    end
+    imgui.EndChild()
+end
 function DrawImproveSharp()
     if imgui.BeginTabBar("ImproveTabs") then
 
@@ -3709,7 +4866,7 @@ function DrawImproveSettingsTab()
     if imgui.ButtonClickable((settings.improve.inventoryMode or 1) ~= 2, u8("Новый стиль"), imgui.ImVec2(-1, 0)) then
         settings.improve.inventoryMode = 2; SaveSettings()
     end
-    imgui.TextDisabled(u8"Новый стиль работает через CEF-пакеты")
+    imgui.TextDisabled(u8"Новый стиль работает через CEF-пакеты, Классический на textdraw")
 
     imgui.Separator()
 
@@ -3741,7 +4898,7 @@ function DrawImproveSettingsTab()
         settings.improve.checkOilsOnStart = not settings.improve.checkOilsOnStart
         SaveSettings()
     end
-    imgui.TextDisabled(u8"Если выключено, заточка стартует без принудительной проверки /stats")
+    imgui.TextDisabled(u8"Если выключено, заточка стартует без принудительной проверки")
 end
 
 function DrawImproveLogsTab()
@@ -3962,6 +5119,39 @@ function DrawSettings()
             end
             imgui.TextDisabled(u8"Если выключено, заточка стартует без принудительной проверки")
 
+            imgui.Text(u8"Напомнить, если не было сбора:")
+            imgui.PushItemWidth(ScaleUI(120))
+            local collectNotifyMinutesPtr = imgui.new.int(tonumber(settings.main.collectNotifyMinutes) or 0)
+            if imgui.InputInt("##collectNotifyMinutes", collectNotifyMinutesPtr, 0, 0) then
+                settings.main.collectNotifyMinutes = math.maxEx(0, collectNotifyMinutesPtr[0])
+                SaveSettings()
+            end
+            imgui.PopItemWidth()
+            imgui.SameLine()
+            imgui.TextDisabled(u8"мин (0 = выкл)")
+
+            local notifyState = Collect_GetNotifySystemState()
+            if not notifyState.ready then
+                imgui.TextDisabled(u8(notifyState.message))
+                if collectReminder.managerEnsurePending then
+                    imgui.TextDisabled(u8"Подготовка менеджера уведомлений...")
+                else
+                    if imgui.Button(u8(Collect_GetNotifyInstallButtonText(notifyState)), imgui.ImVec2(-1, 0)) then
+                        Collect_EnsureNotificationManager()
+                    end
+                    if not notifyState.available then
+                        if collectReminder.managerDownloadPending then
+                            imgui.TextDisabled(u8"Скачивание менеджера уведомлений и библиотеки...")
+                        elseif imgui.Button(u8"Скачать менеджер и библиотеку", imgui.ImVec2(-1, 0)) then
+                            Collect_DownloadNotificationSystem()
+                        end
+                    end
+                end
+                imgui.TextDisabled(u8("GitHub: " .. NOTIFY_MANAGER_REPO_URL))
+                if collectReminder.managerStatusMessage ~= "" then
+                    imgui.TextDisabled(u8(collectReminder.managerStatusMessage))
+                end
+            end
 
             imgui.Spacing()
             imgui.Separator()
@@ -3986,11 +5176,7 @@ function DrawSettings()
             imgui.ScrollMouse()
             imgui.Spacing()
 
-            local inc = settings.main.income or { 
-                showPerHour=true, showPer24h=true, showPerCycle=true, 
-                showTillThresholdProfit=true, showTillThresholdHours=true 
-            }
-            settings.main.income = inc
+            local inc = GetIncomeSettings()
 
             imgui.TextWrapped(u8"Выберите, какие показатели доходности отображать:")
             imgui.Spacing()
@@ -3998,21 +5184,21 @@ function DrawSettings()
             imgui.Spacing()
 
             if imgui.Checkbox(u8"Показывать доход за час", imgui.new.bool(inc.showPerHour)) then
-                inc.showPerHour = not inc.showPerHour  
+                inc.showPerHour = not inc.showPerHour
                 SaveSettings()
             end
             imgui.SameLine()
             imgui.TextDisabled(u8"(/час)")
 
             if imgui.Checkbox(u8"Показывать доход за 24 часа", imgui.new.bool(inc.showPer24h)) then
-                inc.showPer24h = not inc.showPer24h  
+                inc.showPer24h = not inc.showPer24h
                 SaveSettings()
             end
             imgui.SameLine()
             imgui.TextDisabled(u8"(/24ч)")
 
             if imgui.Checkbox(u8"Показывать доход за цикл", imgui.new.bool(inc.showPerCycle)) then
-                inc.showPerCycle = not inc.showPerCycle  
+                inc.showPerCycle = not inc.showPerCycle
                 SaveSettings()
             end
             imgui.SameLine()
@@ -4023,21 +5209,116 @@ function DrawSettings()
             imgui.Spacing()
 
             if imgui.Checkbox(u8"Показывать текущую прибыль", imgui.new.bool(inc.showTillThresholdProfit)) then
-                inc.showTillThresholdProfit = not inc.showTillThresholdProfit  
+                inc.showTillThresholdProfit = not inc.showTillThresholdProfit
                 SaveSettings()
             end
 
             if imgui.Checkbox(u8"Показывать время до доливки", imgui.new.bool(inc.showTillThresholdHours)) then
-                inc.showTillThresholdHours = not inc.showTillThresholdHours  
+                inc.showTillThresholdHours = not inc.showTillThresholdHours
                 SaveSettings()
             end
+
+            imgui.Spacing()
+            imgui.Separator()
+            imgui.Spacing()
+
+            imgui.TextWrapped(u8"Бонусы доходности по домам:")
+            imgui.Spacing()
+            imgui.Text(u8"Время в онлайне:")
+            imgui.PushItemWidth(ScaleUI(120))
+            local incomeOnlineHoursPtr = imgui.new.int(tonumber(inc.onlineHours) or 0)
+            if imgui.InputInt("##income_online_hours_global", incomeOnlineHoursPtr, 0, 0) then
+                inc.onlineHours = math.minEx(24, math.maxEx(0, incomeOnlineHoursPtr[0]))
+                SaveSettings()
+            end
+            imgui.PopItemWidth()
             imgui.SameLine()
-            imgui.TextDisabled(u8"(в часах)")
+            imgui.TextDisabled(u8"ч (0-24)")
+            imgui.TextDisabled(u8"Бонус от Время в онлайне применяется ко всем домам, даже если дома нет в списке ниже")
+            imgui.Spacing()
+
+            imgui.Text(u8"Номер дома:")
+            imgui.PushItemWidth(ScaleUI(140))
+            imgui.InputInt("##incomeHouseNumber", inputIncomeHouse, 0, 0)
+            imgui.PopItemWidth()
+            imgui.SameLine()
+
+            if imgui.Button(u8"Добавить дом", imgui.ImVec2(ScaleUI(160), 0)) then
+                local houseNumber = math.maxEx(0, inputIncomeHouse[0])
+                if houseNumber >= 0 then
+                    local houseKey = tostring(houseNumber)
+                    if type(inc.houseBonuses[houseKey]) ~= "table" then
+                        inc.houseBonuses[houseKey] = {
+                            creativitySet = false,
+                            customPercent = 0,
+                        }
+                        SaveSettings()
+                    end
+                    inputIncomeHouse[0] = 0
+                end
+            end
+            imgui.TextDisabled(u8"Набор творчества даёт +20%% для дома")
+
+            imgui.Spacing()
+
+            local houseKeys = GetSortedIncomeHouseBonusKeys()
+            if #houseKeys == 0 then
+                imgui.TextDisabled(u8"Список домов пуст. Добавьте дом выше.")
+            else
+                imgui.BeginChild("income_house_bonus_list", imgui.ImVec2(-1, ScaleUI(220)), true)
+                imgui.ScrollMouse()
+
+                local removedHouse = false
+                for _, houseKey in ipairs(houseKeys) do
+                    local houseConfig = NormalizeIncomeHouseBonusConfig(inc.houseBonuses[houseKey])
+                    inc.houseBonuses[houseKey] = houseConfig
+                    local totalBonus = CalcHouseIncomeBonusPercent(houseKey)
+
+                    imgui.Separator()
+                    imgui.Text(u8(string.format("Дом №%s | Итоговый бонус: +%.2f%%", houseKey, totalBonus)))
+
+                    imgui.SameLine()
+                    if imgui.RightButton(u8("Удалить##income_remove_" .. houseKey), imgui.ImVec2(ScaleUI(120), 0)) then
+                        inc.houseBonuses[houseKey] = nil
+                        SaveSettings()
+                        removedHouse = true
+                        break
+                    end
+
+                    local creativityPtr = imgui.new.bool(houseConfig.creativitySet == true)
+                    if imgui.Checkbox(u8("Набор творчества##income_creativity_" .. houseKey), creativityPtr) then
+                        houseConfig.creativitySet = creativityPtr[0]
+                        SaveSettings()
+                    end
+
+                    imgui.SameLine()
+                    imgui.Text("\t|\t")
+                    imgui.SameLine()
+
+                    imgui.Text(u8"Свой процент:")
+                    imgui.SameLine()
+                    imgui.PushItemWidth(ScaleUI(120))
+                    local customPercentPtr = imgui.new.int(tonumber(houseConfig.customPercent) or 0)
+                    if imgui.InputInt("##income_custom_percent_" .. houseKey, customPercentPtr, 0, 0) then
+                        houseConfig.customPercent = math.maxEx(0, customPercentPtr[0])
+                        SaveSettings()
+                    end
+                    imgui.PopItemWidth()
+                    imgui.SameLine()
+                    imgui.TextDisabled(u8"%%")
+
+                    imgui.Spacing()
+                end
+
+                if not removedHouse and #houseKeys > 0 then
+                    imgui.Separator()
+                end
+                imgui.EndChild()
+            end
 
             imgui.EndChild()
             imgui.EndTabItem()
         end
-
         -- ТАБ 3: Банк
         if imgui.BeginTabItem(u8"Банк") then
             imgui.BeginChild("tab_bank", imgui.ImVec2(-1, -1))
@@ -4213,7 +5494,7 @@ function DrawSettings()
             imgui.PopItemWidth()
             imgui.SameLine()
             if imgui.Button(u8"Добавить в список", imgui.ImVec2(ScaleUI(150), 0)) then
-                if inputBlackHouse[0] > 0 then
+                if inputBlackHouse[0] >= 0 then
                     table.insert(settings.main.blackListHouses, inputBlackHouse[0])
                     SaveSettings()
                     inputBlackHouse[0] = 0
@@ -4426,7 +5707,7 @@ function DrawHousesBank()
         end
     )
     for i, house in ipairs(housesBanks) do
-        local _bank_now_str = house.bankNow:gsub("[^%d]", "")
+        local _bank_now_str = tostring(house.bankNow or ""):gsub("[^%d]", "")
         local bank_now = tonumber(_bank_now_str) or 0
         local bank_color = COLORS.WHITE
 
@@ -4469,7 +5750,8 @@ function DrawHouses()
         if house.cycles < 100 then
             lowCycles = lowCycles + 1
         end
-        if tonumber(house.bankNow) < 5000000 then
+        local bank_now = tonumber((tostring(house.bankNow or ""):gsub("[^%d]", ""))) or 0
+        if bank_now < 5000000 then
             lowBank = lowBank + 1
         end
     end
@@ -4488,7 +5770,7 @@ function DrawHouses()
         StartProcessInteracting("take")
     end
     imgui.SameLine()
-    if imgui.ButtonClickable(not stateCrypto.work, fa.TOGGLE_ON .. u8"\tВключить все видеокарты", imgui.ImVec2(-1, 0)) then
+    if imgui.ButtonClickable(not stateCrypto.work, fa.PLAY .. u8"\tВключить все видеокарты", imgui.ImVec2(-1, 0)) then
         StartProcessInteracting("on")
     end
 
@@ -4518,7 +5800,7 @@ function DrawHouses()
         -- Определяем цвета для циклов и банка
         local cycles_color = house.cycles < 100 and COLORS.RED or COLORS.WHITE -- красный если < 100, белый если >= 100
 
-        local _bank_now_str = house.bankNow:gsub("[^%d]", "")
+        local _bank_now_str = tostring(house.bankNow or ""):gsub("[^%d]", "")
         local bank_now = tonumber(_bank_now_str) or 0
         local bank_color = COLORS.WHITE
 
@@ -4549,7 +5831,7 @@ function DrawHouses()
             GetCommaValue(house.cycles),
             COLORS.WHITE,
             bank_color,
-            GetCommaValue(house.bankNow),
+            GetCommaValue(house.bankNow or 0),
             house.currency
         )
 
@@ -4600,7 +5882,7 @@ function DrawShelves()
 
     local totalWidth = (imgui.GetWindowWidth() - ScaleUI(30))
     local half    = totalWidth / 2
-    local quarter = totalWidth / 4
+    local quarter = (totalWidth / 4) - (imgui.GetStyle().ItemSpacing.x / 2)
 
     if imgui.ButtonClickable(not stateCrypto.work, fa.HAND_HOLDING_DOLLAR .. u8"\tСобрать", imgui.ImVec2(half, 0)) then
         StartProcessInteracting("take")
@@ -4620,16 +5902,31 @@ function DrawShelves()
         AddChatMessage("Автозаливка: " .. (settings.main.autoFillEnabled and "включена" or "выключена"), TYPECHATMESSAGES.SECONDARY)
     end
 
-    if imgui.ButtonClickable(not stateCrypto.work, fa.TOGGLE_ON .. u8"\tВключить карты", imgui.ImVec2(half, 0)) then
+    local toggleEnableIcon  = settings.main.autoEnableCards and fa.TOGGLE_ON or fa.TOGGLE_OFF
+    local toggleEnableTitle = settings.main.autoEnableCards and u8"Автовкл: вкл" or u8"Автовкл: выкл"
+
+    if imgui.ButtonClickable(not stateCrypto.work, fa.PLAY .. u8"\tВключить карты", imgui.ImVec2(quarter, 0)) then
         StartProcessInteracting("on")
     end
     imgui.SameLine()
-    if imgui.ButtonClickable(not stateCrypto.work, fa.TOGGLE_OFF .. u8"\tОтключить карты", imgui.ImVec2(-1, 0)) then
+    if imgui.Button(toggleEnableIcon .. "\t" .. toggleEnableTitle, imgui.ImVec2(quarter, 0)) then
+        settings.main.autoEnableCards = not settings.main.autoEnableCards
+        SaveSettings()
+        AddChatMessage("Автовключение карт после сбора: " .. (settings.main.autoEnableCards and "включено" or "выключено"), TYPECHATMESSAGES.SECONDARY)
+    end
+    imgui.SameLine()
+    if imgui.ButtonClickable(not stateCrypto.work, fa.PAUSE .. u8"\tОтключить карты", imgui.ImVec2(-1, 0)) then
         StartProcessInteracting("off")
     end
-
     if stateCrypto.work then
         imgui.ProgressBar(stateCrypto.progressShelves/#stateCrypto.queueShelves,imgui.ImVec2(-1,0), stateCrypto.progressShelves.."/"..#stateCrypto.queueShelves)
+    end
+
+    local currentHouseNumber = tonumber(stateCrypto.activeHouseID)
+    local currentHouseBonusPercent = CalcHouseIncomeBonusPercent(currentHouseNumber)
+    local inc = GetIncomeSettings()
+    if currentHouseNumber and currentHouseNumber > 0 then
+        imgui.Text(u8(string.format("Дом №%d | Бонус доходности: +%.2f%%", currentHouseNumber, currentHouseBonusPercent)))
     end
 
     imgui.Separator()
@@ -4672,11 +5969,10 @@ function DrawShelves()
 
         -- Расчёт ожидаемой выработки по уровню + остаток до доливки
         local per_h, per_24h, per_cycle, hours_left, income_left =
-            CalcGpuIncome(shelf.level, shelf.percentage, settings.main.fillFrom)
+            CalcGpuIncome(shelf.level, shelf.percentage, settings.main.fillFrom, currentHouseBonusPercent)
 
         -- Собираем суффикс по настройкам
         local parts = {}
-        local inc = settings.main.income or { showPerHour=true, showPer24h=true, showPerCycle=true, showTillThreshold=true }
 
         if inc.showPerHour  then table.insert(parts, string.format("%.2f/ч",   per_h))     end
         if inc.showPer24h   then table.insert(parts, string.format("%.2f/24ч", per_24h))   end
@@ -4691,7 +5987,7 @@ function DrawShelves()
         if inc.showTillThresholdHours then -- and hours_left > 0
             local hh = math.floor(hours_left)
             local mm = math.floor((hours_left - hh) * 60 + 0.5)
-            income_suffix = income_suffix .. string.format(" | До %s: %d:%02dч",
+            income_suffix = income_suffix .. string.format(" | До %s: %dч:%02dм",
                 shelf.percentage > settings.main.fillFrom and "доливки" or "заливки", hh, mm)
         end
         if inc.showTillThresholdProfit then -- and hours_left > 0
@@ -4843,7 +6139,7 @@ end
 
 -- Функция для создания кнопки, выровненной по правому краю
 function imgui.RightButton(label)
-    local _clearLabel = label:gsub("##.-", "")
+    local _clearLabel = label:gsub("##.*$", "")
     imgui.SetItemRight(_clearLabel)
 
     if imgui.Button(label) then
@@ -5002,6 +6298,9 @@ local function MainStyle()
 end
 
 local function MainStyleMobile()
+    if imgui.IsInitialized() then
+        imgui.SwitchContext()
+    end
     settings.style.colorChat, settings.style.colorMessage = '8cbf91', 0xFF8cbf91
 
     local style = imgui.GetStyle()
