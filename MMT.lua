@@ -662,7 +662,7 @@ local function StartCollectViaFlash()
     end
 
     if improve.isOn or improve.oils.busy or flashCollect.statsBusy then
-        AddChatMessage("—бор через флешку: дождитесь окончани€ сканировани€ /stats", TYPECHATMESSAGES.WARNING)
+        AddChatMessage("—бор через флешку: дождитесь завершени€ другого процесса", TYPECHATMESSAGES.WARNING)
         return false
     end
 
@@ -675,37 +675,11 @@ local function StartCollectViaFlash()
         FlashCollect_ResetFlags()
         FlashCollect_ResetItem()
         flashCollect.active = true
-
-        if not FlashCollect_FindFlashViaStats() then
-            return
-        end
-
-        flashCollect.inventoryOpened = false
-        flashCollect.waitHouseDialog = false
+        flashCollect.waitHouseDialog = true
         flashCollect.houseDialogReady = false
 
-        AddChatMessage("—бор через флешку: открываю /invent", TYPECHATMESSAGES.DEBUG)
-        sampSendChat('/invent')
-
-        local useDelayMs = FlashCollect_GetUseDelayAfterInventoryOpen()
-        local inventoryTimeout = os.clock() + (useDelayMs / 1000)
-        while flashCollect.active and not flashCollect.inventoryOpened and os.clock() < inventoryTimeout do
-            wait(25)
-        end
-
-        AddChatMessage(string.format("—бор через флешку: жду %d мс после /invent перед использованием", useDelayMs), TYPECHATMESSAGES.DEBUG)
-        wait(useDelayMs)
-        if not flashCollect.active then
-            return
-        end
-
-        flashCollect.waitHouseDialog = true
-        if not FlashCollect_SendUseSlot(flashCollect.slot) then
-            FlashCollect_Fail("—бор через флешку: не удалось отправить пакет использовани€ предмета", TYPECHATMESSAGES.CRITICAL)
-            return
-        end
-
-        FlashCollect_CloseInventoryAfterUse()
+        AddChatMessage("—бор через флешку: отправл€ю /flashminer", TYPECHATMESSAGES.DEBUG)
+        sampSendChat('/flashminer')
 
         local dialogTimeout = os.clock() + 8
         while flashCollect.active and not flashCollect.houseDialogReady and not flashCollect.failed and os.clock() < dialogTimeout do
@@ -4579,7 +4553,7 @@ function DrawMainMenu()
                 StartCollectViaFlash()
             end
             if flashCollect.active then
-                imgui.Text(u8"—бор через флешку: ожидание инвентар€/диалога дома...")
+                imgui.Text(u8"—бор через флешку: ожидание списка домов...")
             elseif (flashCollect.slot or 0) > 0 and settings.main.showStatusPanel then
                 imgui.Text(string.format("—бор через флешку: слот %d, количество %d", flashCollect.slot or 0, flashCollect.count or 0))
             end
@@ -6382,5 +6356,3 @@ function SetStyle(mobile)
     colors[clr.TabHovered]             = colors[clr.ButtonHovered]
     colors[clr.TabActive]              = colors[clr.FrameBg]
 end
-
-
