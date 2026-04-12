@@ -5,7 +5,7 @@
 script_authors('Sand')
 script_name('MMT | Mining Tool')
 script_description('Mining assistant TG: @Mister_Sand')
-script_version("1.7")
+script_version("1.8")
 
 -- =====================================================================================================================
 --                                                          Import
@@ -122,7 +122,7 @@ local defaultSettings = {
         },
         -- Черный список домов, которые нужно скрыть
         blackListHouses = {},
-        maxBankAmount = 19999999 - 10000,
+        maxBankAmount = 59999999 - 10000,
         -- Пополнять банк до целевой суммы (если выключено - до максимума диалога)
         bankFillToTarget = false,
         bankTargetAmount = 10000000,
@@ -450,7 +450,7 @@ local function Improve_SendCef(payload)
     return true
 end
 
-local function Improve_SendCefInterfaceClick(iface, sub, reqid, payload)
+local function Improve_SendCefMobile(iface, sub, reqid, payload)
     iface = tonumber(iface or 0) or 0
     sub = tonumber(sub or 0) or 0
     reqid = tonumber(reqid or -1) or -1
@@ -566,69 +566,6 @@ local function FlashCollect_ParseStatsInventoryPage(text)
     end
 end
 
-local function FlashCollect_RequestStatsScan(async)
-    if flashCollect.statsBusy or improve.oils.busy then
-        return false
-    end
-
-    FlashCollect_ResetItem()
-    flashCollect.statsBusy = true
-    sampSendChat('/stats')
-
-    local function finish()
-        flashCollect.lastStatsAt = os.date('%H:%M')
-    end
-
-    if async then
-        lua_thread.create(function()
-            while flashCollect.statsBusy do wait(10) end
-            finish()
-        end)
-    else
-        while flashCollect.statsBusy do wait(10) end
-        finish()
-        return true
-    end
-end
-
-local function FlashCollect_SendUseSlot(slot)
-    slot = tonumber(slot or 0) or 0
-    if slot <= 0 then
-        return false
-    end
-
-    if ISMONETLOADER then
-        local payload = string.format('{"action":1,"id":0,"slot":%d,"type":1}', slot)
-        improve.cef.lastPacketId = 220
-        improve.cef.lastPacket = payload
-        return Improve_SendCefInterfaceClick(52, 3, -1, payload)
-    end
-
-    local packet = string.format('clickOnButton|{"type": 1,"slot": %d, "action": 1}', slot)
-    improve.cef.lastPacketId = 220
-    improve.cef.lastPacket = packet
-    return Improve_SendCef(packet)
-end
-
-local function FlashCollect_CloseInventoryAfterUse()
-    if not ISMONETLOADER then
-        return
-    end
-
-    wait(100)
-    if flashCollect.active then
-        sampSendClickTextdraw(65535)
-    end
-end
-
-local function FlashCollect_GetUseDelayAfterInventoryOpen()
-    local delayMs = tonumber(settings.deley and settings.deley.improve_waitTryClick or 500) or 500
-    if delayMs < 800 then
-        delayMs = 800
-    end
-    return delayMs
-end
-
 local function FlashCollect_Fail(reason, chatType)
     flashCollect.failed = true
     flashCollect.error = tostring(reason or "")
@@ -638,21 +575,6 @@ local function FlashCollect_Fail(reason, chatType)
     flashCollect.inventoryOpened = false
     flashCollect.statsBusy = false
     AddChatMessage(reason or "Сбор через флешку: ошибка", chatType or TYPECHATMESSAGES.CRITICAL)
-end
-
-local function FlashCollect_FindFlashViaStats()
-    AddChatMessage("Сбор через флешку: открываю список предметов в /stats", TYPECHATMESSAGES.DEBUG)
-    if not FlashCollect_RequestStatsScan(false) then
-        FlashCollect_Fail("Сбор через флешку: сканирование /stats уже выполняется", TYPECHATMESSAGES.WARNING)
-        return false
-    end
-
-    if (flashCollect.count or 0) <= 0 or (flashCollect.slot or 0) <= 0 then
-        FlashCollect_Fail("Сбор через флешку: флешка не найдена в списке предметов /stats", TYPECHATMESSAGES.CRITICAL)
-        return false
-    end
-
-    return true
 end
 
 local function StartCollectViaFlash()
@@ -1487,15 +1409,41 @@ local function DialogReturnVisibility()
 end
 
 local function HandleBankDepositDialog(dialogId, title, text)
-    if not (stateCrypto.work and processes.dep and title:find("{73B461}Баланс домашнего счёта")) then
+    local dialogTitle = tostring(title or "")
+    local dialogText = tostring(text or "")
+    local isBankTitle = dialogTitle:find("Баланс домашнего сч", 1, true) ~= nil
+    local hasCurrentState = dialogText:find("Текущее состояние сч", 1, true) ~= nil
+    local hasCanTopup = dialogText:find("Можно пополнить сч", 1, true) ~= nil
+
+    if not (stateCrypto.work and processes.dep and (isBankTitle or (hasCurrentState and hasCanTopup))) then
         return nil
     end
 
-    local can_str = text:match("Можно пополнить счёт ещё на:%s*{%w+}%$([%d%.,]+)")
-    local can = 0
-    if can_str then
-        can = tonumber((can_str:gsub("[^%d]", ""))) or 0
+    local function parseSmileMoneyValue(valueText)
+        local raw = tostring(valueText or "")
+        local numbers = {}
+
+        for amount in raw:gmatch("%d[%d%.]*") do
+            table.insert(numbers, tonumber((amount:gsub("%.", ""))) or 0)
+        end
+
+        if #numbers == 0 then
+            return 0
+        end
+
+        if #numbers >= 2 and numbers[1] < 1000 then
+            return numbers[1] * 1000000 + numbers[2]
+        end
+
+        if raw:find("KK", 1, true) and numbers[1] < 1000 then
+            return numbers[1] * 1000000
+        end
+
+        return numbers[1]
     end
+
+    local canLine = text:match("Можно пополнить счёт ещё на:%s*(.-)[\r\n]") or text:match("Можно пополнить счет еще на:%s*(.-)[\r\n]") or ""
+    local can = parseSmileMoneyValue(canLine)
 
     local cur = tonumber(stateCrypto.queueHousesBank[stateCrypto.progressHousesBank].bankNow) or 0
     local target = (settings.main.bankFillToTarget and settings.main.bankTargetAmount) or nil
@@ -1512,7 +1460,7 @@ local function HandleBankDepositDialog(dialogId, title, text)
     end
 
     local PER_OP_LIMIT = 10000000
-    dep = math.minEx(dep,  math.maxEx(0, can - 1))
+    dep = math.minEx(dep, math.maxEx(0, can - 1))
     dep = math.minEx(dep, PER_OP_LIMIT)
     if dep <= 0 then
         DialogUtils.waitAndSendDialogResponse(dialogId, 0, 0, "")
@@ -1523,7 +1471,6 @@ local function HandleBankDepositDialog(dialogId, title, text)
     stateCrypto.queueHousesBank[stateCrypto.progressHousesBank].bankNow = cur + dep
     return DialogReturnVisibility()
 end
-
 local function HandleTakeProfitDialog(dialogId, title)
     if not (stateCrypto.work and processes.take and title:find("Вывод прибыли видеокарты")) then
         return nil
@@ -1576,6 +1523,12 @@ local function HandleShelfDialog(dialogId, title, text)
 
         if processes.fill and value.action == "fill" then
             if queueShelf and (queueShelf.fill or 0) > settings.main.fillFrom then
+                if settings.main.autoEnableCards and not queueShelf.work and (queueShelf.fill or 0) > 0 and onAction then
+                    queueShelf.work = true
+                    DialogUtils.waitAndSendDialogResponse(dialogId, 1, onAction.samp_line, "")
+                    return DialogReturnVisibility()
+                end
+
                 stateCrypto.progressShelves = stateCrypto.progressShelves + 1
                 DialogUtils.waitAndSendDialogResponse(dialogId, 0, 0, "")
                 return DialogReturnVisibility()
@@ -1839,6 +1792,7 @@ local function HandleStatsInventoryDialog(dialogId, title, text)
 end
 
 function sampev.onShowDialog(dialogId, style, title, button1, button2, text)
+
     lastIDDialog = dialogId
 
     local handled = HandleBankDepositDialog(dialogId, title, text)
@@ -2456,8 +2410,8 @@ function HouseProcessor.processBankHouses()
             end
         end
 
-        -- Дополнительная проверка и повторная операция если нужно
-        if NeedTopupForBankValue(houseData.bankNow) then
+        -- Повторяем пополнение, пока не достигнем цели/максимума.
+        while NeedTopupForBankValue(houseData.bankNow) do
             sampSendDialogResponse(lastIDDialog, 1, houseData.samp_line, "")
             stateCrypto.waitDep = true
 
@@ -3607,14 +3561,6 @@ local function Collect_NormalizeCryptoAmount(amount)
     return math.floor(amount * 1000 + 0.5) / 1000
 end
 
-local function Collect_FormatCryptoAmount(amount)
-    local value = Collect_NormalizeCryptoAmount(amount)
-    local text = string.format("%.3f", value)
-    text = text:gsub("(%..-)0+$", "%1")
-    text = text:gsub("%.$", "")
-    return GetCommaValue(text)
-end
-
 function Collect_GetLastCollectInfo()
     local meta = collectLogStore.meta or {}
     local info = meta.lastCollect
@@ -3998,54 +3944,141 @@ function ParseHouseData(text)
     houses = {}
 
     local results = {}
-    local lines = {}
 
-    -- Разбиваем текст на строки
-    for line in text:gmatch("[^\r\n]+") do
-        table.insert(lines, line)
+    local function trim(value)
+        local result = tostring(value or ""):gsub("^%s+", "")
+        result = result:gsub("%s+$", "")
+        return result
     end
 
-    -- Паттерн для извлечения данных о доме с налогом (поддержка разных валют)
-    local patternWithTax = "Дом №(%d+)%s*([^%d]+)%s*{%w+}([%d]+)%s*([%d]+)%s*циклов%s*%(([VC]*%$)([%d%.,]+) / [VC]*%$([%d%.,]+)%)"
+    local function parseEnergyValue(valueText)
+        local raw = trim(valueText)
+        local numbers = {}
 
-    -- Паттерн для извлечения данных о доме без налога (поддержка разных валют)
-    local patternWithoutTax = "Дом №(%d+)%s*([^%d]+)%s*([%d]+)%s*циклов%s*%(([VC]*%$)([%d%.,]+) / [VC]*%$([%d%.,]+)%)"
-
-    for lineIndex, line in ipairs(lines) do
-        local found = false
-
-        -- Сначала пробуем паттерн с налогом
-        for houseNum, city, tax, cycles, currency, bankNow, bankMax in string.gmatch(line, patternWithTax) do
-            if CheckHouseInBlackList(houseNum) then break end
-
-            table.insert(results, {
-                samp_line = lineIndex - 2,
-                house_number = tonumber(houseNum),
-                city = city:gsub("^%s+", ""):gsub("%s+$", ""),
-                tax = tonumber(tax),
-                cycles = tonumber(cycles),
-                currency = currency,
-                bankNow = bankNow:gsub(",", ""),
-                bankMax = bankMax:gsub(",", ""),
-                raw_line = line
-            })
-            found = true
+        for amount in raw:gmatch("%d[%d%.]*") do
+            table.insert(numbers, tonumber((amount:gsub("%.", ""))) or 0)
         end
 
-        -- Если не найдено совпадений с налогом, пробуем паттерн без налога
-        if not found then
-            for houseNum, city, cycles, currency, bankNow, bankMax in string.gmatch(line, patternWithoutTax) do
-                if CheckHouseInBlackList(houseNum) then break end
+        if #numbers == 0 then
+            return nil, nil
+        end
 
+        if #numbers >= 2 and numbers[1] < 1000 then
+            return tostring(numbers[1] * 1000000 + numbers[2]), "$"
+        end
+
+        if raw:find("KK", 1, true) and numbers[1] < 1000 then
+            return tostring(numbers[1] * 1000000), "$"
+        end
+
+        return tostring(numbers[1]), "$"
+    end
+
+    local function splitTabs(line)
+        local parts = {}
+        for part in tostring(line or ""):gmatch("[^\t]+") do
+            table.insert(parts, trim(part))
+        end
+        return parts
+    end
+
+    local lineIndex = 0
+    for line in text:gmatch("[^\r\n]+") do
+        lineIndex = lineIndex + 1
+        local cols = splitTabs(line)
+
+        if #cols >= 4 and cols[1]:find("%[") then
+            local firstCol = cols[1]
+            local city = trim(cols[#cols - 2] or "")
+            local tax = tonumber((tostring(cols[#cols - 1] or ""):match("(%d+)%D*$")))
+            local energyCol = trim(cols[#cols] or "")
+            local houseNum = firstCol:match("(%d+)%s*$")
+            local cycles = tonumber((energyCol:match("(%d+)") or ""))
+            local energyBlock = energyCol:match("%((.-)%)")
+
+            if houseNum and city ~= "" and cycles and energyBlock then
+                local bankNowRaw, bankMaxRaw = energyBlock:match("^(.-)%s*/%s*(.-)$")
+                local bankNow, currency = parseEnergyValue(bankNowRaw or "")
+                local bankMax = select(1, parseEnergyValue(bankMaxRaw or ""))
+
+                if bankNow and bankMax and not CheckHouseInBlackList(houseNum) then
+                    table.insert(results, {
+                        samp_line = lineIndex - 2,
+                        house_number = tonumber(houseNum),
+                        city = city,
+                        tax = tax or 0,
+                        cycles = cycles,
+                        currency = currency,
+                        bankNow = bankNow,
+                        bankMax = bankMax,
+                        raw_line = line
+                    })
+                end
+            end
+        end
+    end
+
+    return results
+end
+function ParseHouseBankData(text)
+    housesBanks = {}
+
+    local results = {}
+
+    local function trim(value)
+        local result = tostring(value or ""):gsub("^%s+", "")
+        result = result:gsub("%s+$", "")
+        return result
+    end
+
+    local function parseBankValue(valueText)
+        local raw = trim(valueText)
+        local numbers = {}
+
+        for amount in raw:gmatch("%d[%d%.]*") do
+            table.insert(numbers, tonumber((amount:gsub("%.", ""))) or 0)
+        end
+
+        if #numbers == 0 then
+            return nil
+        end
+
+        if #numbers >= 2 and numbers[1] < 1000 then
+            return tostring(numbers[1] * 1000000 + numbers[2])
+        end
+
+        if raw:find("KK", 1, true) and numbers[1] < 1000 then
+            return tostring(numbers[1] * 1000000)
+        end
+
+        return tostring(numbers[1])
+    end
+
+    local function splitTabs(line)
+        local parts = {}
+        for part in tostring(line or ""):gmatch("[^\t]+") do
+            table.insert(parts, trim(part))
+        end
+        return parts
+    end
+
+    local lineIndex = 0
+    for line in text:gmatch("[^\r\n]+") do
+        lineIndex = lineIndex + 1
+        local cols = splitTabs(line)
+
+        if #cols >= 3 and cols[1]:find("%[") then
+            local firstCol = cols[1]
+            local city = trim(cols[#cols - 1] or "")
+            local bankNow = parseBankValue(cols[#cols] or "")
+            local houseNum = firstCol:match("(%d+)%s*$")
+
+            if houseNum and city ~= "" and bankNow and not CheckHouseInBlackList(houseNum) then
                 table.insert(results, {
                     samp_line = lineIndex - 2,
                     house_number = tonumber(houseNum),
-                    city = city:gsub("^%s+", ""):gsub("%s+$", ""),
-                    tax = nil,
-                    cycles = tonumber(cycles),
-                    currency = currency,
-                    bankNow = bankNow:gsub(",", ""),
-                    bankMax = bankMax:gsub(",", ""),
+                    city = city,
+                    bankNow = bankNow,
                     raw_line = line
                 })
             end
@@ -4054,37 +4087,6 @@ function ParseHouseData(text)
 
     return results
 end
-
-function ParseHouseBankData(text)
-    housesBanks = {}
-
-    local results = {}
-    local lines = {}
-
-    -- Разбиваем текст на строки
-    for line in text:gmatch("[^\r\n]+") do
-        table.insert(lines, line)
-    end
-
-    local pattern = "Дом №(%d+)%s*([^%d]+)%s*%$([%d%.,]+)"
-
-    for lineIndex, line in ipairs(lines) do
-        for houseNum, city, bankNow in string.gmatch(line, pattern) do
-            if CheckHouseInBlackList(houseNum) then break end
-
-            table.insert(results, {
-                samp_line = lineIndex - 2,
-                house_number = tonumber(houseNum),
-                city = city:gsub("^%s+", ""):gsub("%s+$", ""),
-                bankNow = bankNow:gsub(",", ""),
-                raw_line = line
-            })
-        end
-    end
-
-    return results
-end
-
 function ParseShelfData(text)
     shelves = {}
     housesData[stateCrypto.activeHouseID] = { work_vc = 0, max_collect = 0, min_liquid = 0}
@@ -4302,7 +4304,7 @@ local function digits_to_int(s)
 end
 
 local function clamp_bank_target(v)
-    return math.maxEx(10000, math.minEx(19999999 - 10000, v))
+    return math.maxEx(10000, math.minEx(59999999 - 10000, v))
 end
 
 function imgui.GetMiddleButtonX(count)
