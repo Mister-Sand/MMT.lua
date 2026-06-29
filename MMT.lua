@@ -5,7 +5,7 @@
 script_authors('Sand')
 script_name('MMT | Mining Tool')
 script_description('Mining assistant TG: @Mister_Sand')
-script_version("1.9")
+script_version("1.10")
 
 -- =====================================================================================================================
 --                                                          Import
@@ -356,6 +356,15 @@ local Interacting = {}
 local Chat = {}
 local UI = {}
 local Util = {}
+function Util.EnsureDirectoryExists(path)
+    local currentPath = ""
+    for folder in string.gmatch(path, "[^/\\]+") do
+        currentPath = currentPath .. folder .. "/"
+        if not lfs.attributes(currentPath, "mode") then
+            lfs.mkdir(currentPath)
+        end
+    end
+end
 
 local lastIDDialog = 0
 
@@ -758,9 +767,10 @@ end
 
 function FlashCollect.ParseStatsInventoryPage(text)
     for line in (text or ''):gmatch("[^\r\n]+") do
-        local indexSlot, name, count = line:match("%[([^%]]+)%]%s(.-)%s%{.-}%[([^%]]+)%sшт%]")
+        local indexSlot, name, count = line:match("%[([^%]]+)%]%s*(.-)%s*%[(%d+)%s*шт%]")
         local slotNum = tonumber(indexSlot)
         count = tonumber(count)
+        if name then name = name:gsub("{%x+}", ""):gsub("%s+$", "") end
         if indexSlot and name and count then
             FlashCollect.RegisterItem(name, count, slotNum)
         end
@@ -1918,7 +1928,7 @@ local function HandleHouseSelectionDialog(dialogId, title, text)
     return DialogReturnVisibility()
 end
 
-local function HandleStatsInventoryDialog(dialogId, title, text)
+local function HandleStatsInventoryDialog(dialogId, style, title, text)
     if not (improve.oils.busy or flashCollect.statsBusy) then
         return nil
     end
@@ -1932,6 +1942,16 @@ local function HandleStatsInventoryDialog(dialogId, title, text)
         return nil
     end
 
+    local _page = text or ''
+    if _page == statsLastPageText then
+        if improve.oils.busy then improve.oils.busy = false; improve.oils.lastAt = os.date('%H:%M') end
+        if flashCollect.statsBusy then flashCollect.statsBusy = false; flashCollect.lastStatsAt = os.date('%H:%M') end
+        statsLastPageText = nil
+        sampSendDialogResponse(dialogId, 0, 0, '')
+        return false
+    end
+    statsLastPageText = _page
+
     if improve.oils.busy then
         Improve.ParseInventoryDialogPage(text or '')
     end
@@ -1940,7 +1960,14 @@ local function HandleStatsInventoryDialog(dialogId, title, text)
     end
 
     if (text or ''):find('Следующая%sстраница') then
-        sampSendDialogResponse(dialogId, 1, 0, '')
+        local _hoff = (style == 5) and 1 or 0
+        local _nextIdx = 0
+        local _ln = 0
+        for _line in (text or ''):gmatch('[^\r\n]+') do
+            if _line:find('Следующая%sстраница') and (_ln - _hoff) >= 0 then _nextIdx = _ln - _hoff end
+            _ln = _ln + 1
+        end
+        sampSendDialogResponse(dialogId, 1, _nextIdx, '')
         return false
     end
 
@@ -1952,6 +1979,7 @@ local function HandleStatsInventoryDialog(dialogId, title, text)
         flashCollect.statsBusy = false
         flashCollect.lastStatsAt = os.date('%H:%M')
     end
+    statsLastPageText = nil
     sampSendDialogResponse(dialogId, 0, 0, '')
     return false
 end
@@ -1998,7 +2026,7 @@ function sampev.onShowDialog(dialogId, style, title, button1, button2, text)
         return DialogReturnVisibility()
     end
 
-    handled = HandleStatsInventoryDialog(dialogId, title, text)
+    handled = HandleStatsInventoryDialog(dialogId, style, title, text)
     if handled ~= nil then
         return handled
     end
@@ -3109,9 +3137,10 @@ end
 
 function Improve.ParseInventoryDialogPage(text)
     for line in (text or ''):gmatch("[^\r\n]+") do
-        local indexSlot, name, count = line:match("%[([^%]]+)%]%s(.-)%s%{.-}%[([^%]]+)%sшт%]")
+        local indexSlot, name, count = line:match("%[([^%]]+)%]%s*(.-)%s*%[(%d+)%s*шт%]")
         local slotNum = tonumber(indexSlot)
         count = tonumber(count)
+        if name then name = name:gsub("{%x+}", ""):gsub("%s+$", "") end
         if indexSlot and name and count then
             if name == "Смазка для разгона Arizona Video Card" then
                 improve.oils.arizona = improve.oils.arizona + count
@@ -3435,14 +3464,22 @@ end
 function Storage.LoadCollectLogStore()
     local data = Storage.LoadJSON(COLLECT_STATS_FILE)
     if type(data) ~= "table" then
-        data = {}
+        collectLogStore = {
+            days = {},
+            meta = {}
+        }
+        return
     end
-    data.days = data.days or {}
-    data.meta = data.meta or {}
+
+    data.days = type(data.days) == "table" and data.days or {}
+    data.meta = type(data.meta) == "table" and data.meta or {}
+
     if type(data.meta.lastCollect) ~= "table" then
         data.meta.lastCollect = nil
     end
+
     collectLogStore = data
+
     if Collect.TrimLogStoreDetails() then
         Storage.SaveCollectLogStore()
     end
@@ -4302,16 +4339,6 @@ function Util.OpenUrl(url)
 	else
 		os.execute("explorer " .. url)
 	end
-end
-
-function Util.EnsureDirectoryExists(path)
-    local currentPath = ""
-    for folder in string.gmatch(path, "[^/\\]+") do
-        currentPath = currentPath .. folder .. "/"
-        if not lfs.attributes(currentPath, "mode") then
-            lfs.mkdir(currentPath)
-        end
-    end
 end
 
 function Util.GetCommaValue(n)
