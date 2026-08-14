@@ -5,7 +5,7 @@
 script_authors('Sand')
 script_name('MMT | Mining Tool')
 script_description('Mining assistant TG: @Mister_Sand')
-script_version("2.0")
+script_version("2.1")
 
 -- =====================================================================================================================
 --                                                          Import
@@ -181,6 +181,8 @@ local defaultSettings = {
         autoTake = false,
         -- Автопополнение воды при открытии меню фермера
         autoFill = false,
+        -- Заливать воду фермеру не выше этого уровня (максимум - Farmer.WATER_MAX)
+        fillTarget = 400,
         -- Пауза перед ответом на диалог (мс)
         actionDelay = 150,
         -- Таймаут ожидания диалога (сек)
@@ -205,6 +207,8 @@ local defaultSettings = {
         autoTake = false,
         -- Автозарядка майнера при открытии меню
         autoFill = false,
+        -- Заряжать майнера не выше этого уровня (максимум - Miner.CHARGE_MAX)
+        fillTarget = 10,
         -- Пауза перед ответом на диалог (мс)
         actionDelay = 150,
         -- Таймаут ожидания диалога (сек)
@@ -468,8 +472,9 @@ local miner = {
     menuOpen = false,          -- открыто ли (скрытое) меню майнера на сервере
     last = { kind = nil, id = nil, style = nil },
     menu = { id = nil, status = "", storeNow = 0, storeMax = 0, wareLine = nil, statusLine = nil },
-    ware = { id = nil, items = {}, putLine = nil, chargeName = nil },
+    ware = { id = nil, items = {}, putLine = nil, chargeName = nil, chargeLine = nil, chargeInWare = 0 },
     input = {},
+    skipLines = {},            -- строки склада, которые забирать не нужно (номер строки -> true)
     collected = {},            -- [имя] = количество (за текущую сессию)
     chargeSpent = 0,           -- сколько зарядки залито за сессию
     chargeNow = 0,             -- зарядка у майнера (из диалога "Положить на склад")
@@ -1067,41 +1072,52 @@ function FlashCollect.Start(hideWindow)
 
     flashCollect.hideWindow = hideWindow == true
 
-    lua_thread.create(function()
-        FlashCollect.ResetFlags()
-        FlashCollect.ResetItem()
-        flashCollect.active = true
-        flashCollect.waitHouseDialog = true
-        flashCollect.houseDialogReady = false
-
-        Chat.Add("Сбор через флешку: отправляю /flashminer", TYPECHATMESSAGES.DEBUG)
-        sampSendChat('/flashminer')
-
-        local dialogTimeout = os.clock() + 8
-        while flashCollect.active and not flashCollect.houseDialogReady and not flashCollect.failed and os.clock() < dialogTimeout do
-            wait(25)
-        end
-
-        if not flashCollect.active then
-            return
-        end
-
-        if flashCollect.failed then
-            return
-        end
-
-        if not flashCollect.houseDialogReady or #houses == 0 then
-            FlashCollect.Fail("Сбор через флешку: список домов не открылся", TYPECHATMESSAGES.CRITICAL)
-            return
-        end
-
-        FlashCollect.ResetFlags()
-        Chat.Add("Сбор через флешку: запускаю сбор со всех домов", TYPECHATMESSAGES.DEBUG)
-        wait(100)
-        Interacting.Start("take", "flash")
-    end)
+    if flashCollect.thread and (flashCollect.thread:status() == "suspended"
+        or flashCollect.thread:status() == "dead")
+    then
+        flashCollect.thread:run()
+    else
+        flashCollect.thread = lua_thread.create(FlashCollect.Process)
+    end
 
     return true
+end
+
+-- Тело сбора через флешку вынесено в отдельную функцию: поток создаётся заранее
+-- приостановленным (см. main), потому что lua_thread.create изнутри уже работающего
+-- потока роняет moonloader ("cannot resume non-suspended coroutine")
+function FlashCollect.Process()
+    FlashCollect.ResetFlags()
+    FlashCollect.ResetItem()
+    flashCollect.active = true
+    flashCollect.waitHouseDialog = true
+    flashCollect.houseDialogReady = false
+
+    Chat.Add("Сбор через флешку: отправляю /flashminer", TYPECHATMESSAGES.DEBUG)
+    sampSendChat('/flashminer')
+
+    local dialogTimeout = os.clock() + 8
+    while flashCollect.active and not flashCollect.houseDialogReady and not flashCollect.failed and os.clock() < dialogTimeout do
+        wait(25)
+    end
+
+    if not flashCollect.active then
+        return
+    end
+
+    if flashCollect.failed then
+        return
+    end
+
+    if not flashCollect.houseDialogReady or #houses == 0 then
+        FlashCollect.Fail("Сбор через флешку: список домов не открылся", TYPECHATMESSAGES.CRITICAL)
+        return
+    end
+
+    FlashCollect.ResetFlags()
+    Chat.Add("Сбор через флешку: запускаю сбор со всех домов", TYPECHATMESSAGES.DEBUG)
+    wait(100)
+    Interacting.Start("take", "flash")
 end
 -- ===== Кэш уровней видеокарт =====
 
@@ -1840,7 +1856,8 @@ function main()
 
     if notifySuccess and type(notify) == 'table' and type(notify.register_action) == 'function' then
         collectReminderAction = notify.register_action(u8("Запустить сбор"), function()
-            FlashCollect.Start()
+            -- колбэк вызывается изнутри notify.process_actions: поток отсюда не запускаем
+            flashCollect.notifyStart = true
         end)
     end
 
@@ -1850,7 +1867,17 @@ function main()
             wait(10)
 
             if notifySuccess and type(notify) == 'table' and type(notify.process_actions) == 'function' then
-                notify.process_actions()
+                -- ошибка внутри библиотеки не должна убивать весь фоновый поток
+                local okActions, errActions = pcall(notify.process_actions)
+                if not okActions then
+                    print("[MMT] notify.process_actions: " .. tostring(errActions))
+                end
+            end
+
+            -- запуск сбора по кнопке уведомления: только вне process_actions
+            if flashCollect.notifyStart then
+                flashCollect.notifyStart = false
+                FlashCollect.Start()
             end
 
             -- автообновление инвентаря при старте заточки (если включено)
@@ -1896,6 +1923,7 @@ function main()
             Improve.ProbeWatchdogTick()
             Improve.MobileStatusTick()
             Collect.ReminderTick()
+            Storage.FlushResourceLogs()
         end
     end)
 
@@ -1903,6 +1931,9 @@ function main()
 
     processInteractingThread = lua_thread.create_suspended(Interacting.Process)
     farmer.thread = lua_thread.create_suspended(Farmer.Process)
+    miner.thread = lua_thread.create_suspended(Miner.Process)
+    flashCollect.thread = lua_thread.create_suspended(FlashCollect.Process)
+    improve.oilsThread = lua_thread.create_suspended(Improve.OilsWaitProcess)
 end
 
 -- =====================================================================================================================
@@ -3722,30 +3753,41 @@ function Improve.RefreshOils(async)
     Improve.LogAdd("INFO", "Запрос /stats для обновления инвентаря смазок и видеокарт.")
     sampSendChat('/stats')
 
-    local function logResult()
-        Improve.LogAdd("INFO", string.format(
-            "Инвентарь обновлён: Arizona=%d, Обычная=%d, видеокарты=%d.",
-            improve.oils.arizona or 0,
-            improve.oils.classic or 0,
-            #(improve.cef.cards or {})
-        ))
-
-        -- После ручного обновления сразу показываем найденные слоты видеокарт в UI.
-        if Improve.IsNewStyleMode() then
-            Improve.SyncVideoCardsFromCef()
-            improve.cef.probed = false
-        end
-    end
-
     if async then
-        lua_thread.create(function()
-            while improve.oils.busy do wait(10) end
-            logResult()
-        end)
+        -- ждать /stats уходим в отдельный поток; он создан заранее приостановленным,
+        -- потому что RefreshOils зовут в том числе из фонового потока
+        if improve.oilsThread and (improve.oilsThread:status() == "suspended"
+            or improve.oilsThread:status() == "dead")
+        then
+            improve.oilsThread:run()
+        else
+            improve.oilsThread = lua_thread.create(Improve.OilsWaitProcess)
+        end
     else
-        while improve.oils.busy do wait(10) end
-        logResult()
+        Improve.OilsWaitProcess()
         return true
+    end
+end
+
+-- Ждём окончания разбора /stats и пишем результат в лог
+function Improve.OilsWaitProcess()
+    while improve.oils.busy do wait(10) end
+    Improve.LogOilsResult()
+end
+
+-- Итог обновления инвентаря смазок и видеокарт
+function Improve.LogOilsResult()
+    Improve.LogAdd("INFO", string.format(
+        "Инвентарь обновлён: Arizona=%d, Обычная=%d, видеокарты=%d.",
+        improve.oils.arizona or 0,
+        improve.oils.classic or 0,
+        #(improve.cef.cards or {})
+    ))
+
+    -- После ручного обновления сразу показываем найденные слоты видеокарт в UI.
+    if Improve.IsNewStyleMode() then
+        Improve.SyncVideoCardsFromCef()
+        improve.cef.probed = false
     end
 end
 
@@ -4068,6 +4110,18 @@ function Storage.FlushCollectLogStore()
         return Storage.SaveCollectLogStore()
     end
     return true
+end
+
+-- Логи теплиц и майнера пишутся с троттлингом в 2 секунды: если запись попала в паузу,
+-- она оставалась только в памяти до конца процесса. Досохраняем её фоном
+function Storage.FlushResourceLogs()
+    local now = os.clock()
+    if greenhouseLog.dirty and (now - (greenhouseLog.lastSaveAt or 0)) >= 5 then
+        Storage.SaveGreenhouseLog()
+    end
+    if minerLog.dirty and (now - (minerLog.lastSaveAt or 0)) >= 5 then
+        Storage.SaveMinerLog()
+    end
 end
 
 function Collect.GetMaxLogItemsPerHouseDay()
@@ -4790,9 +4844,12 @@ function Farmer.ListItem(idx, style)
     return base
 end
 
+-- Сколько всего влезает воды в фермера
+Farmer.WATER_MAX = 400
+
 -- Разбор диалога "Меню фермера"
 function Farmer.ParseMenu(text, style)
-    local m = { id = nil, status = "", storeNow = 0, storeMax = 0, wareLine = nil }
+    local m = { id = nil, status = "", storeNow = 0, storeMax = 0, wareLine = nil, statusLine = nil }
     text = Farmer.stripColors(text)
     local idx = 0
     for line in tostring(text or ""):gmatch("[^\r\n]+") do
@@ -4806,6 +4863,7 @@ function Farmer.ParseMenu(text, style)
                 m.storeMax = Farmer.num(b)
             end
         elseif low:find("статус") then
+            m.statusLine = Farmer.ListItem(idx, style)
             local v = line:match(".*%[%s*(.-)%s*%]")
             if v then m.status = v end
         end
@@ -5016,6 +5074,30 @@ function Farmer.WaitAdvance(startSeq)
     return nil
 end
 
+-- Закрывает всё, что осталось открытым. Отвечаем именно тому диалогу, который пришёл последним:
+-- на Cancel сервер часто возвращает предыдущее окно, а ответ по устаревшему id он игнорирует,
+-- и тогда на экране висит "мёртвый" диалог, который уже ничего не открывает
+function Farmer.CloseChain(limit)
+    limit = tonumber(limit) or 4
+    local interval = tonumber(settings.farmer.waitInterval) or 10
+    for _ = 1, limit do
+        local id = farmer.last and farmer.last.id
+        if id == nil then break end
+        local seq = farmer.dialogSeq
+        Farmer.Respond(id, 0, 0, "")
+        local deadline = os.clock() + 0.35
+        while os.clock() < deadline and farmer.dialogSeq == seq do
+            wait(interval)
+        end
+        -- сервер ничего не прислал в ответ - значит закрылось всё
+        if farmer.dialogSeq == seq then break end
+    end
+    farmer.last = { kind = nil, id = nil, style = nil }
+    if farmer.menu then farmer.menu.id = nil end
+    if farmer.ware then farmer.ware.id = nil end
+    farmer.menuOpen = false
+end
+
 function Farmer.OpenWarehouse()
     if not (farmer.menu and farmer.menu.id and farmer.menu.wareLine ~= nil) then
         return false
@@ -5112,9 +5194,20 @@ function Farmer.DoFill()
     farmer.statusText = "Пополняю воду..."
     local seq = farmer.dialogSeq
     Farmer.Respond(farmer.ware.id, 1, farmer.ware.putLine, "")
-    if Farmer.WaitAdvance(seq) ~= "putInput" then return end
-    local missing = math.maxEx(0, (tonumber(farmer.input.farmMax) or 0) - (tonumber(farmer.input.farmNow) or 0))
+    if Farmer.WaitAdvance(seq) ~= "putInput" then
+        -- окно осталось у игрока: если он зальёт руками, скрипт этого не увидит и в лог не запишет
+        Farmer.Log("Окно пополнения воды не открылось - вода не залита и не посчитана")
+        return
+    end
+    -- заливаем не выше заданного в настройках уровня (по умолчанию - полный бак)
+    local farmMax = tonumber(farmer.input.farmMax) or 0
+    local cap = tonumber(settings.farmer.fillTarget) or Farmer.WATER_MAX
+    -- ползунок на максимуме = без ограничения: заливаем столько, сколько принимает фермер
+    local target = (cap >= Farmer.WATER_MAX) and farmMax or math.minEx(cap, farmMax)
+    local missing = math.maxEx(0, target - (tonumber(farmer.input.farmNow) or 0))
     local amount = math.minEx(missing, tonumber(farmer.input.have) or 0)
+    Farmer.Log(string.format("Окно пополнения: у вас %d, у фермера %d/%d, зальём %d",
+        tonumber(farmer.input.have) or 0, tonumber(farmer.input.farmNow) or 0, farmMax, amount), true)
     if amount > 0 then
         Farmer.Respond(farmer.input.id, 1, 0, tostring(amount))
         Farmer.AddWater(amount)
@@ -5122,26 +5215,30 @@ function Farmer.DoFill()
         farmer.wareWaterNow = math.minEx(tonumber(farmer.wareWaterMax) or 0, (tonumber(farmer.wareWaterNow) or 0) + amount)
     else
         Farmer.Respond(farmer.input.id, 0, 0, "")
-        Farmer.Log(missing <= 0 and "Вода у фермера уже залита доверху" or "У вас с собой нет воды")
+        if missing > 0 then
+            Farmer.Log("У вас с собой нет воды")
+        elseif target < farmMax then
+            Farmer.Log(string.format("Вода у фермера уже на заданном уровне (%d из %d)", target, farmMax))
+        else
+            Farmer.Log("Вода у фермера уже залита доверху")
+        end
     end
 end
 
 function Farmer.Finish(reason)
-    if farmer.ware and farmer.ware.id then
-        Farmer.Respond(farmer.ware.id, 0, 0, "")
-        wait(120)
+    -- Свежие "У вас: N" и запас воды сервер показывает только в окне пополнения:
+    -- заглядываем туда, пока склад ещё открыт
+    if farmer.last.kind == "ware" and farmer.ware and farmer.ware.id and farmer.ware.putLine ~= nil then
+        farmer.statusText = "Обновляю запас воды..."
+        Farmer.PeekWater()
     end
+    Farmer.CloseChain()
     -- Переоткрываем меню через Alt, чтобы подтянуть свежие данные (склад/статус) после сбора/заливки
     farmer.statusText = "Обновляю данные..."
     Farmer.ReopenMenuViaAlt()
-    if farmer.menu and farmer.menu.id then
-        Farmer.Respond(farmer.menu.id, 0, 0, "")
-        wait(60)
-    end
+    Farmer.CloseChain()
     Storage.RequestSaveGreenhouseLog(true)
     farmer.active = false
-    farmer.menuOpen = false
-    if farmer.menu then farmer.menu.id = nil end
     farmer.statusText = tostring(reason or "Готово")
 
     local parts = {}
@@ -5153,6 +5250,18 @@ function Farmer.Finish(reason)
     Farmer.Log(tostring(reason or "Готово"))
 end
 
+-- Запас воды у фермера и остаток воды у игрока сервер показывает только в окне пополнения:
+-- открываем его и считываем "Имеется у Вас: N" и "Имеется у фермера: N / M".
+-- Окно остаётся открытым - закрывает его вызывающий через Farmer.CloseChain()
+function Farmer.PeekWater()
+    if not (farmer.ware and farmer.ware.id and farmer.ware.putLine ~= nil) then
+        return false
+    end
+    local seq = farmer.dialogSeq
+    Farmer.Respond(farmer.ware.id, 1, farmer.ware.putLine, "")
+    return Farmer.WaitAdvance(seq) == "putInput"
+end
+
 -- Открыть склад фермы, обновить данные о содержимом и закрыть диалоги
 function Farmer.CheckWare()
     if not Farmer.EnsureMenu() then
@@ -5162,24 +5271,55 @@ function Farmer.CheckWare()
     farmer.statusText = "Проверяю склад фермы..."
     Farmer.Log("Смотрю, что лежит на складе")
     local ok = Farmer.EnsureWare()
-    if farmer.ware and farmer.ware.id then
-        Farmer.Respond(farmer.ware.id, 0, 0, "")
-        wait(120)
+
+    -- содержимое склада уже разобрано, дальше читаем воду из окна пополнения
+    if ok then
+        farmer.statusText = "Проверяю запас воды..."
+        if not Farmer.PeekWater() then
+            Farmer.Log("Запас воды прочитать не удалось", true)
+        end
     end
-    if farmer.menu and farmer.menu.id then
-        Farmer.Respond(farmer.menu.id, 0, 0, "")
-        wait(60)
-    end
+
+    Farmer.CloseChain()
     farmer.active = false
-    farmer.menuOpen = false
-    if farmer.menu then farmer.menu.id = nil end
     farmer.statusText = ok and "Склад фермы обновлён" or "Не удалось открыть склад фермы"
+end
+
+-- Переключить статус фермера (собирает / не собирает).
+-- Меню на сервере к этому моменту обычно уже закрыто, поэтому открываем его заново через Alt
+function Farmer.ToggleStatus()
+    if not Farmer.EnsureMenu() then
+        farmer.active = false
+        return
+    end
+    if farmer.menu.statusLine == nil then
+        Farmer.Log("В меню фермера нет строки статуса")
+        Farmer.CloseChain()
+        farmer.active = false
+        farmer.statusText = "Статус переключить не удалось"
+        return
+    end
+
+    farmer.statusText = "Переключаю статус..."
+    local seq = farmer.dialogSeq
+    Farmer.Respond(farmer.menu.id, 1, farmer.menu.statusLine, "")
+    -- сервер возвращает меню с новым статусом - его и разберём
+    Farmer.WaitAdvance(seq)
+    Farmer.CloseChain()
+    farmer.active = false
+    local st = (farmer.menu.status ~= nil and farmer.menu.status ~= "") and farmer.menu.status or "?"
+    farmer.statusText = "Статус: " .. tostring(st)
+    Farmer.Log("Статус фермера: " .. tostring(st))
 end
 
 function Farmer.Process()
     farmer.active = true
     if farmer.mode == "check" then
         Farmer.CheckWare()
+        return
+    end
+    if farmer.mode == "status" then
+        Farmer.ToggleStatus()
         return
     end
     if not Farmer.EnsureMenu() then
@@ -5320,6 +5460,9 @@ Storage.LoadGreenhouseLog()
 --                    Miner: разбор диалогов
 -- --------------------------------------------------------
 
+-- Сколько всего влезает зарядки в майнера
+Miner.CHARGE_MAX = 10
+
 -- Разбор диалога "Меню майнера"
 function Miner.ParseMenu(text, style)
     local m = { id = nil, status = "", storeNow = 0, storeMax = 0, wareLine = nil, statusLine = nil }
@@ -5346,9 +5489,14 @@ function Miner.ParseMenu(text, style)
     return m
 end
 
+-- Строка склада с зарядкой майнера: её забирать нельзя, иначе вынем заряд из самого майнера
+function Miner.IsCharge(name)
+    return Farmer.lower(Farmer.stripColors(name)):find("заряд") ~= nil
+end
+
 -- Разбор диалога "Склад майнера"
 function Miner.ParseWare(text, style)
-    local w = { id = nil, items = {}, putLine = nil, chargeName = nil }
+    local w = { id = nil, items = {}, putLine = nil, chargeName = nil, chargeLine = nil, chargeInWare = 0 }
     text = Farmer.stripColors(text)
     local idx = 0
     for line in tostring(text or ""):gmatch("[^\r\n]+") do
@@ -5367,7 +5515,14 @@ function Miner.ParseWare(text, style)
             if #cols >= 2 then
                 local name = cols[1]
                 local count = Farmer.num(cols[#cols])
-                if name ~= "" and (count > 0 or low:find("ед")) then
+                if Miner.IsCharge(name) then
+                    -- зарядка майнера: запоминаем строку, но в список забираемого не кладём
+                    w.chargeLine = li
+                    w.chargeInWare = count
+                    if w.chargeName == nil or w.chargeName == "" then
+                        w.chargeName = Farmer.cleanName(name)
+                    end
+                elseif name ~= "" and (count > 0 or low:find("ед")) then
                     table.insert(w.items, {
                         line = li,
                         name = Farmer.cleanName(name),
@@ -5396,7 +5551,7 @@ end
 
 function Miner.NextTakeable()
     for _, it in ipairs((miner.ware and miner.ware.items) or {}) do
-        if (it.count or 0) > 0 then
+        if (it.count or 0) > 0 and not (it.line ~= nil and miner.skipLines[it.line]) then
             return it
         end
     end
@@ -5440,22 +5595,11 @@ function Miner.HandleDialog(dialogId, style, title, text)
         return true
     end
 
-    if low:find("склад майнера") then
-        if not miner.active then return nil end
-        local ware = Miner.ParseWare(text, style)
-        ware.id = dialogId
-        miner.ware = ware
-        miner.wareAt = os.time()
-        miner.last = { kind = "ware", id = dialogId, style = style }
-        miner.dialogSeq = miner.dialogSeq + 1
-        return false
-    end
-
     -- Заголовки "Положить на склад" / "Забрать" совпадают с фермерскими,
-    -- поэтому перехватываем их только когда работает именно майнер
-    if not miner.active then return nil end
-
+    -- поэтому перехватываем их только когда работает именно майнер.
+    -- Проверяем их раньше склада: "Положить на склад майнера" тоже содержит "склад майнера"
     if low:find("положить на склад") then
+        if not miner.active then return nil end
         local inp = Miner.ParsePutInput(text)
         inp.kind = "put"
         inp.id = dialogId
@@ -5469,11 +5613,23 @@ function Miner.HandleDialog(dialogId, style, title, text)
     end
 
     if low:find("забрать") then
+        if not miner.active then return nil end
         local inp = Farmer.ParseTakeInput(text)
         inp.kind = "take"
         inp.id = dialogId
         miner.input = inp
         miner.last = { kind = "takeInput", id = dialogId, style = style }
+        miner.dialogSeq = miner.dialogSeq + 1
+        return false
+    end
+
+    if low:find("склад майнера") then
+        if not miner.active then return nil end
+        local ware = Miner.ParseWare(text, style)
+        ware.id = dialogId
+        miner.ware = ware
+        miner.wareAt = os.time()
+        miner.last = { kind = "ware", id = dialogId, style = style }
         miner.dialogSeq = miner.dialogSeq + 1
         return false
     end
@@ -5535,6 +5691,30 @@ function Miner.WaitAdvance(startSeq)
         end
     end
     return nil
+end
+
+-- Закрывает всё, что осталось открытым. Отвечаем именно тому диалогу, который пришёл последним:
+-- на Cancel сервер часто возвращает предыдущее окно, а ответ по устаревшему id он игнорирует,
+-- и тогда на экране висит "мёртвый" диалог, который уже ничего не открывает
+function Miner.CloseChain(limit)
+    limit = tonumber(limit) or 4
+    local interval = tonumber(settings.miner.waitInterval) or 10
+    for _ = 1, limit do
+        local id = miner.last and miner.last.id
+        if id == nil then break end
+        local seq = miner.dialogSeq
+        Miner.Respond(id, 0, 0, "")
+        local deadline = os.clock() + 0.35
+        while os.clock() < deadline and miner.dialogSeq == seq do
+            wait(interval)
+        end
+        -- сервер ничего не прислал в ответ - значит закрылось всё
+        if miner.dialogSeq == seq then break end
+    end
+    miner.last = { kind = nil, id = nil, style = nil }
+    if miner.menu then miner.menu.id = nil end
+    if miner.ware then miner.ware.id = nil end
+    miner.menuOpen = false
 end
 
 function Miner.OpenWarehouse()
@@ -5612,7 +5792,12 @@ function Miner.DoTake()
         local amount = tonumber(miner.input.max) or 0
         local nm = (miner.input.name ~= nil and miner.input.name ~= "") and miner.input.name or item.name
         Miner.Log("Количество к забору: " .. tostring(amount), true)
-        if amount > 0 then
+        if Miner.IsCharge(nm) then
+            -- на складе строка могла называться иначе, чем в окне забора - отменяем и больше её не трогаем
+            Miner.Respond(miner.input.id, 0, 0, "")
+            if item.line ~= nil then miner.skipLines[item.line] = true end
+            Miner.Log(string.format("Пропустил %s: зарядку майнера не забираем", tostring(nm)))
+        elseif amount > 0 then
             Miner.Respond(miner.input.id, 1, 0, tostring(amount))
             Miner.AddCollected(nm, amount)
             -- диалог закрывается полностью; следующий проход откроет меню через Alt
@@ -5633,9 +5818,20 @@ function Miner.DoFill()
     miner.statusText = "Заряжаю майнера..."
     local seq = miner.dialogSeq
     Miner.Respond(miner.ware.id, 1, miner.ware.putLine, "")
-    if Miner.WaitAdvance(seq) ~= "putInput" then return end
-    local missing = math.maxEx(0, (tonumber(miner.input.minerMax) or 0) - (tonumber(miner.input.minerNow) or 0))
+    if Miner.WaitAdvance(seq) ~= "putInput" then
+        -- окно осталось у игрока: если он зарядит руками, скрипт этого не увидит и в лог не запишет
+        Miner.Log("Окно зарядки не открылось - зарядка не залита и не посчитана")
+        return
+    end
+    -- заряжаем не выше заданного в настройках уровня (по умолчанию - полный заряд)
+    local minerMax = tonumber(miner.input.minerMax) or 0
+    local cap = tonumber(settings.miner.fillTarget) or Miner.CHARGE_MAX
+    -- ползунок на максимуме = без ограничения: заряжаем столько, сколько принимает майнер
+    local target = (cap >= Miner.CHARGE_MAX) and minerMax or math.minEx(cap, minerMax)
+    local missing = math.maxEx(0, target - (tonumber(miner.input.minerNow) or 0))
     local amount = math.minEx(missing, tonumber(miner.input.have) or 0)
+    Miner.Log(string.format("Окно зарядки: у вас %d, у майнера %d/%d, зальём %d",
+        tonumber(miner.input.have) or 0, tonumber(miner.input.minerNow) or 0, minerMax, amount), true)
     if amount > 0 then
         Miner.Respond(miner.input.id, 1, 0, tostring(amount))
         Miner.AddCharge(amount)
@@ -5643,26 +5839,30 @@ function Miner.DoFill()
         miner.chargeNow = math.minEx(tonumber(miner.chargeMax) or 0, (tonumber(miner.chargeNow) or 0) + amount)
     else
         Miner.Respond(miner.input.id, 0, 0, "")
-        Miner.Log(missing <= 0 and "Майнер уже заряжен полностью" or "У вас с собой нет зарядки")
+        if missing > 0 then
+            Miner.Log("У вас с собой нет зарядки")
+        elseif target < minerMax then
+            Miner.Log(string.format("Майнер уже заряжен до заданного уровня (%d из %d)", target, minerMax))
+        else
+            Miner.Log("Майнер уже заряжен полностью")
+        end
     end
 end
 
 function Miner.Finish(reason)
-    if miner.ware and miner.ware.id then
-        Miner.Respond(miner.ware.id, 0, 0, "")
-        wait(120)
+    -- Свежие "У вас: N" и заряд майнера сервер показывает только в окне пополнения:
+    -- заглядываем туда, пока склад ещё открыт
+    if miner.last.kind == "ware" and miner.ware and miner.ware.id and miner.ware.putLine ~= nil then
+        miner.statusText = "Обновляю заряд..."
+        Miner.PeekCharge()
     end
+    Miner.CloseChain()
     -- Переоткрываем меню через Alt, чтобы подтянуть свежие данные (склад/статус) после сбора/зарядки
     miner.statusText = "Обновляю данные..."
     Miner.ReopenMenuViaAlt()
-    if miner.menu and miner.menu.id then
-        Miner.Respond(miner.menu.id, 0, 0, "")
-        wait(60)
-    end
+    Miner.CloseChain()
     Storage.RequestSaveMinerLog(true)
     miner.active = false
-    miner.menuOpen = false
-    if miner.menu then miner.menu.id = nil end
     miner.statusText = tostring(reason or "Готово")
 
     local parts = {}
@@ -5674,21 +5874,16 @@ function Miner.Finish(reason)
     Miner.Log(tostring(reason or "Готово"))
 end
 
--- Открыть склад майнера, обновить данные о содержимом и закрыть диалоги
--- Заряд майнера сервер показывает только в окне пополнения:
--- открываем его, считываем "Имеется у майнера: N / M" и закрываем
+-- Заряд майнера и остаток зарядки у игрока сервер показывает только в окне пополнения:
+-- открываем его и считываем "Имеется у Вас: N" и "Имеется у майнера: N / M".
+-- Окно остаётся открытым - закрывает его вызывающий через Miner.CloseChain()
 function Miner.PeekCharge()
     if not (miner.ware and miner.ware.id and miner.ware.putLine ~= nil) then
         return false
     end
     local seq = miner.dialogSeq
     Miner.Respond(miner.ware.id, 1, miner.ware.putLine, "")
-    if Miner.WaitAdvance(seq) ~= "putInput" then
-        return false
-    end
-    Miner.Respond(miner.input.id, 0, 0, "")
-    wait(120)
-    return true
+    return Miner.WaitAdvance(seq) == "putInput"
 end
 
 function Miner.CheckWare()
@@ -5700,31 +5895,44 @@ function Miner.CheckWare()
     Miner.Log("Смотрю, что лежит на складе майнера")
     local ok = Miner.EnsureWare()
 
-    -- содержимое склада уже разобрано, дальше читаем заряд из окна пополнения;
-    -- отмена в нём закрывает и склад, так что отдельно закрывать уже нечего
-    local closed = false
+    -- содержимое склада уже разобрано, дальше читаем заряд из окна пополнения
     if ok then
         miner.statusText = "Проверяю заряд майнера..."
-        closed = Miner.PeekCharge()
-        if not closed then
+        if not Miner.PeekCharge() then
             Miner.Log("Заряд майнера прочитать не удалось", true)
         end
     end
 
-    if not closed then
-        if miner.ware and miner.ware.id then
-            Miner.Respond(miner.ware.id, 0, 0, "")
-            wait(120)
-        end
-        if miner.menu and miner.menu.id then
-            Miner.Respond(miner.menu.id, 0, 0, "")
-            wait(60)
-        end
-    end
+    Miner.CloseChain()
     miner.active = false
-    miner.menuOpen = false
-    if miner.menu then miner.menu.id = nil end
     miner.statusText = ok and "Склад майнера обновлён" or "Не удалось открыть склад майнера"
+end
+
+-- Переключить статус майнера (собирает / не собирает).
+-- Меню на сервере к этому моменту обычно уже закрыто, поэтому открываем его заново через Alt
+function Miner.ToggleStatus()
+    if not Miner.EnsureMenu() then
+        miner.active = false
+        return
+    end
+    if miner.menu.statusLine == nil then
+        Miner.Log("В меню майнера нет строки статуса")
+        Miner.CloseChain()
+        miner.active = false
+        miner.statusText = "Статус переключить не удалось"
+        return
+    end
+
+    miner.statusText = "Переключаю статус..."
+    local seq = miner.dialogSeq
+    Miner.Respond(miner.menu.id, 1, miner.menu.statusLine, "")
+    -- сервер возвращает меню с новым статусом - его и разберём
+    Miner.WaitAdvance(seq)
+    Miner.CloseChain()
+    miner.active = false
+    local st = (miner.menu.status ~= nil and miner.menu.status ~= "") and miner.menu.status or "?"
+    miner.statusText = "Статус: " .. tostring(st)
+    Miner.Log("Статус майнера: " .. tostring(st))
 end
 
 function Miner.Process()
@@ -5733,12 +5941,17 @@ function Miner.Process()
         Miner.CheckWare()
         return
     end
+    if miner.mode == "status" then
+        Miner.ToggleStatus()
+        return
+    end
     if not Miner.EnsureMenu() then
         miner.active = false
         return
     end
     miner.collected = {}
     miner.chargeSpent = 0
+    miner.skipLines = {}
     miner.logs = {}
     local doTake = (miner.mode == "take" or miner.mode == "both")
     local doFill = (miner.mode == "fill" or miner.mode == "both")
@@ -6693,11 +6906,11 @@ function Draw.FarmerMain()
     -- Статус-кнопка: зелёная если фермер собирает, жёлтая если нет
     local collecting = tostring(st):find("Собирает") ~= nil
 
-    -- переключать статус можно только пока открыт диалог меню на сервере
-    local canToggle = (farmer.menu and farmer.menu.id) ~= nil and not farmer.active
+    -- меню на сервере скрипт закрывает за собой, поэтому по клику открываем его заново через Alt
+    local canToggle = not farmer.active and (farmer.menu and farmer.menu.statusLine) ~= nil
     if collecting then
         if imgui.ButtonClickable(canToggle, u8("Статус: " .. tostring(st))) then
-            sampSendDialogResponse(farmer.menu.id, 1, 0, "")
+            Farmer.Start("status")
         end
     else
         local stCol = HexToVec4(COLORS.YELLOW)
@@ -6708,7 +6921,7 @@ function Draw.FarmerMain()
         imgui.PushStyleColor(imgui.Col.Text,          imgui.ImVec4(0.10, 0.10, 0.10, 1.0))
 
         if imgui.ButtonClickable(canToggle, u8("Статус: " .. tostring(st))) then
-            sampSendDialogResponse(farmer.menu.id, 1, 0, "")
+            Farmer.Start("status")
         end
 
         imgui.PopStyleColor(4)
@@ -6741,7 +6954,7 @@ function Draw.FarmerMain()
         Farmer.Start("fill")
     end
     imgui.SameLine()
-    if imgui.AccentButtonClickable(not farmer.active, fa.PLAY .. u8"\tСобрать всё", imgui.ImVec2(-1, 0)) then
+    if imgui.AccentButtonClickable(not farmer.active, fa.PLAY .. u8"\tСделать всё", imgui.ImVec2(-1, 0)) then
         Farmer.Start("both")
     end
 
@@ -6758,6 +6971,12 @@ function Draw.FarmerMain()
         Storage.SaveSettings()
     end
 
+    local checkIcon = settings.farmer.refreshOnOpen and fa.TOGGLE_ON or fa.TOGGLE_OFF
+    if imgui.Button(checkIcon .. "\t" .. (settings.farmer.refreshOnOpen and u8"Проверка склада при открытии меню: вкл" or u8"Проверка склада при открытии меню: выкл") .. "##farmer_refresh_on_open", imgui.ImVec2(halfW, 0)) then
+        settings.farmer.refreshOnOpen = not settings.farmer.refreshOnOpen
+        Storage.SaveSettings()
+    end
+    imgui.SameLine()
     if imgui.ButtonClickable(not farmer.active, fa.WAREHOUSE .. u8"	Проверить склад фермы", imgui.ImVec2(-1, 0)) then
         Farmer.Start("check")
     end
@@ -7132,6 +7351,17 @@ function Draw.FarmerSettings()
     end
 
     imgui.Spacing()
+    imgui.Text(u8"Заливать воду фермеру не выше:")
+    imgui.PushItemWidth(-1)
+    local _fillTarget = new.int(tonumber(settings.farmer.fillTarget) or Farmer.WATER_MAX)
+    if imgui.SliderInt("##farmFillTarget", _fillTarget, 0, Farmer.WATER_MAX, u8"%d") then
+        settings.farmer.fillTarget = math.maxEx(0, math.minEx(Farmer.WATER_MAX, _fillTarget[0]))
+        Storage.SaveSettings()
+    end
+    imgui.PopItemWidth()
+    imgui.TextDisabled(u8(string.format("Остальная вода остаётся с собой. По умолчанию %d - заполняется полностью.", Farmer.WATER_MAX)))
+
+    imgui.Spacing()
     imgui.Separator()
     imgui.Spacing()
 
@@ -7192,11 +7422,11 @@ function Draw.MinerMain()
     -- Статус-кнопка: зелёная если майнер собирает, жёлтая если нет
     local collecting = tostring(st):find("обирает") ~= nil
 
-    -- переключать статус можно только пока открыт диалог меню на сервере
-    local canToggle = (miner.menu and miner.menu.id) ~= nil and not miner.active
+    -- меню на сервере скрипт закрывает за собой, поэтому по клику открываем его заново через Alt
+    local canToggle = not miner.active and (miner.menu and miner.menu.statusLine) ~= nil
     if collecting then
         if imgui.ButtonClickable(canToggle, u8("Статус: " .. tostring(st))) then
-            sampSendDialogResponse(miner.menu.id, 1, miner.menu.statusLine or 0, "")
+            Miner.Start("status")
         end
     else
         local stCol = HexToVec4(COLORS.YELLOW)
@@ -7207,7 +7437,7 @@ function Draw.MinerMain()
         imgui.PushStyleColor(imgui.Col.Text,          imgui.ImVec4(0.10, 0.10, 0.10, 1.0))
 
         if imgui.ButtonClickable(canToggle, u8("Статус: " .. tostring(st))) then
-            sampSendDialogResponse(miner.menu.id, 1, miner.menu.statusLine or 0, "")
+            Miner.Start("status")
         end
 
         imgui.PopStyleColor(4)
@@ -7240,7 +7470,7 @@ function Draw.MinerMain()
         Miner.Start("fill")
     end
     imgui.SameLine()
-    if imgui.AccentButtonClickable(not miner.active, fa.PLAY .. u8"\tСобрать всё", imgui.ImVec2(-1, 0)) then
+    if imgui.AccentButtonClickable(not miner.active, fa.PLAY .. u8"\tСделать всё", imgui.ImVec2(-1, 0)) then
         Miner.Start("both")
     end
 
@@ -7257,6 +7487,12 @@ function Draw.MinerMain()
         Storage.SaveSettings()
     end
 
+    local checkIcon = settings.miner.refreshOnOpen and fa.TOGGLE_ON or fa.TOGGLE_OFF
+    if imgui.Button(checkIcon .. "\t" .. (settings.miner.refreshOnOpen and u8"Проверка склада при открытии меню: вкл" or u8"Проверка склада при открытии меню: выкл") .. "##miner_refresh_on_open", imgui.ImVec2(halfW, 0)) then
+        settings.miner.refreshOnOpen = not settings.miner.refreshOnOpen
+        Storage.SaveSettings()
+    end
+    imgui.SameLine()
     if imgui.ButtonClickable(not miner.active, fa.WAREHOUSE .. u8"\tПроверить склад майнера", imgui.ImVec2(-1, 0)) then
         Miner.Start("check")
     end
@@ -7280,10 +7516,17 @@ function Draw.MinerMain()
 
     imgui.Spacing()
     Draw.SectionTitle(Draw.WareTitle(miner.wareAt))
-    local wareItems = (miner.ware or {}).items or {}
-    if #wareItems > 0 then
+    local ware = miner.ware or {}
+    local wareItems = ware.items or {}
+    local hasCharge = ware.chargeLine ~= nil
+    if #wareItems > 0 or hasCharge then
         for i, it in ipairs(wareItems) do
             Draw.WareRow(i, it.name, it.count)
+        end
+        -- зарядку скрипт не забирает, показываем её отдельной строкой
+        if hasCharge then
+            local chargeName = (ware.chargeName ~= nil and ware.chargeName ~= "") and ware.chargeName or "Зарядка"
+            Draw.WareRow(#wareItems + 1, chargeName, ware.chargeInWare, COLORS.YELLOW)
         end
     else
         imgui.TextDisabled(u8"Пока неизвестно - нажмите \"Проверить склад майнера\"")
@@ -7310,6 +7553,17 @@ function Draw.MinerSettings()
         settings.miner.autoFill = not settings.miner.autoFill
         Storage.SaveSettings()
     end
+
+    imgui.Spacing()
+    imgui.Text(u8"Заряжать майнера не выше:")
+    imgui.PushItemWidth(-1)
+    local _fillTarget = new.int(tonumber(settings.miner.fillTarget) or Miner.CHARGE_MAX)
+    if imgui.SliderInt("##minerFillTarget", _fillTarget, 0, Miner.CHARGE_MAX, u8"%d") then
+        settings.miner.fillTarget = math.maxEx(0, math.minEx(Miner.CHARGE_MAX, _fillTarget[0]))
+        Storage.SaveSettings()
+    end
+    imgui.PopItemWidth()
+    imgui.TextDisabled(u8(string.format("Остальная зарядка остаётся с собой. По умолчанию %d - майнер заряжается доверху.", Miner.CHARGE_MAX)))
 
     imgui.Spacing()
     imgui.Separator()
