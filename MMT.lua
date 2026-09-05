@@ -5,7 +5,7 @@
 script_authors('Sand')
 script_name('MMT | Mining Tool')
 script_description('Mining assistant TG: @Mister_Sand')
-script_version("2.1")
+script_version("2.2")
 
 -- =====================================================================================================================
 --                                                          Import
@@ -252,6 +252,10 @@ local defaultSettings = {
         timeoutShelf = 10,
         -- Ждать перед отправкой ответа на диалог
         waitRun = 0,
+        -- Повторов, если сервер не ответил на открытие полки
+        shelfRetries = 2,
+        -- Повторов дома, который не отработал целиком
+        houseRetries = 1,
         -- Пуза после получения результата
         improve_waitResult = 500,
         -- Пуза перед нажатием на видеокарту в инвентаре
@@ -382,6 +386,12 @@ local stateCrypto = {
     queueHouses = {},
     -- Прогресс полок
     progressShelves = 0,
+    -- Счётчик всех показанных диалогов и номер последнего списка полок.
+    -- По ним видно, открыт ли список сейчас и прислал ли сервер его заново
+    dialogSerial = 0,
+    shelfListSerial = 0,
+    -- Сколько полок пропущено из-за зависших диалогов
+    shelvesSkipped = 0,
     -- Список полок в очереди
     queueShelves = {},
     -- Прогресс домов банка
@@ -1929,6 +1939,9 @@ function main()
 
     Chat.Add('Скрипт загружен. Команда активации: {'..settings.style.colorChat..'}/mmt{FFFFFF}.')
 
+    -- предупреждения о повреждённых файлах, найденных при загрузке
+    Storage.FlushBrokenFilesNotice()
+
     processInteractingThread = lua_thread.create_suspended(Interacting.Process)
     farmer.thread = lua_thread.create_suspended(Farmer.Process)
     miner.thread = lua_thread.create_suspended(Miner.Process)
@@ -1987,6 +2000,29 @@ local function HandleStateCryptoServerMessage(color, text)
 
     if text:find("У Вас недостаточно денежных средств!") and color == -1104335361 then
         Interacting.Deactivate()
+    end
+
+    -- Фактический вывод прибыли: сервер присылает точную сумму, которую реально выдал.
+    -- "Вы вывели {ffffff}9 BTC{ffff00}, осталось на счету видеокарты: {ffffff}0.043804 BTC{ffff00}."
+    if processes.take and text:find("осталось на счету видеокарты:") then
+        local clean = text:gsub("{%x%x%x%x%x%x}", "")
+        local rawAmount, currency = clean:match("Вы вывели%s*([%d%.]+)%s*(%u+)")
+        local amount = tonumber(rawAmount) or 0
+
+        if amount > 0 and (currency == "BTC" or currency == "ASC") then
+            local hid = stateCrypto.currentHouseId or 0
+            local queueShelf = stateCrypto.queueShelves[stateCrypto.progressShelves]
+
+            collectStats.total[currency] = (collectStats.total[currency] or 0) + amount
+            collectStats.house[hid] = collectStats.house[hid] or { BTC = 0, ASC = 0 }
+            collectStats.house[hid][currency] = (collectStats.house[hid][currency] or 0) + amount
+
+            Collect.AddLogEntry(hid, currency, amount)
+            Collect.SummaryTake(queueShelf, currency, amount)
+
+            Chat.Add(string.format("Сбор DEBUG: сервер выдал %s %s (дом %s)",
+                tostring(amount), tostring(currency), tostring(hid)), TYPECHATMESSAGES.DEBUG)
+        end
     end
 
     if processes.take and (
@@ -2235,17 +2271,8 @@ local function HandleTakeProfitDialog(dialogId, title)
         queueShelf.count = (queueShelf.count or 0) - (stateCrypto.takeCount or 0)
     end
 
-    if stateCrypto.takeCount and stateCrypto.takeCount > 0 and stateCrypto.takeCurrency then
-        local cur = stateCrypto.takeCurrency
-        local hid = stateCrypto.currentHouseId or 0
-
-        collectStats.total[cur] = (collectStats.total[cur] or 0) + stateCrypto.takeCount
-        collectStats.house[hid] = collectStats.house[hid] or { BTC = 0, ASC = 0 }
-        collectStats.house[hid][cur] = (collectStats.house[hid][cur] or 0) + stateCrypto.takeCount
-
-        Collect.AddLogEntry(hid, cur, stateCrypto.takeCount)
-        Collect.SummaryTake(queueShelf, cur, stateCrypto.takeCount)
-    end
+    -- Сумму не считаем здесь: подпись кнопки - не факт выплаты.
+    -- Статистику считаем по сообщению "Вы вывели N BTC/ASC" в HandleStateCryptoServerMessage.
 
     DialogUtils.waitAndSendDialogResponse(dialogId, 1, 0, "")
     stateCrypto.takeCount = 0
@@ -2266,6 +2293,29 @@ local function HandleShelfDialog(dialogId, title, text)
     local queueShelf = stateCrypto.queueShelves[stateCrypto.progressShelves]
     local onAction = nil
     local hasCollectableTakeAction = false
+    local actionDebug = {}
+
+    for _, value in ipairs(actions) do
+        table.insert(actionDebug, string.format("%s(count=%s,line=%s)",
+            tostring(value.action), tostring(value.count or 0), tostring(value.samp_line or "?")))
+    end
+    Chat.Add(string.format("Сбор DEBUG: диалог %s, take=%s, действий=[%s]",
+        tostring(dialogId), tostring(processes.take), table.concat(actionDebug, ", ")), TYPECHATMESSAGES.DEBUG)
+
+    -- У ASC-карты сервер иногда показывает фейковую кнопку BTC вместе с ASC.
+    -- Пропускаем такой BTC только если тип ASC уже определён в очереди полок.
+    local hasBtcTake, hasAscTake, isVideoCard = false, false, false
+    for _, value in ipairs(actions) do
+        if value.action == "take_btc" then hasBtcTake = true end
+        if value.action == "take_asc" then hasAscTake = true end
+        if value.action == "take_video_card" then isVideoCard = true end
+    end
+    local isAsicShelf = text:find("ASIC") ~= nil
+    local shelfCardType = queueShelf and queueShelf.card_type or nil
+    local skipStuckBtc = hasBtcTake and hasAscTake and shelfCardType == "ASC"
+    Chat.Add(string.format("Сбор DEBUG: BTC=%s, ASC=%s, video=%s, ASIC=%s, тип=%s, skipBTC=%s",
+        tostring(hasBtcTake), tostring(hasAscTake), tostring(isVideoCard),
+        tostring(isAsicShelf), tostring(shelfCardType or "?"), tostring(skipStuckBtc)), TYPECHATMESSAGES.DEBUG)
 
     for _, value in ipairs(actions) do
         if value.action == "on" and not onAction then
@@ -2273,10 +2323,13 @@ local function HandleShelfDialog(dialogId, title, text)
         end
 
         if processes.take then
-            if value.count > 0 and (value.action == "take_btc" or value.action == "take_asc") then
+            if value.count > 0 and (value.action == "take_btc" or value.action == "take_asc")
+                and not (skipStuckBtc and value.action == "take_btc") then
                 hasCollectableTakeAction = true
                 stateCrypto.takeCount = value.count
                 stateCrypto.takeCurrency = (value.action == "take_btc") and "BTC" or "ASC"
+                Chat.Add(string.format("Сбор DEBUG: отправляю действие %s, сумма=%s, строка=%s",
+                    tostring(value.action), tostring(value.count), tostring(value.samp_line)), TYPECHATMESSAGES.DEBUG)
                 DialogUtils.waitAndSendDialogResponse(dialogId, 1, value.samp_line, "")
                 return DialogReturnVisibility()
             end
@@ -2324,6 +2377,7 @@ local function HandleShelfDialog(dialogId, title, text)
     end
 
     if processes.take and queueShelf and not hasCollectableTakeAction then
+        Chat.Add("Сбор DEBUG: подходящее действие забора не найдено, закрываю диалог", TYPECHATMESSAGES.DEBUG)
         if settings.main.autoEnableCards and not queueShelf.work and (queueShelf.fill or 0) > 0 and onAction then
             queueShelf.work = true
             Collect.SummaryCardEnabled()
@@ -2374,7 +2428,8 @@ local function HandleLiquidChoiceDialog(dialogId, title, text)
             choice = "btc"
         elseif counts.supper_btc > 0 then
             choice = "supper_btc"
-        elseif not card and counts.asc > 0 then
+        elseif (not card or card == "ASIC") and counts.asc > 0 then
+            -- АСИК тоже принимает охлаждайку ASC
             choice = "asc"
         end
     end
@@ -2391,7 +2446,12 @@ local function HandleLiquidChoiceDialog(dialogId, title, text)
     end
 
     processes.fill = false
-    local reason = (card == "ASC") and "нет охлаждайки ASC" or "нет охлаждайки BTC/super"
+    local reason = "нет охлаждайки BTC/super"
+    if card == "ASC" then
+        reason = "нет охлаждайки ASC"
+    elseif not card or card == "ASIC" then
+        reason = "нет охлаждайки BTC/super/ASC"
+    end
     Chat.Add("Охлаждение: " .. reason .. " для текущей карты", TYPECHATMESSAGES.CRITICAL)
     return nil
 end
@@ -2406,6 +2466,9 @@ local function HandleVideoCardSelectionDialog(dialogId, title, text)
         idDialogs.selectVideoCardItemFlash = dialogId
     end
     idDialogs.selectVideoCard = dialogId
+    -- запоминаем, каким по счёту диалогом пришёл список: по этому номеру
+    -- процесс сбора понимает, что вернулся к списку, а не завис на карточке
+    stateCrypto.shelfListSerial = stateCrypto.dialogSerial or 0
     FlashCollect.ApplyWindowVisibility()
     -- не фермерский диалог - возвращаемся в раздел видеокарт
     if not farmer.active then
@@ -2531,6 +2594,7 @@ end
 function sampev.onShowDialog(dialogId, style, title, button1, button2, text)
 
     lastIDDialog = dialogId
+    stateCrypto.dialogSerial = (stateCrypto.dialogSerial or 0) + 1
 
     local minerHandled = Miner.HandleDialog(dialogId, style, title, text)
     if minerHandled ~= nil then
@@ -2880,11 +2944,12 @@ function DialogUtils.waitForDialog(expectedDialogId, timeoutSeconds)
         wait(settings.deley.waitInterval)
 
         if os.clock() > timeout then
-            return false, "Timeout waiting for dialog " .. tostring(expectedDialogId)
+            return false, string.format("диалог %s не пришёл за %d сек.",
+                tostring(expectedDialogId), math.floor(timeoutSeconds or settings.deley.timeoutDialog))
         end
 
         if not Interacting.IsActive() then
-            return false, "Process was interrupted"
+            return false, "процесс остановлен"
         end
     end
 
@@ -2905,11 +2970,12 @@ function DialogUtils.waitForAnyDialog(expectedDialogIds, timeoutSeconds)
 
         if os.clock() > timeout then
             local dialogNames = table.concat(expectedDialogIds, ", ")
-            return false, "Timeout waiting for any dialog: " .. dialogNames
+            return false, string.format("ни один из диалогов (%s) не пришёл за %d сек.",
+                dialogNames, math.floor(timeoutSeconds or settings.deley.timeoutDialog))
         end
 
         if not Interacting.IsActive() then
-            return false, "Process was interrupted"
+            return false, "процесс остановлен"
         end
     end
 end
@@ -2922,10 +2988,11 @@ function DialogUtils.sendResponseAndWait(dialogId, button, listitem, input, wait
         while not waitCondition() do
             wait(settings.deley.waitInterval)
             if os.clock() > timeout then
-                return false, "Timeout waiting for condition"
+                return false, string.format("сервер не ответил за %d сек.",
+                    math.floor(settings.deley.timeoutDialog))
             end
             if not Interacting.IsActive() then
-                return false, "Process was interrupted"
+                return false, "процесс остановлен"
             end
         end
     end
@@ -2978,44 +3045,120 @@ function ShelfProcessor.filterShelves()
     return filtered
 end
 
-function ShelfProcessor.process()
-    stateCrypto.progressShelves = 1
-    stateCrypto.queueShelves = ShelfProcessor.filterShelves()
+--- Сколько раз перезаходить на полку, если сервер не ответил
+function ShelfProcessor.MaxRetries()
+    return math.minEx(5, math.maxEx(0, tonumber(settings.deley.shelfRetries) or 2))
+end
 
-    if #stateCrypto.queueShelves == 0 then
-        Chat.Add("Отсутствуют полки для работы", TYPECHATMESSAGES.WARNING)
-        return true
+--- Список полок сейчас на экране (последним пришёл именно он)
+function ShelfProcessor.IsShelfListOpen()
+    local listSerial = stateCrypto.shelfListSerial or 0
+    return listSerial > 0 and listSerial == (stateCrypto.dialogSerial or 0)
+end
+
+--- Возврат к списку полок: закрываем всё, что сервер оставил открытым, пока он не
+--- пришлёт список заново. Заодно обновляются данные полок дома, поэтому повторная
+--- попытка идёт уже по свежему состоянию, а не по устаревшему.
+--- @return boolean recovered Список полок снова на экране
+function ShelfProcessor.BackToShelfList()
+    if ShelfProcessor.IsShelfListOpen() then return true end
+
+    local startSerial = stateCrypto.shelfListSerial or 0
+    local deadline = os.clock() + settings.deley.timeoutDialog
+
+    while (stateCrypto.shelfListSerial or 0) <= startSerial do
+        if not Interacting.IsActive() then return false end
+        if os.clock() > deadline then return false end
+
+        sampSendDialogResponse(lastIDDialog, 0, 0, "")
+        wait(300)
     end
 
-    for index, shelfData in ipairs(stateCrypto.queueShelves) do
-        Collect.SummaryVisit(shelfData)
+    return true
+end
 
-        local success, dialogId = DialogUtils.waitForAnyDialog({
+--- Одна полка: открыть, дождаться результата, при зависании вернуться к списку и повторить.
+--- @return string outcome "done" | "skipped" | "lost" | "cancelled"
+function ShelfProcessor.RunShelf(shelfData, index)
+    local attempts = ShelfProcessor.MaxRetries() + 1
+
+    for attempt = 1, attempts do
+        local listReady, listError = DialogUtils.waitForAnyDialog({
             idDialogs.selectVideoCardItemFlash,
             idDialogs.selectVideoCard
         })
 
-        if not success then
-            Chat.Add("Ошибка ожидания диалога полок: " .. dialogId, TYPECHATMESSAGES.CRITICAL)
-            return false
-        end
+        if not listReady then
+            if not Interacting.IsActive() then return "cancelled" end
 
-        local oldProgress = stateCrypto.progressShelves
-        local progressUpdated = function()
-            return stateCrypto.progressShelves ~= oldProgress
-        end
+            Chat.Add(string.format("Полка %d: %s", index, tostring(listError)), TYPECHATMESSAGES.WARNING)
+            if not ShelfProcessor.BackToShelfList() then return "lost" end
+        else
+            local startProgress = stateCrypto.progressShelves
+            local shelfDone = function()
+                return stateCrypto.progressShelves ~= startProgress
+            end
 
-        success, error = DialogUtils.sendResponseAndWait(
-            lastIDDialog, 1, shelfData.samp_line, "", progressUpdated
-        )
+            local ok, sendError = DialogUtils.sendResponseAndWait(
+                lastIDDialog, 1, shelfData.samp_line, "", shelfDone
+            )
 
-        if not success then
-            Chat.Add("Ошибка обработки полки: " .. error, TYPECHATMESSAGES.CRITICAL)
-            return false
+            if ok then return "done" end
+            if not Interacting.IsActive() then return "cancelled" end
+
+            Chat.Add(string.format("Полка %d: %s Возвращаюсь и пробую снова (%d из %d)",
+                index, tostring(sendError), attempt, attempts), TYPECHATMESSAGES.WARNING)
+
+            -- карточка видеокарты осталась открытой: закрываем её и берём свежий список
+            if not ShelfProcessor.BackToShelfList() then return "lost" end
         end
     end
 
-    return true
+    return "skipped"
+end
+
+--- @return string outcome "done" | "lost" | "cancelled"
+function ShelfProcessor.process()
+    stateCrypto.progressShelves = 1
+    stateCrypto.queueShelves = ShelfProcessor.filterShelves()
+    stateCrypto.shelvesSkipped = 0
+
+    if #stateCrypto.queueShelves == 0 then
+        Chat.Add("Отсутствуют полки для работы", TYPECHATMESSAGES.WARNING)
+        return "done"
+    end
+
+    for index, shelfData in ipairs(stateCrypto.queueShelves) do
+        -- пропущенные полки двигают прогресс сами, иначе обработчики диалогов
+        -- будут смотреть не на ту позицию очереди, что и цикл
+        if (stateCrypto.progressShelves or 0) < index then
+            stateCrypto.progressShelves = index
+        end
+
+        Collect.SummaryVisit(shelfData)
+
+        local outcome = ShelfProcessor.RunShelf(shelfData, index)
+
+        if outcome == "cancelled" then
+            return "cancelled"
+        elseif outcome == "lost" then
+            Chat.Add(string.format("Полка %d: не удалось вернуться к списку полок", index),
+                TYPECHATMESSAGES.WARNING)
+            return "lost"
+        elseif outcome == "skipped" then
+            stateCrypto.shelvesSkipped = (stateCrypto.shelvesSkipped or 0) + 1
+            stateCrypto.progressShelves = index + 1
+            Chat.Add(string.format("Полка %d пропущена: сервер так и не ответил", index),
+                TYPECHATMESSAGES.WARNING)
+        end
+    end
+
+    if (stateCrypto.shelvesSkipped or 0) > 0 then
+        Chat.Add(string.format("Пропущено полок из-за зависших диалогов: %d", stateCrypto.shelvesSkipped),
+            TYPECHATMESSAGES.WARNING)
+    end
+
+    return "done"
 end
 
 -- --------------------------------------------------------
@@ -3068,7 +3211,7 @@ function HouseProcessor.processBankHouses()
                 return false, "Timeout waiting for current bank house dialog"
             end
             if not Interacting.IsActive() then
-                return false, "Process was interrupted"
+                return false, "процесс остановлен"
             end
         end
     end
@@ -3156,6 +3299,70 @@ function HouseProcessor.processBankHouses()
     return true
 end
 
+--- Сколько раз перезаходить в дом, который не отработал целиком
+function HouseProcessor.MaxRetries()
+    return math.minEx(3, math.maxEx(0, tonumber(settings.deley.houseRetries) or 1))
+end
+
+--- Возврат к списку домов: закрываем всё, что осталось открытым.
+--- Раньше этот цикл был без таймаута и слал ответы каждые 10 мс - если сервер
+--- список так и не присылал, сбор вис намертво.
+--- @return boolean recovered Список домов снова на экране
+function HouseProcessor.BackToHouseList()
+    local deadline = os.clock() + settings.deley.timeoutDialog
+
+    while lastIDDialog ~= idDialogs.selectHouse do
+        if not Interacting.IsActive() then return false end
+        if os.clock() > deadline then return false end
+
+        sampSendDialogResponse(lastIDDialog, 0, 0, "")
+        wait(300)
+    end
+
+    return true
+end
+
+--- Один дом: открыть, дождаться полок, обойти их.
+--- @return string outcome "done" | "retry" | "cancelled"
+function HouseProcessor.RunHouse(houseData, index)
+    local listReady, listError = DialogUtils.waitForDialog(idDialogs.selectHouse)
+    if not listReady then
+        if not Interacting.IsActive() then return "cancelled" end
+        Chat.Add("Список домов: " .. tostring(listError), TYPECHATMESSAGES.WARNING)
+        return "retry"
+    end
+
+    -- Очищаем данные полок для нового дома
+    shelves = {}
+    stateCrypto.queueShelves = {}
+
+    sampSendDialogResponse(lastIDDialog, 1, houseData.samp_line, "")
+    lastOpenHouse = index
+    stateCrypto.currentHouseId = houses[index] and houses[index].house_number or nil
+    if stateCrypto.currentHouseId and not collectStats.house[stateCrypto.currentHouseId] then
+        collectStats.house[stateCrypto.currentHouseId] = { BTC = 0, ASC = 0 }
+    end
+
+    -- Ждем загрузки полок с таймаутом
+    local timeout = os.clock() + settings.deley.timeoutShelf
+    while #shelves == 0 do
+        wait(50)
+
+        if not Interacting.IsActive() then return "cancelled" end
+
+        if os.clock() > timeout then
+            Chat.Add("Не смог получить полки для дома " .. index, TYPECHATMESSAGES.WARNING)
+            return "retry"
+        end
+    end
+
+    local outcome = ShelfProcessor.process()
+    if outcome == "cancelled" then return "cancelled" end
+    if outcome == "lost" then return "retry" end
+
+    return "done"
+end
+
 function HouseProcessor.processRegularHouses()
     stateCrypto.progressHouses = 1
     stateCrypto.queueHouses = {}
@@ -3167,57 +3374,33 @@ function HouseProcessor.processRegularHouses()
     end
 
     for index, houseData in ipairs(stateCrypto.queueHouses) do
-        local success, error = DialogUtils.waitForDialog(idDialogs.selectHouse)
-        if not success then
-            Chat.Add("Interacting.Deactivate - " .. error, TYPECHATMESSAGES.CRITICAL)
-            return false
-        end
+        local attempts = HouseProcessor.MaxRetries() + 1
 
-        -- Очищаем данные полок для нового дома
-        shelves = {}
-        stateCrypto.queueShelves = {}
+        for attempt = 1, attempts do
+            local outcome = HouseProcessor.RunHouse(houseData, index)
 
-        sampSendDialogResponse(lastIDDialog, 1, houseData.samp_line, "")
-        lastOpenHouse = index
-        stateCrypto.currentHouseId = houses[index] and houses[index].house_number or nil
-        if stateCrypto.currentHouseId and not collectStats.house[stateCrypto.currentHouseId] then
-            collectStats.house[stateCrypto.currentHouseId] = { BTC = 0, ASC = 0 }
-        end
+            if outcome == "cancelled" then return false end
+            if outcome == "done" then break end
 
-        -- Ждем загрузки полок с таймаутом
-        local timeout = os.clock() + settings.deley.timeoutShelf
-        local shelvesLoaded = false
-
-        while not shelvesLoaded do
-            wait(50)
-
-            if #shelves > 0 then
-                shelvesLoaded = true
-            elseif os.clock() > timeout then
-                Chat.Add("Не смог получить полки для дома " .. index, TYPECHATMESSAGES.WARNING)
-                break
-            end
-
-            if not Interacting.IsActive() then
+            -- дом не отработал: возвращаемся к списку домов и заходим заново
+            if not HouseProcessor.BackToHouseList() then
+                Chat.Add("Не удалось вернуться к списку домов, сбор остановлен", TYPECHATMESSAGES.CRITICAL)
                 return false
             end
-        end
 
-        if shelvesLoaded then
-            local shelfSuccess = ShelfProcessor.process()
-            if not shelfSuccess then
-                return false
+            if attempt < attempts then
+                Chat.Add(string.format("Дом %d: перепроверяю (попытка %d из %d)",
+                    index, attempt + 1, attempts), TYPECHATMESSAGES.WARNING)
+            else
+                Chat.Add(string.format("Дом %d пропущен после %d попыток, иду к следующему",
+                    index, attempts), TYPECHATMESSAGES.WARNING)
             end
         end
 
         -- Закрываем диалог дома
-        while lastIDDialog ~= idDialogs.selectHouse do
-            sampSendDialogResponse(lastIDDialog, 0, 0, "")
-            wait(settings.deley.waitInterval)
-
-            if not Interacting.IsActive() then
-                return false
-            end
+        if not HouseProcessor.BackToHouseList() then
+            Chat.Add("Не удалось вернуться к списку домов, сбор остановлен", TYPECHATMESSAGES.CRITICAL)
+            return false
         end
 
         stateCrypto.progressHouses = stateCrypto.progressHouses + 1
@@ -3287,7 +3470,7 @@ function Interacting.Process()
     if #houses > 0 then
         success = HouseProcessor.processRegularHouses()
     else
-        success = ShelfProcessor.process()
+        success = ShelfProcessor.process() ~= "cancelled"
     end
 
     if not success then
@@ -3982,16 +4165,90 @@ end
 --                           Load
 -- --------------------------------------------------------
 
-function Storage.LoadJSON(filePatch)
+-- Сообщения о повреждённых файлах копятся до старта main(): Chat.Add работает
+-- только после загрузки настроек, а Settings.json читается самым первым
+Storage.brokenFilesNotice = {}
+
+function Storage.NoticeBrokenFile(message)
+    print("[MMT] "..tostring(message))
+    table.insert(Storage.brokenFilesNotice, tostring(message))
+end
+
+--- Выводит накопленные предупреждения в чат. Вызывается из main()
+function Storage.FlushBrokenFilesNotice()
+    if #Storage.brokenFilesNotice == 0 then return end
+
+    for _, message in ipairs(Storage.brokenFilesNotice) do
+        Chat.Add(message, TYPECHATMESSAGES.WARNING)
+    end
+    Storage.brokenFilesNotice = {}
+end
+
+--- Убирает нечитаемый файл в сторону, чтобы скрипт стартовал с чистого листа,
+--- а сам файл остался для разбора
+function Storage.QuarantineBrokenFile(filePatch, reason)
+    local _broken = filePatch..".broken"
+    os.remove(_broken)
+
+    if not os.rename(filePatch, _broken) then
+        os.remove(filePatch)
+        _broken = nil
+    end
+
+    Storage.NoticeBrokenFile(string.format("Файл %s повреждён (%s).%s",
+        filePatch, tostring(reason),
+        _broken and (" Копия для разбора: ".._broken) or " Файл удалён."))
+end
+
+--- Читает и разбирает JSON.
+--- @return table|nil data Данные файла
+--- @return string|nil reason Причина, если файл есть, но не читается.
+---         nil в обоих значениях - файла просто нет или он пустой, это не ошибка
+function Storage.ReadJSONFile(filePatch)
     local _file = io.open(filePatch, "rb")
+    if not _file then return nil, nil end
 
-    if _file then
-        local _content = _file:read("*a")
-        _file:close()
+    local _content = _file:read("*a")
+    _file:close()
 
-        if _content and _content:match("%S") then
-            return json.decode(_content)
-        end
+    if not _content or not _content:match("%S") then return nil, nil end
+
+    -- блокнот и подобные редакторы дописывают BOM, cjson на нём падает
+    if _content:sub(1, 3) == "\239\187\191" then
+        _content = _content:sub(4)
+        if not _content:match("%S") then return nil, nil end
+    end
+
+    local _ok, _data = pcall(json.decode, _content)
+
+    if not _ok then
+        -- из "MMT.lua:4040: текст ошибки" оставляем только текст
+        local _reason = tostring(_data)
+        _reason = _reason:gsub("^.-:%d+:%s*", "")
+        return nil, _reason
+    end
+
+    if type(_data) ~= "table" then return nil, "внутри не объект JSON" end
+
+    return _data, nil
+end
+
+--- Битый файл не должен ронять весь скрипт. Обычно он получается, когда игра падает
+--- во время записи: размер файла Windows уже увеличила, а данные сбросить не успела,
+--- и внутри остаются нули - cjson отвечает на них
+--- "JSON parser does not support UTF-16 or UTF-32" и бросает ошибку наружу.
+function Storage.LoadJSON(filePatch)
+    local _data, _reason = Storage.ReadJSONFile(filePatch)
+    if _data then return _data end
+    if not _reason then return {} end
+
+    Storage.QuarantineBrokenFile(filePatch, _reason)
+
+    -- рядом лежит предыдущее удачное сохранение - шанс не потерять логи
+    local _backup = Storage.ReadJSONFile(filePatch..".bak")
+    if _backup then
+        Storage.NoticeBrokenFile(string.format("Данные восстановлены из %s.bak", filePatch))
+        return _backup
     end
 
     return {}
@@ -4038,20 +4295,50 @@ end
 --                           Save
 -- --------------------------------------------------------
 
+--- Пишет JSON через временный файл и подменяет им основной. Прямая запись в основной
+--- файл оставляла после падения игры обрезанный или забитый нулями JSON, из-за чего
+--- скрипт потом не стартовал. Предыдущее сохранение остаётся рядом как .bak.
 function Storage.SaveJSON(filePatch, data)
     local folderPath = string.match(filePatch, "^(.*[/\\])")
     if folderPath then
         Util.EnsureDirectoryExists(folderPath)
     end
 
-    local _file = io.open(filePatch, "w")
-    if _file then
-        _file:write(json.encode(data))
-        _file:close()
-        return true
-    else
+    -- кодируем до открытия файла: ошибка кодирования не должна обнулять то,
+    -- что уже лежит на диске
+    local _ok, _encoded = pcall(json.encode, data)
+    if not _ok or type(_encoded) ~= "string" then
+        print("[MMT] Не удалось закодировать "..filePatch..": "..tostring(_encoded))
         return false
     end
+
+    local _tempPatch = filePatch..".tmp"
+    local _file = io.open(_tempPatch, "wb")
+    if not _file then return false end
+
+    local _written = pcall(_file.write, _file, _encoded)
+    _file:close()
+
+    if not _written then
+        os.remove(_tempPatch)
+        return false
+    end
+
+    -- прошлую версию не удаляем, а отводим в .bak: если игра упадёт между
+    -- переименованиями, данные останутся хотя бы в одном из двух файлов
+    local _backupPatch = filePatch..".bak"
+    os.remove(_backupPatch)
+    os.rename(filePatch, _backupPatch)
+
+    if not os.rename(_tempPatch, filePatch) then
+        -- подменить не вышло: возвращаем прошлую версию на место
+        os.rename(_backupPatch, filePatch)
+        os.remove(_tempPatch)
+        print("[MMT] Не удалось заменить "..filePatch.." новой версией")
+        return false
+    end
+
+    return true
 end
 
 function Storage.SaveSettings()
@@ -8730,6 +9017,24 @@ function Draw.Settings()
                 Storage.SaveSettings()
             end
             imgui.TextDisabled(u8"Пауза перед отправкой ответа в диалог")
+
+            imgui.Spacing()
+
+            imgui.Text(u8"Повторов при зависшей полке:")
+            local _shelfRetries = new.int(tonumber(settings.deley.shelfRetries) or 2)
+            if imgui.SliderInt("##shelfRetries", _shelfRetries, 0, 5, u8"%d") then
+                settings.deley.shelfRetries = _shelfRetries[0]
+                Storage.SaveSettings()
+            end
+            imgui.TextDisabled(u8"Если сервер не ответил на открытие полки, скрипт закроет\nкарточку видеокарты, вернётся к списку и попробует снова")
+
+            imgui.Text(u8"Повторов при зависшем доме:")
+            local _houseRetries = new.int(tonumber(settings.deley.houseRetries) or 1)
+            if imgui.SliderInt("##houseRetries", _houseRetries, 0, 3, u8"%d") then
+                settings.deley.houseRetries = _houseRetries[0]
+                Storage.SaveSettings()
+            end
+            imgui.TextDisabled(u8"Сколько раз перезайти в дом, если он не отработал целиком.\nПосле этого дом пропускается, а сбор идёт дальше")
 
             imgui.Spacing()
             imgui.Separator()
