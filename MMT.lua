@@ -5,7 +5,7 @@
 script_authors('Sand')
 script_name('MMT | Mining Tool')
 script_description('Mining assistant TG: @Mister_Sand')
-script_version("2.2")
+script_version("2.3")
 
 -- =====================================================================================================================
 --                                                          Import
@@ -199,6 +199,8 @@ local defaultSettings = {
         logsPeriod = 7,
         -- Вид логов теплиц: "table" | "graph"
         logsView = "table",
+        -- Напомнить в Telegram, если не было сбора с теплиц (в минутах, 0 = выкл)
+        notifyMinutes = 0,
     },
     miner = {
         -- Обновлять содержимое склада при открытии меню майнера
@@ -225,6 +227,61 @@ local defaultSettings = {
         logsPeriod = 7,
         -- Вид логов майнера: "table" | "graph"
         logsView = "table",
+        -- Напомнить в Telegram, если не было сбора с майнера (в минутах, 0 = выкл)
+        notifyMinutes = 0,
+    },
+    mirage = {
+        -- Забирать монеты сразу при открытии сарая миража
+        autoTake = false,
+        -- Не открывать окно скрипта, когда монеты забирает автосбор
+        hideOnAutoTake = false,
+        -- В каком радиусе показывать сараи в списке "Сараи рядом", метров
+        nearRadius = 50,
+        -- Напомнить в Telegram, если сарай давно не собирали (в минутах, 0 = выкл)
+        notifyMinutes = 0,
+        -- Хранить логи сарая за N дней (0 = без ограничения)
+        logMaxDays = 60,
+        -- Период отображения логов (дней, 0 = всё время)
+        logsPeriod = 7,
+        -- Вид логов: "table" | "graph"
+        logsView = "table",
+    },
+    notifications = {
+        -- Версия формата: до 2 была одна общая галочка Telegram
+        version = 2,
+        -- Через какого бота: 1 = свой бот, 2 = MCR Notification
+        methodBot = 1,
+        -- Свой бот: токен и ID чата
+        botToken = "",
+        chatId = "",
+        -- ID пользователя в боте MCR Notification
+        mcrChatId = "",
+        -- Ключ MCR (пусто = взять из MCR ПК или MLoader)
+        mcrKey = "",
+        -- Напоминания в Telegram по событиям
+        tg = {
+            crypto = false,
+            greenhouse = false,
+            miner = false,
+            mirage = false,
+        },
+        -- Напоминания в игре (менеджер уведомлений, без него - сообщение в чат)
+        game = {
+            crypto = true,
+            greenhouse = true,
+            miner = true,
+            mirage = true,
+        },
+        -- [вид] = время сбора, о котором уже напомнили (повторно не шлём)
+        sent = {},
+    },
+    cloud = {
+        -- Отправлять сборы крипты, теплиц и майнера на сервер MCR (нужен ключ MCR)
+        sendCollects = true,
+        -- Какой лог показывать в разделе "Логи": "local" | "cloud"
+        logsSource = "local",
+        -- Период облачного лога, дней
+        period = 7,
     },
     improve = {
         -- true: улучшать все карты; false: только выбранную
@@ -245,6 +302,8 @@ local defaultSettings = {
         probeRetries = 2,
         -- Быстрая проверка: не переоткрывать /invent между картами
         fastProbe = true,
+        -- Брать уровни карт из пакетов инвентаря, а не из диалога по каждой карте
+        packetLevels = true,
     },
     deley = {
         timeoutDialog = 10,
@@ -327,9 +386,9 @@ local windowPos = nil
 local activeTabScript = "main"
 
 -- Активный раздел (режим) верхнего переключателя
-local activeMode = "cards"  -- "cards" | "farmer" | "miner"
-local MODE_ORDER = { "cards", "farmer", "miner" }
-local MODE_LABELS = { cards = "Видеокарты", farmer = "Фермер", miner = "Майнер" }
+local activeMode = "cards"  -- "cards" | "farmer" | "miner" | "mirage"
+local MODE_ORDER = { "cards", "farmer", "miner", "mirage" }
+local MODE_LABELS = { cards = "Видеокарты", farmer = "Фермер", miner = "Майнер", mirage = "Сарай миража" }
 
 local inputBlackHouse = new.int()
 local inputIncomeHouse = new.int()
@@ -352,6 +411,9 @@ local ui_state = {
         selectedDay = nil,
     },
     minerLogs = {
+        selectedDay = nil,
+    },
+    mirageLogs = {
         selectedDay = nil,
     },
     -- цвет меняли в этом кадре, сохранить настройки когда отпустят элемент
@@ -435,10 +497,8 @@ local collectStats = {
 local collectLogStore = { days = {}, meta = {} }
 local collectLogSave = { dirty = false, lastAt = 0, minInterval = 2 }
 local collectReminder = {
-    lastNotifiedCollectAt = 0,
-    notifyPending = false,
-    retryAfterAt = 0,
     lastTickAt = 0,
+    game = {},               -- [событие] = { notifiedAt, retryAt, pending } - напоминания в игре
     managerEnsurePending = false,
     managerDownloadPending = false,
     managerStatusMessage = "",
@@ -496,6 +556,29 @@ local miner = {
 
 -- Лог сбора с майнера (в одну кучу за день)
 local minerLog = { days = {}, dirty = false, lastSaveAt = 0 }
+
+-- Сарай миража: состояние, лог и функции модуля
+local Mirage = {
+    st = {
+        open = false,              -- окно сарая сейчас открыто на сервере
+        dialogId = nil,
+        dialogStyle = nil,
+        dialogAt = 0,
+        house = nil,
+        now = 0,                   -- монет в сарае
+        max = 10,
+        cost = 0,                  -- цена сбора
+        pending = nil,             -- забор отправлен, ждём подтверждения
+        sheds = {},                -- [дом или id надписи] = { id, house, coins, x, y, z, at }
+        shedKeys = {},             -- [id 3D-текста] = ключ сарая в sheds
+        sessionCoins = 0,
+        sessionSpent = 0,
+        sessionCollects = 0,
+        statusText = "",
+        logs = {},
+    },
+    log = { days = {}, dirty = false, lastSaveAt = 0, lastCollectAt = 0 },
+}
 
 -- Доступные полки
 local shelves = {}
@@ -597,6 +680,8 @@ local improve = {
         lastPacket = '',
         cards = {},
         inventoryFresh = false,   -- инвентарь уже открыт, можно кликать без /invent
+        inventoryOpen = false,    -- мы открывали инвентарь и ещё не закрывали его
+        inventoryBlockedUntil = 0,-- сервер попросил подождать перед следующим /invent
         unknownCount = 0,         -- сколько карт выбранного типа остались без уровня
         probing = false,
         probeDone = false,
@@ -611,6 +696,8 @@ local improve = {
         probeTotal = 0,
         watchdogMark = '',      -- слепок прогресса проверки для сторожа
         watchdogAt = 0,
+        pktLevels = {},         -- уровни карт из пакетов инвентаря: [слот] = { level, cardType, at }
+        pktInvAt = 0,           -- когда в последний раз приходил инвентарь пакетом
     },
 }
 
@@ -681,6 +768,246 @@ function Improve.CloseInventory()
     if type(sampSendClickTextdraw) ~= 'function' then return end
     pcall(sampSendClickTextdraw, 65535)
     improve.cef.inventoryFresh = false
+    improve.cef.inventoryOpen = false
+    -- сразу после закрытия сервер не даёт открыть инвентарь снова
+    improve.cef.inventoryBlockedUntil = os.clock() + 1.2
+end
+
+-- Сервер отвечает "Нельзя так быстро открывать инвентарь": ждём, пока он снова разрешит
+function Improve.WaitInventoryCooldown()
+    local guard = os.clock() + 6
+    while os.clock() < (improve.cef.inventoryBlockedUntil or 0) do
+        if os.clock() > guard then break end
+        wait(100)
+    end
+end
+
+-- =====================================================================================================================
+--                        Уровни видеокарт из пакетов инвентаря
+-- =====================================================================================================================
+-- При входе в игру и при каждом открытии инвентаря сервер присылает весь инвентарь
+-- набором пакетов, а дальше шлёт точечные обновления слотов. У видеокарты там уже есть
+-- уровень: unic_id = уровень, text = "N lvl", plus_btc/plus_asc = доход в час.
+-- Значит уровень можно взять из пакета и не открывать диалог по каждой карте.
+local CEF_CARD_ITEMS = { [1810] = 1, [5995] = 2 }
+
+function Improve.UsePacketLevels()
+    if type(settings) ~= 'table' or type(settings.improve) ~= 'table' then return false end
+    return settings.improve.packetLevels ~= false
+end
+
+-- Уровень карты из данных слота: unic_id, потом подпись "N lvl", потом доход в час
+function Improve.LevelFromSlotData(itemData)
+    local _level = tonumber(itemData.unic_id)
+
+    if not _level and type(itemData.text) == 'string' then
+        _level = tonumber(itemData.text:match('^%s*(%d+)%s*lvl%s*$'))
+    end
+
+    if not _level then
+        local _income = tonumber(itemData.plus_btc) or tonumber(itemData.plus_asc)
+        if _income then
+            for _lvl, _hourly in pairs(GPU_HOURLY_BY_LEVEL) do
+                if math.abs(_hourly - _income) < 0.0005 then
+                    _level = _lvl
+                    break
+                end
+            end
+        end
+    end
+
+    if not _level or _level < 1 or _level > 10 then return nil end
+    return _level
+end
+
+-- Уровень слота, который пришёл пакетом; nil, если такого слота не видели
+function Improve.PacketLevelForSlot(slot, cardType)
+    local _entry = improve.cef.pktLevels[tonumber(slot) or 0]
+    if type(_entry) ~= 'table' then return nil end
+    if cardType ~= nil and (tonumber(_entry.cardType) or 0) ~= (tonumber(cardType) or 0) then
+        return nil
+    end
+    return tonumber(_entry.level)
+end
+
+function Improve.ForgetPacketLevels()
+    improve.cef.pktLevels = {}
+    improve.cef.pktInvAt = 0
+end
+
+-- Запомнить уровень из пакета и сразу обновить карточку в списке
+function Improve.ApplyPacketCardSlot(slot, itemId, itemData)
+    local _cardType = CEF_CARD_ITEMS[itemId]
+    if not _cardType then return false end
+
+    local _level = Improve.LevelFromSlotData(itemData)
+    if not _level then return false end
+
+    improve.cef.pktLevels[slot] = { level = _level, cardType = _cardType, at = os.time() }
+
+    for _, c in ipairs(improve.cef.cards or {}) do
+        if (tonumber(c.slot) or 0) == slot and (tonumber(c.cardType) or 0) == _cardType then
+            if (not c.levelKnown) or (tonumber(c.level) or 0) ~= _level then
+                Improve.LogAdd('INFO', string.format('Пакет инвентаря: слот %d - уровень %d.', slot, _level))
+            end
+            c.level = _level
+            c.levelKnown = true
+            c.levelGuessed = false
+            c.probeFailed = false
+            Improve.CardCacheSet(c.slot, c.name, _level, _cardType, c.storageUpgrade)
+            break
+        end
+    end
+
+    return true
+end
+
+-- Разбор страницы инвентаря: {"action":0|2,"data":{"type":1,"items":[...]}}
+function Improve.ApplyPacketInventoryPage(page)
+    if type(page) ~= 'table' then return end
+
+    local _body = (type(page.data) == 'table') and page.data or page
+    if type(_body.items) ~= 'table' then return end
+    if (tonumber(_body.type) or 1) ~= 1 then return end
+
+    local _action = tonumber(page.action) or tonumber(_body.action)
+    if _action ~= nil and _action ~= 0 and _action ~= 2 then return end
+
+    for _, itemData in ipairs(_body.items) do
+        if type(itemData) == 'table' then
+            local _slot = tonumber(itemData.slot)
+            local _item = tonumber(itemData.item)
+            if _slot and _item then
+                Improve.ApplyPacketCardSlot(_slot, _item, itemData)
+            elseif _slot and itemData.item == nil then
+                -- слот опустел: прошлый уровень тут больше ни о чём не говорит
+                improve.cef.pktLevels[_slot] = nil
+            end
+        end
+    end
+
+    improve.cef.pktInvAt = os.clock()
+end
+
+-- Чтение CEF-пакета: ПК шлёт тип 17, мобильный клиент - тип 84 с iface/sub
+function Improve.ReadCefPacket(id, bs)
+    if id ~= 220 or not bs then return nil end
+
+    pcall(raknetBitStreamResetReadPointer, bs)
+
+    local _ok, _iface, _sub, _payload = pcall(function()
+        raknetBitStreamIgnoreBits(bs, 8)
+        local _type = raknetBitStreamReadInt8(bs)
+
+        if _type == 17 then
+            raknetBitStreamIgnoreBits(bs, 32)
+            local _len = raknetBitStreamReadInt16(bs)
+            local _encoded = raknetBitStreamReadInt8(bs)
+            if not _len or _len < 0 or _encoded == nil then return nil end
+            if _encoded ~= 0 then
+                return nil, nil, raknetBitStreamDecodeString(bs, _len + _encoded)
+            end
+            return nil, nil, raknetBitStreamReadString(bs, _len)
+        end
+
+        if _type == 84 then
+            local _ifaceId = raknetBitStreamReadInt8(bs)
+            local _subId = raknetBitStreamReadInt8(bs)
+            local _len = raknetBitStreamReadInt16(bs)
+            local _encoded = raknetBitStreamReadInt8(bs)
+            if not _len or _len < 0 or _encoded == nil then return nil end
+            if _encoded ~= 0 then
+                return _ifaceId, _subId, raknetBitStreamDecodeString(bs, _len + 1)
+            end
+            return _ifaceId, _subId, raknetBitStreamReadString(bs, _len)
+        end
+
+        return nil
+    end)
+
+    pcall(raknetBitStreamResetReadPointer, bs)
+
+    if not _ok or type(_payload) ~= 'string' or _payload == '' then return nil end
+    return _iface, _sub, _payload
+end
+
+-- Ловим пакеты инвентаря игрока и достаём из них уровни видеокарт
+function Improve.CaptureInventoryPacket(id, bs)
+    if not Improve.UsePacketLevels() then return end
+
+    local _iface, _sub, _payload = Improve.ReadCefPacket(id, bs)
+    if not _payload then return end
+
+    -- на мобильном инвентарь приходит по iface 52: sub 0 - весь, sub 2 - обновление
+    if _iface ~= nil and (_iface ~= 52 or (_sub ~= 0 and _sub ~= 2)) then return end
+
+    -- дешёвый фильтр: лавка (13 и 28) и прочие интерфейсы нам не нужны
+    if not _payload:find('"items"', 1, true) then return end
+    if _payload:find('"type":13', 1, true) or _payload:find('"type":28', 1, true) then return end
+
+    local _text = _payload:gsub('%z', '')
+    local _first = _text:sub(1, 1)
+    if _first ~= '{' and _first ~= '[' then
+        _text = _text:match('(%b[])') or _text:match('(%b{})') or ''
+    end
+    if _text == '' then return end
+
+    local _okJson, _data = pcall(json.decode, _text)
+    if not _okJson or type(_data) ~= 'table' then return end
+
+    if type(_data.data) == 'table' or type(_data.items) == 'table' then
+        Improve.ApplyPacketInventoryPage(_data)
+        return
+    end
+
+    for _, page in ipairs(_data) do
+        Improve.ApplyPacketInventoryPage(page)
+    end
+end
+
+addEventHandler('onReceivePacket', function(id, bs)
+    pcall(Improve.CaptureInventoryPacket, id, bs)
+end)
+
+-- Попросить сервер прислать инвентарь целиком: один такой запрос заменяет
+-- поштучную проверку карт. Вызывать только из потока - внутри есть wait
+function Improve.RequestInventoryDump(timeoutSec)
+    if not Improve.UsePacketLevels() then return false end
+
+    local _mark = improve.cef.pktInvAt or 0
+
+    -- на мобильном открытый диалог статуса мешает открыть инвентарь
+    if ISMONETLOADER then
+        Improve.CloseMobileStatusDialog(((tonumber(timeoutSec) or 5) * 1000) + 1000)
+    end
+
+    if improve.cef.inventoryOpen then
+        Improve.CloseInventory()
+    end
+    Improve.WaitInventoryCooldown()
+    improve.cef.inventoryOpen = true
+
+    if ISMONETLOADER then
+        Improve.SendCefMobile(52, 0, 4294967295, '""')
+    else
+        sampSendChat('/invent')
+    end
+
+    local _deadline = os.clock() + (tonumber(timeoutSec) or 5)
+    local _got = false
+    while os.clock() < _deadline do
+        wait(50)
+        if (improve.cef.pktInvAt or 0) > _mark then
+            _got = true
+            break
+        end
+    end
+
+    -- дамп приходит несколькими пакетами подряд, даём дойти остальным страницам
+    if _got then wait(400) end
+
+    Improve.CloseInventory()
+    return _got
 end
 
 -- Завершение проверки уровней: убираем за собой статус и инвентарь.
@@ -949,6 +1276,14 @@ function Improve.OpenCardDialog(slot, action, clickType, skipInvent)
     if skipInvent then
         wait(200)
     else
+        -- /invent переключает инвентарь: открытый он закроет, и клик уйдёт в пустоту.
+        -- Закрываем сами только то, что открывали, иначе сервер отвечает
+        -- "Нельзя так быстро открывать инвентарь" и команда пропадает впустую
+        if improve.cef.inventoryOpen then
+            Improve.CloseInventory()
+        end
+        Improve.WaitInventoryCooldown()
+        improve.cef.inventoryOpen = true
         sampSendChat('/invent')
         wait(inventWait)
     end
@@ -1064,7 +1399,7 @@ function FlashCollect.Fail(reason, chatType)
     Chat.Add(reason or "Сбор через флешку: ошибка", chatType or TYPECHATMESSAGES.CRITICAL)
 end
 
-function FlashCollect.Start(hideWindow)
+function FlashCollect.Start(hideWindow, fromCommand)
     if stateCrypto.work then
         Chat.Add("Сбор через флешку: процесс уже запущен", TYPECHATMESSAGES.WARNING)
         return false
@@ -1081,6 +1416,7 @@ function FlashCollect.Start(hideWindow)
     end
 
     flashCollect.hideWindow = hideWindow == true
+    flashCollect.fromCommand = fromCommand == true
 
     if flashCollect.thread and (flashCollect.thread:status() == "suspended"
         or flashCollect.thread:status() == "dead")
@@ -1210,6 +1546,8 @@ end
 function Improve.ResetCefInventory()
     improve.cef.cards = {}
     improve.cef.inventoryFresh = false
+    improve.cef.inventoryOpen = false
+    improve.cef.inventoryBlockedUntil = 0
     improve.cef.unknownCount = 0
     improve.cef.probing = false
     improve.cef.probeDone = false
@@ -1262,17 +1600,31 @@ function Improve.AddCefCardSlot(slot, itemName, hasStorageUpgrade, cardType)
             c.name = tostring(itemName or c.name or '')
             c.cardType = ctype
             c.storageUpgrade = storage or (c.storageUpgrade == true)
+
+            local _pktLevel = Improve.PacketLevelForSlot(slot, ctype)
+            if _pktLevel then
+                c.level = _pktLevel
+                c.levelKnown = true
+                c.levelGuessed = false
+                c.probeFailed = false
+            end
             return
         end
     end
 
     -- уровень берём из кэша, если он про этот же предмет и ещё не протух
+    -- пакет инвентаря знает уровень точно, кеш - только по памяти прошлых проверок
     local level, known = 0, false
+    local pktLevel = Improve.PacketLevelForSlot(slot, ctype)
     local cached = Improve.CardCacheGet(slot, itemName)
-    if cached and (tonumber(cached.cardType or 0) or 0) == ctype then
+    if cached and cached.storage == true then storage = true end
+
+    if pktLevel then
+        level = pktLevel
+        known = true
+    elseif cached and (tonumber(cached.cardType or 0) or 0) == ctype then
         level = tonumber(cached.level) or 0
         known = true
-        if cached.storage == true then storage = true end
     end
 
     table.insert(improve.cef.cards, {
@@ -1372,6 +1724,30 @@ function Improve.RunNewStyleProbeLoop(allowWhenStopped, rescanAll)
     improve.cef.inventoryFresh = false
 
     local selectedType = tonumber(settings.improve.typeCards or 1) or 1
+
+    -- Уровни приходят в пакете инвентаря. Если с запуска скрипта такого пакета
+    -- ещё не было, просим инвентарь один раз - это дешевле, чем диалог по каждой карте
+    if Improve.UsePacketLevels() then
+        if rescanAll then Improve.ForgetPacketLevels() end
+
+        if (improve.cef.pktInvAt or 0) == 0 then
+            local _hasUnknown = false
+            for _, c in ipairs(improve.cef.cards or {}) do
+                if tonumber(c.cardType or 0) == selectedType and (rescanAll or not c.levelKnown) then
+                    _hasUnknown = true
+                    break
+                end
+            end
+
+            if _hasUnknown then
+                Improve.LogAdd('INFO', 'Оценка карт: запрашиваем инвентарь, уровни должны прийти пакетом.')
+                if not Improve.RequestInventoryDump(6) then
+                    Improve.LogAdd('WARN', 'Оценка карт: инвентарь пакетом не пришёл, проверяем карты по старинке.')
+                end
+            end
+        end
+    end
+
     local typeCards, probeCards, knownCount = {}, {}, 0
     for _, c in ipairs(improve.cef.cards or {}) do
         if tonumber(c.cardType or 0) == selectedType then
@@ -1379,6 +1755,12 @@ function Improve.RunNewStyleProbeLoop(allowWhenStopped, rescanAll)
                 c.levelKnown = false
                 c.probeFailed = false
                 c.levelGuessed = false
+
+                local _pktLevel = Improve.PacketLevelForSlot(c.slot, c.cardType)
+                if _pktLevel then
+                    c.level = _pktLevel
+                    c.levelKnown = true
+                end
             end
             table.insert(typeCards, c)
             if c.levelKnown then
@@ -1509,7 +1891,7 @@ function Improve.RunNewStyleProbeLoop(allowWhenStopped, rescanAll)
             Improve.LogAdd('WARN', string.format('Новый стиль: слот %d проверить не удалось, пропускаю.', card.slot))
             if failStreak >= 3 then
                 improve.cef.probeAbort = true
-                improve.cef.probeAbortReason = 'подряд не ответили 3 карты'
+                improve.cef.probeAbortReason = 'подряд не открылось окно у 3 карт (стойте у стола, закройте инвентарь, MMT должен быть запущен один раз)'
                 break
             end
         end
@@ -1603,12 +1985,16 @@ end
 function Improve.HandleNewStyleChooseDialog(dialogId, title, text)
     if not Improve.IsNewStyleMode() then return false end
 
-    local dialogTitle = tostring(title or '')
+    local dialogTitle = Farmer.stripColors(tostring(title or ''))
     local dialogText = tostring(text or '')
-    local isChooseDialog = dialogTitle:find('{BFBBBA}Выберите вид улучшения для видеокарты', 1, true) ~= nil
-    local isUpgradeDialog = dialogTitle:find('{BFBBBA}Улучшение видеокарты', 1, true) ~= nil
+    local isChooseDialog = dialogTitle:find('Выберите вид улучшения для видеокарты', 1, true) ~= nil
+    local isUpgradeDialog = dialogTitle:find('Улучшение видеокарты', 1, true) ~= nil
 
     if not isChooseDialog and not (improve.cef.probing and isUpgradeDialog) then
+        -- чужой диалог во время проверки - пишем заголовок, чтобы было видно, что пришло вместо карты
+        if improve.cef.probing and improve.cef.pendingSlot then
+            Improve.LogAdd('WARN', string.format('Новый стиль: вместо окна карты (слот %s) пришёл диалог "%s".', tostring(improve.cef.pendingSlot), dialogTitle))
+        end
         return false
     end
 
@@ -1840,6 +2226,18 @@ function main()
     -- цвет префикса в чате и смысловые цвета берём из настроек до первого сообщения
     UI.RefreshSemanticColors()
 
+    -- два экземпляра MMT шлют /invent одновременно: инвентарь открывается
+    -- и тут же закрывается, проверка уровней видеокарт не срабатывает
+    local okList, scriptList = pcall(script.list)
+    if okList and type(scriptList) == 'table' then
+        local me = thisScript()
+        for _, s in ipairs(scriptList) do
+            if s.id ~= me.id and s.name == me.name then
+                Chat.Add(string.format('MMT запущен дважды (%s). Оставьте один файл, иначе проверка уровней видеокарт не сработает.', tostring(s.filename)), TYPECHATMESSAGES.WARNING)
+            end
+        end
+    end
+
     sampRegisterChatCommand("mmt", function ()
         UI.SwitchMainWindow()
     end)
@@ -1856,7 +2254,7 @@ function main()
         if settings.main.hideWindowOnFlashCmd then
             imguiWindows.main[0] = false
         end
-        FlashCollect.Start(settings.main.hideWindowOnFlashCmd)
+        FlashCollect.Start(settings.main.hideWindowOnFlashCmd, true)
     end)
     sampRegisterChatCommand("mmtfarm", function ()
         activeMode = "farmer"
@@ -1933,6 +2331,9 @@ function main()
             Improve.ProbeWatchdogTick()
             Improve.MobileStatusTick()
             Collect.ReminderTick()
+            Collect.TgTick()
+            Collect.SyncTick()
+            Mirage.Tick()
             Storage.FlushResourceLogs()
         end
     end)
@@ -1972,6 +2373,7 @@ local function HandleStateCryptoServerMessage(color, text)
         local nowFillLiquid = text:match("восстановлено до ([%d%.]+)%%")
 
         if nowFillLiquid then
+            Collect.SyncOnLiquid(stateCrypto.fillLiquidType)
             stateCrypto.queueShelves[stateCrypto.progressShelves].fill = tonumber(nowFillLiquid)
             stateCrypto.waitFill = false
             stateCrypto.fillLiquidType = nil
@@ -1982,24 +2384,26 @@ local function HandleStateCryptoServerMessage(color, text)
     end
 
     if text:find("Чтобы запустить видеокарту в работу, необходимо вывести всю прибыль этой видеокарты") and color == -1104335361 then
-        Interacting.Deactivate()
+        Interacting.Deactivate("сначала нужно вывести прибыль видеокарты")
     end
 
     if text:find("Эта функция недоступна через флешку") and color == -1104335361 then
-        Interacting.Deactivate()
+        Interacting.Deactivate("функция недоступна через флешку")
     end
 
     if text:find("Вы успешно пополнили счёт дома за электроэнергию на ") and color == 1941201407 then
+        Collect.SyncOnDeposit(stateCrypto.pendingDeposit)
+        stateCrypto.pendingDeposit = 0
         stateCrypto.waitDep = false
     end
 
     if text:find("В этом доме нет подвала с вентиляцией или он еще не достроен") and color == -1104335361 then
-        Interacting.Deactivate()
+        Interacting.Deactivate("в доме нет подвала с вентиляцией")
         Chat.Add("Вы можете добавить данный дом в чёрный список, чтобы его скрыть", TYPECHATMESSAGES.SECONDARY)
     end
 
     if text:find("У Вас недостаточно денежных средств!") and color == -1104335361 then
-        Interacting.Deactivate()
+        Interacting.Deactivate("недостаточно денег")
     end
 
     -- Фактический вывод прибыли: сервер присылает точную сумму, которую реально выдал.
@@ -2019,6 +2423,7 @@ local function HandleStateCryptoServerMessage(color, text)
 
             Collect.AddLogEntry(hid, currency, amount)
             Collect.SummaryTake(queueShelf, currency, amount)
+            Collect.SyncOnTake(currency, amount)
 
             Chat.Add(string.format("Сбор DEBUG: сервер выдал %s %s (дом %s)",
                 tostring(amount), tostring(currency), tostring(hid)), TYPECHATMESSAGES.DEBUG)
@@ -2157,6 +2562,14 @@ function Improve.HandleResultServerMessage(text)
 end
 
 function Improve.HandleProbeServerMessage(text)
+    -- "Нельзя так быстро открывать инвентарь, подождите еще 1 сек." - команда не сработала
+    local blockSeconds = text:match('Нельзя так быстро открывать инвентарь, подождите еще (%d+)')
+    if blockSeconds then
+        improve.cef.inventoryOpen = false
+        improve.cef.inventoryFresh = false
+        improve.cef.inventoryBlockedUntil = os.clock() + (tonumber(blockSeconds) or 1) + 0.5
+    end
+
     if improve.cef.probing and text:find('Чтобы установить видеокарту, вы должны находиться в подвале возле одной из специальных стоек') then
         improve.cef.probeAbort = true
         improve.cef.probeAbortReason = 'нужно находиться в подвале возле стойки'
@@ -2174,6 +2587,7 @@ end
 
 function sampev.onServerMessage(color, text)
     HandleFlashCollectServerMessage(text)
+    Mirage.HandleServerMessage(text)
 
     local handled = HandleStateCryptoServerMessage(color, text)
     if handled ~= nil then
@@ -2258,6 +2672,7 @@ local function HandleBankDepositDialog(dialogId, title, text)
     end
 
     DialogUtils.waitAndSendDialogResponse(dialogId, 1, 0, tostring(dep))
+    stateCrypto.pendingDeposit = dep
     stateCrypto.queueHousesBank[stateCrypto.progressHousesBank].bankNow = cur + dep
     return DialogReturnVisibility()
 end
@@ -2466,6 +2881,8 @@ local function HandleVideoCardSelectionDialog(dialogId, title, text)
         idDialogs.selectVideoCardItemFlash = dialogId
     end
     idDialogs.selectVideoCard = dialogId
+    -- номер дома в заголовке есть не всегда: в подвале его нет
+    stateCrypto.shelfListHouse = title:match("дом №(%d+)")
     -- запоминаем, каким по счёту диалогом пришёл список: по этому номеру
     -- процесс сбора понимает, что вернулся к списку, а не завис на карточке
     stateCrypto.shelfListSerial = stateCrypto.dialogSerial or 0
@@ -2606,6 +3023,11 @@ function sampev.onShowDialog(dialogId, style, title, button1, button2, text)
         return farmerHandled
     end
 
+    local mirageHandled = Mirage.HandleDialog(dialogId, style, title, text)
+    if mirageHandled ~= nil then
+        return mirageHandled
+    end
+
     local handled = HandleBankDepositDialog(dialogId, title, text)
     if handled ~= nil then
         return handled
@@ -2680,6 +3102,7 @@ end
 
 -- Срабатывание на отправку диалога
 function sampev.onSendDialogResponse(id, btn, list, input)
+    Mirage.OnDialogResponse(id, btn)
 
     if id == idDialogs.mobileImproveStatus then
         return Improve.HandleMobileStatusDialogResponse(btn)
@@ -2695,6 +3118,15 @@ function sampev.onSendDialogResponse(id, btn, list, input)
         imguiWindows.main[0] = false
     end
 
+end
+
+-- 3D-текст над сараем миража: номер дома и монеты на складе
+function sampev.onCreate3DText(id, color, position, distance, testLOS, attachedPlayerId, attachedVehicleId, text)
+    Mirage.On3DText(id, position, text)
+end
+
+function sampev.onRemove3DText(id)
+    Mirage.Remove3DText(id)
 end
 
 -- --------------------------------------------------------
@@ -3135,6 +3567,7 @@ function ShelfProcessor.process()
             stateCrypto.progressShelves = index
         end
 
+        Collect.SyncOnVisit()
         Collect.SummaryVisit(shelfData)
 
         local outcome = ShelfProcessor.RunShelf(shelfData, index)
@@ -3184,6 +3617,7 @@ function HouseProcessor.filterBankHouses()
         if NeedTopupForBank(house.bankNow) then
             table.insert(filtered, {
                 samp_line = house.samp_line,
+                house_number = house.house_number,
                 bankNow = house.bankNow
             })
         end
@@ -3222,6 +3656,7 @@ function HouseProcessor.processBankHouses()
             Chat.Add("Ошибка ожидания диалога дома: " .. error, TYPECHATMESSAGES.CRITICAL)
             return false
         end
+        Collect.SyncBankBegin(houseData)
 
         sampSendDialogResponse(lastIDDialog, 1, houseData.samp_line, "")
         lastOpenHouse = index
@@ -3293,6 +3728,7 @@ function HouseProcessor.processBankHouses()
             end
         end
 
+        Collect.SyncBankEnd("complete")
         stateCrypto.progressHousesBank = stateCrypto.progressHousesBank + 1
     end
 
@@ -3339,6 +3775,7 @@ function HouseProcessor.RunHouse(houseData, index)
     sampSendDialogResponse(lastIDDialog, 1, houseData.samp_line, "")
     lastOpenHouse = index
     stateCrypto.currentHouseId = houses[index] and houses[index].house_number or nil
+    Collect.SyncBeginHouse(stateCrypto.currentHouseId, index)
     if stateCrypto.currentHouseId and not collectStats.house[stateCrypto.currentHouseId] then
         collectStats.house[stateCrypto.currentHouseId] = { BTC = 0, ASC = 0 }
     end
@@ -3375,16 +3812,21 @@ function HouseProcessor.processRegularHouses()
 
     for index, houseData in ipairs(stateCrypto.queueHouses) do
         local attempts = HouseProcessor.MaxRetries() + 1
+        local houseDone = false
 
         for attempt = 1, attempts do
             local outcome = HouseProcessor.RunHouse(houseData, index)
 
             if outcome == "cancelled" then return false end
-            if outcome == "done" then break end
+            if outcome == "done" then
+                houseDone = true
+                break
+            end
 
             -- дом не отработал: возвращаемся к списку домов и заходим заново
             if not HouseProcessor.BackToHouseList() then
                 Chat.Add("Не удалось вернуться к списку домов, сбор остановлен", TYPECHATMESSAGES.CRITICAL)
+                stateCrypto.stopReason = "не удалось вернуться к списку домов"
                 return false
             end
 
@@ -3400,7 +3842,14 @@ function HouseProcessor.processRegularHouses()
         -- Закрываем диалог дома
         if not HouseProcessor.BackToHouseList() then
             Chat.Add("Не удалось вернуться к списку домов, сбор остановлен", TYPECHATMESSAGES.CRITICAL)
+            stateCrypto.stopReason = "не удалось вернуться к списку домов"
             return false
+        end
+
+        if houseDone then
+            Collect.SyncEndHouse("complete")
+        else
+            Collect.SyncEndHouse("interrupted", "дом пропущен после повторов")
         end
 
         stateCrypto.progressHouses = stateCrypto.progressHouses + 1
@@ -3424,6 +3873,7 @@ function Interacting.Start(action, source)
 
     collectStats = { total = { BTC = 0, ASC = 0 }, house = {}, summary = Collect.NewSummary(source) }
     stateCrypto.currentHouseId = nil
+    Collect.SyncStartSession()
 
     if action == "fill" then
         processes.fill = true
@@ -3470,11 +3920,18 @@ function Interacting.Process()
     if #houses > 0 then
         success = HouseProcessor.processRegularHouses()
     else
-        success = ShelfProcessor.process() ~= "cancelled"
+        Collect.SyncBeginHouse(stateCrypto.shelfListHouse, "shelves")
+        local outcome = ShelfProcessor.process()
+        success = outcome ~= "cancelled"
+        if outcome == "done" then
+            Collect.SyncEndHouse("complete")
+        elseif success then
+            Collect.SyncEndHouse("interrupted", "не удалось вернуться к списку полок")
+        end
     end
 
     if not success then
-        Interacting.Deactivate()
+        Interacting.Deactivate(stateCrypto.stopReason)
         return
     end
 
@@ -3498,7 +3955,11 @@ function Interacting.IsActive()
     return processes.take or processes.fill or processes.on or processes.off or processes.dep
 end
 
-function Interacting.Deactivate()
+function Interacting.Deactivate(reason)
+    Collect.SyncEndHouse("interrupted", reason or stateCrypto.stopReason or "остановлено")
+    Collect.SyncBankEnd("interrupted", reason or stateCrypto.stopReason or "остановлено")
+    stateCrypto.pendingDeposit = 0
+    stateCrypto.stopReason = nil
     Storage.FlushCollectLogStore()
     stateCrypto.work = false
     stateCrypto.waitFill = false
@@ -4259,8 +4720,22 @@ function Storage.LoadSettings()
     if not _settings then
         _settings = {}
     end
+    -- до версии 2 Telegram включался одной общей галочкой и списком config
+    local oldNotify = type(_settings.notifications) == 'table' and _settings.notifications.version == nil
+        and _settings.notifications or nil
+    local oldEnabled = oldNotify and oldNotify.enabled == true
+    local oldConfig = oldNotify and type(oldNotify.config) == 'table' and oldNotify.config or nil
+
     -- сливаем настройки с дефолтными
     Storage.MergeSettings(_settings, defaultSettings)
+
+    if oldNotify then
+        for kind in pairs(_settings.notifications.tg) do
+            _settings.notifications.tg[kind] = oldEnabled and (oldConfig == nil or oldConfig[kind] ~= false)
+        end
+        _settings.notifications.enabled = nil
+        _settings.notifications.config = nil
+    end
     if tonumber(_settings.main.maxBankAmount or 0) < 60000000 then
         _settings.main.maxBankAmount = 60000000
     end
@@ -4488,8 +4963,7 @@ function Collect.UpdateLastCollectInfo(houseId, currency, amount)
         currency = tostring(currency or "BTC"),
         amount = Collect.NormalizeCryptoAmount(amount),
     }
-    collectReminder.lastNotifiedCollectAt = 0
-    collectReminder.retryAfterAt = 0
+    Collect.GameState('crypto').retryAt = 0
 end
 
 function Collect.GetReminderThresholdSeconds()
@@ -4725,42 +5199,63 @@ function Collect.EnsureNotificationManager()
     return true
 end
 
-function Collect.SendReminderNotification(info, elapsedSeconds)
-    if not (notifySuccess and type(notify) == 'table' and type(notify.send) == 'function') then
-        collectReminder.retryAfterAt = os.time() + 300
-        Chat.Add("Напоминание о сборе: система session_notifications недоступна", TYPECHATMESSAGES.DEBUG)
-        return false
+-- Состояние напоминаний в игре по событиям
+function Collect.GameState(kind)
+    collectReminder.game = collectReminder.game or {}
+    local st = collectReminder.game[kind]
+    if not st then
+        st = { notifiedAt = 0, retryAt = 0, pending = false }
+        collectReminder.game[kind] = st
+    end
+    return st
+end
+
+Collect.GAME_TITLES = {
+    crypto = 'Пора собирать крипту',
+    greenhouse = 'Пора собирать теплицы',
+    miner = 'Пора собирать майнера',
+    mirage = 'Пора собирать сарай миража',
+}
+
+-- Напоминание в игре: всплывающее окно менеджера уведомлений, без него - сообщение в чат
+function Collect.SendReminderNotification(kind, lastAt, elapsedSeconds)
+    local st = Collect.GameState(kind)
+    local title = Collect.GAME_TITLES[kind] or 'Пора собирать'
+    local text = 'С последнего сбора прошло ' .. Collect.FormatDuration(elapsedSeconds) .. '.'
+    local description = 'Последний сбор: ' .. os.date('%d.%m.%Y %H:%M:%S', lastAt)
+
+    local function toChat()
+        st.notifiedAt = lastAt
+        Chat.Add(title .. '. ' .. text .. ' ' .. description, TYPECHATMESSAGES.WARNING)
     end
 
-    collectReminder.notifyPending = true
-    local lastCollectAt = tonumber(info.timestamp or 0) or 0
-    local lastCollectText = Collect.FormatLastCollectText(info)
-    local overdueText = Collect.FormatDuration(elapsedSeconds)
+    if not (notifySuccess and type(notify) == 'table' and type(notify.send) == 'function') then
+        toChat()
+        return
+    end
 
+    st.pending = true
     notify.send(REQUIRED_NOTIFY_VERSION, {
         script_id = 'MMT',
-        title = u8("Давно не было сбора крипты"),
-        text = u8("С последнего сбора прошло " .. overdueText .. "."),
-        description = u8("Последний сбор: " .. lastCollectText),
+        title = u8(title),
+        text = u8(text),
+        description = u8(description),
         sticky = true,
         theme = 'emerald',
-        action = collectReminderAction
+        -- кнопка "Запустить сбор" есть только у крипты
+        action = (kind == 'crypto') and collectReminderAction or nil,
     }, function(success, notifyInfo)
-        collectReminder.notifyPending = false
+        st.pending = false
         if success then
-            collectReminder.lastNotifiedCollectAt = lastCollectAt
-            collectReminder.retryAfterAt = 0
+            st.notifiedAt = lastAt
+            st.retryAt = 0
             return
         end
-
-        collectReminder.retryAfterAt = os.time() + 60
-        Chat.Add(
-            'Напоминание о сборе не отправлено: ' .. tostring(notifyInfo and notifyInfo.message or 'неизвестная ошибка'),
-            TYPECHATMESSAGES.DEBUG
-        )
+        -- менеджер уведомлений не принял - напоминание всё равно не теряем
+        toChat()
+        Chat.Add('Менеджер уведомлений: ' .. tostring(notifyInfo and notifyInfo.message or 'неизвестная ошибка'),
+            TYPECHATMESSAGES.DEBUG)
     end)
-
-    return true
 end
 
 function Collect.ReminderTick()
@@ -4770,39 +5265,952 @@ function Collect.ReminderTick()
     end
     collectReminder.lastTickAt = nowClock
 
-    if collectReminder.notifyPending then
+    local now = os.time()
+    for _, kind in ipairs(Collect.TG_KINDS) do
+        local id = kind.id
+        if settings.notifications.game[id] then
+            local st = Collect.GameState(id)
+            local lastAt, minutes = Collect.TgReminderSource(id)
+            if not st.pending and now >= st.retryAt and minutes > 0 and lastAt > 0
+                and st.notifiedAt ~= lastAt
+                and (now - lastAt) >= minutes * 60
+                and not Collect.TgKindBusy(id)
+            then
+                Collect.SendReminderNotification(id, lastAt, now - lastAt)
+            end
+        end
+    end
+end
+
+-- ===== Уведомления в Telegram =====
+-- Два способа, как в MCR ПК: свой бот (api.telegram.org) или бот MCR Notification
+-- (API MCR, нужен ключ MCR). Запросы уходят из отдельного effil-потока, чтобы игра
+-- не подвисала; ответы забирает фоновый цикл через Collect.TgTick().
+
+collectReminder.tg = {
+    worker = nil,
+    reqCh = nil,
+    resCh = nil,
+    initError = nil,
+    pending = 0,
+    tickAt = -1000,
+    retryAt = {},              -- [вид] = os.time(), раньше которого не повторяем
+    keyCache = nil,
+    keySource = '',
+    keyCheckedAt = -1000,
+    keyEdit = false,
+    buf = {},
+    lastResult = '',
+}
+
+Collect.TG_KINDS = {
+    { id = 'crypto',     label = 'Пора собирать крипту',       short = 'Крипта' },
+    { id = 'greenhouse', label = 'Пора собирать теплицы',      short = 'Теплицы' },
+    { id = 'miner',      label = 'Пора собирать майнера',      short = 'Майнер' },
+    { id = 'mirage',     label = 'Пора собирать сарай миража', short = 'Сарай миража' },
+}
+
+-- Где лежит интервал напоминания для события
+Collect.REMINDER_MINUTES = {
+    crypto = { 'main', 'collectNotifyMinutes' },
+    greenhouse = { 'farmer', 'notifyMinutes' },
+    miner = { 'miner', 'notifyMinutes' },
+    mirage = { 'mirage', 'notifyMinutes' },
+}
+
+Collect.TG_MCR_URLS = {
+    'https://api.arz-mcr.ru/v1/bot/notifications',
+    'https://api.arz-mcr.top/v1/bot/notifications',
+}
+
+function Collect.TgTrim(s)
+    local r = tostring(s or ''):gsub('^%s+', '')
+    r = r:gsub('%s+$', '')
+    return r
+end
+
+function Collect.TgReadFile(path)
+    local ok, fh = pcall(io.open, path, 'rb')
+    if not ok or not fh then return nil end
+    local data = fh:read('*a')
+    fh:close()
+    return data
+end
+
+-- Ключ MCR: свой из настроек MMT, иначе из MCR ПК, иначе из MLoader
+function Collect.TgGetKey()
+    local tg = collectReminder.tg
+    local own = Collect.TgTrim(settings.notifications.mcrKey)
+    if own ~= '' then
+        return own, 'MMT'
+    end
+
+    if (os.clock() - tg.keyCheckedAt) < 30 and tg.keyCache ~= nil then
+        return tg.keyCache, tg.keySource
+    end
+    tg.keyCheckedAt = os.clock()
+    tg.keyCache, tg.keySource = '', ''
+
+    local base = getWorkingDirectory() .. SEPORATORPATCH
+    local mcrKey = Collect.TgTrim(Collect.TgReadFile(base .. 'MCR' .. SEPORATORPATCH .. 'config' .. SEPORATORPATCH .. 'UserKey-DontShare.key'))
+    if #mcrKey >= 16 then
+        tg.keyCache, tg.keySource = mcrKey, 'MCR ПК'
+        return tg.keyCache, tg.keySource
+    end
+
+    local ini = Collect.TgReadFile(base .. 'config' .. SEPORATORPATCH .. 'mloader.ini') or ''
+    local loaderKey = ''
+    for line in ini:gmatch('[^\r\n]+') do
+        local v = line:match('^%s*key%s*=%s*(.-)%s*$')
+        if v then
+            local unquoted = v:gsub('^"(.*)"$', '%1')
+            loaderKey = Collect.TgTrim(unquoted)
+            break
+        end
+    end
+    if #loaderKey >= 16 then
+        tg.keyCache, tg.keySource = loaderKey, 'MLoader'
+    end
+    return tg.keyCache, tg.keySource
+end
+
+-- Ключ целиком не показываем: только первые и последние два символа
+function Collect.TgMaskKey(key)
+    key = tostring(key or '')
+    if #key <= 4 then return string.rep('*', #key) end
+    return key:sub(1, 2) .. string.rep('*', #key - 4) .. key:sub(-2)
+end
+
+-- Почему отправка сейчас невозможна (nil - всё заполнено)
+function Collect.TgConfigProblem()
+    local cfg = settings.notifications
+    if tonumber(cfg.methodBot) == 2 then
+        if Collect.TgTrim(cfg.mcrChatId) == '' then return 'не указан ваш ID для бота MCR Notification' end
+        if Collect.TgGetKey() == '' then return 'не найден ключ MCR' end
+        return nil
+    end
+    if Collect.TgTrim(cfg.botToken) == '' then return 'не указан токен своего бота' end
+    if Collect.TgTrim(cfg.chatId) == '' then return 'не указан ID чата' end
+    return nil
+end
+
+function Collect.TgInitWorker()
+    local tg = collectReminder.tg
+    if tg.worker then return true end
+    if tg.initError then return false end
+
+    local ok, err = pcall(function()
+        local effil = require('effil')
+        tg.reqCh = effil.channel()
+        tg.resCh = effil.channel()
+        tg.worker = effil.thread(function(reqCh, resCh)
+            local requests = require('requests')
+            while true do
+                local id, method, url, body, isJson = reqCh:pop()
+                if id == nil then return end
+                local headers = { ['User-Agent'] = 'mmt' }
+                if isJson then
+                    headers['Content-Type'] = 'application/json'
+                    headers['Content-Length'] = tostring(#body)
+                end
+                local okReq, res = pcall(requests.request, method, url, {
+                    headers = headers,
+                    data = (body ~= '') and body or nil,
+                    timeout = 15,
+                })
+                if okReq and type(res) == 'table' then
+                    resCh:push(id, tonumber(res.status_code) or 0, tostring(res.text or ''))
+                else
+                    resCh:push(id, 0, tostring(res))
+                end
+            end
+        end)(tg.reqCh, tg.resCh)
+    end)
+
+    if not ok then
+        tg.worker = nil
+        tg.initError = tostring(err)
+        Chat.Add('Telegram: не удалось запустить отправку (' .. tg.initError .. ')', TYPECHATMESSAGES.WARNING)
+        return false
+    end
+    return true
+end
+
+-- Отправить текст. kind - вид уведомления ('test' для тестового сообщения)
+function Collect.TgSend(text, kind)
+    local problem = Collect.TgConfigProblem()
+    if problem then
+        return false, problem
+    end
+    if not Collect.TgInitWorker() then
+        return false, 'нет библиотеки effil/requests'
+    end
+
+    local cfg = settings.notifications
+    local plain = tostring(text or ''):gsub('{%x%x%x%x%x%x}', '')
+    local clean = u8(plain)
+
+    local task = { kind = kind or 'test', text = clean, urlIndex = 1 }
+    if tonumber(cfg.methodBot) == 2 then
+        local key = Collect.TgGetKey()
+        task.isJson = true
+        task.body = json.encode({
+            telegram_id = Collect.TgTrim(cfg.mcrChatId),
+            key_user = key,
+            message = clean,
+        })
+    else
+        local encoded = clean:gsub('([^%w%-_%.~])', function(c)
+            return string.format('%%%02X', string.byte(c))
+        end)
+        task.url = string.format('https://api.telegram.org/bot%s/sendMessage?chat_id=%s&text=%s',
+            Collect.TgTrim(cfg.botToken), Collect.TgTrim(cfg.chatId), encoded)
+    end
+
+    Collect.TgPush(task)
+    return true
+end
+
+function Collect.TgPush(task)
+    local tg = collectReminder.tg
+    tg.tasks = tg.tasks or {}
+    tg.seq = (tg.seq or 0) + 1
+    tg.tasks[tg.seq] = task
+    tg.pending = tg.pending + 1
+    local url = task.url or (task.urls or Collect.TG_MCR_URLS)[task.urlIndex]
+    tg.reqCh:push(tg.seq, 'POST', url, task.body or '', task.isJson == true)
+end
+
+function Collect.TgHandleResult(id, status, text)
+    local tg = collectReminder.tg
+    local task = tg.tasks and tg.tasks[id]
+    if not task then return end
+    tg.tasks[id] = nil
+    tg.pending = math.maxEx(0, tg.pending - 1)
+
+    -- сеть или сервер MCR недоступны - пробуем зеркало
+    local urls = task.urls or Collect.TG_MCR_URLS
+    if task.isJson and (status == 0 or status >= 500) and task.urlIndex < #urls then
+        task.urlIndex = task.urlIndex + 1
+        Collect.TgPush(task)
         return
     end
 
-    local nowTime = os.time()
-    if nowTime < (collectReminder.retryAfterAt or 0) then
+    -- запросы облачного лога разбирают ответ сами
+    if task.onDone then
+        local ok, err = pcall(task.onDone, status, text)
+        if not ok then
+            print('[MMT] обработка ответа сервера: ' .. tostring(err))
+        end
         return
     end
 
-    local thresholdSeconds = Collect.GetReminderThresholdSeconds()
-    if thresholdSeconds <= 0 then
+    if status >= 200 and status < 300 then
+        tg.lastResult = os.date('%H:%M:%S') .. ' - сообщение отправлено'
         return
     end
 
-    if flashCollect.active or (stateCrypto.work and processes.take) then
+    local raw = tostring(text or ''):sub(1, 150)
+    local okDecode, detail = pcall(u8.decode, u8, raw)
+    if not okDecode then detail = raw end
+    local reason = (status == 0) and ('нет связи: ' .. detail) or string.format('ошибка %d: %s', status, detail)
+    tg.lastResult = os.date('%H:%M:%S') .. ' - не отправлено, ' .. reason
+
+    if task.kind ~= 'test' then
+        -- напоминание не дошло: разрешаем повторить его позже
+        settings.notifications.sent[task.kind] = nil
+        -- ошибка настроек (4xx) сама не пройдёт - не шумим каждые 5 минут
+        tg.retryAt[task.kind] = os.time() + ((status >= 400 and status < 500) and 1800 or 300)
+        Chat.Add('Telegram: уведомление не отправлено (' .. reason .. ')', TYPECHATMESSAGES.WARNING)
+    end
+end
+
+-- Время последнего сбора и порог напоминания (в минутах) для вида уведомления
+function Collect.TgReminderSource(kind)
+    if kind == 'crypto' then
+        local info = Collect.GetLastCollectInfo()
+        return info and info.timestamp or 0, tonumber(settings.main.collectNotifyMinutes) or 0
+    elseif kind == 'greenhouse' then
+        return tonumber(greenhouseLog.lastCollectAt) or 0, tonumber(settings.farmer.notifyMinutes) or 0
+    elseif kind == 'miner' then
+        return tonumber(minerLog.lastCollectAt) or 0, tonumber(settings.miner.notifyMinutes) or 0
+    elseif kind == 'mirage' then
+        return tonumber(Mirage.log.lastCollectAt) or 0, tonumber(settings.mirage.notifyMinutes) or 0
+    end
+    return 0, 0
+end
+
+-- Сбор этого вида идёт прямо сейчас - напоминать не о чем
+function Collect.TgKindBusy(kind)
+    if kind == 'crypto' then
+        return flashCollect.active or (stateCrypto.work and processes.take)
+    elseif kind == 'greenhouse' then
+        return farmer.active
+    elseif kind == 'miner' then
+        return miner.active
+    elseif kind == 'mirage' then
+        return Mirage.st.pending ~= nil
+    end
+    return false
+end
+
+function Collect.TgNickname()
+    local ok, res, id = pcall(sampGetPlayerIdByCharHandle, PLAYER_PED)
+    if not (ok and res) then return '' end
+    local okNick, nick = pcall(sampGetPlayerNickname, id)
+    return (okNick and nick) and tostring(nick) or ''
+end
+
+function Collect.TgReminderText(kind, lastAt, elapsed)
+    local head = '[MMT]'
+    local passed = Collect.FormatDuration(elapsed)
+    local lastText = os.date('%d.%m.%Y %H:%M', lastAt)
+    if kind == 'crypto' then
+        return string.format('%s\nПора собирать крипту: с последнего сбора прошло %s.\nПоследний сбор: %s', head, passed, lastText)
+    elseif kind == 'greenhouse' then
+        return string.format('%s\nПора собирать теплицы: с последнего сбора прошло %s.\nПоследний сбор: %s', head, passed, lastText)
+    elseif kind == 'mirage' then
+        return string.format('%s\nПора собирать сарай миража: с последнего сбора прошло %s.\nПоследний сбор: %s', head, passed, lastText)
+    end
+    return string.format('%s\nПора собирать майнера: с последнего сбора прошло %s.\nПоследний сбор: %s', head, passed, lastText)
+end
+
+-- Состояние таймера для окна настроек
+function Collect.TgReminderStatus(kind)
+    local cfg = settings.notifications
+    if not (cfg.game[kind] or cfg.tg[kind]) then return 'выключено' end
+    local lastAt, minutes = Collect.TgReminderSource(kind)
+    if minutes <= 0 then return 'интервал 0 - выключено' end
+    if lastAt <= 0 then return 'после первого сбора' end
+    local remain = minutes * 60 - (os.time() - lastAt)
+    if remain > 0 then return 'через ' .. Collect.FormatDuration(remain) end
+    local sentGame = cfg.game[kind] and Collect.GameState(kind).notifiedAt == lastAt
+    local sentTg = cfg.tg[kind] and tonumber(cfg.sent[kind]) == lastAt
+    if sentGame or sentTg then return 'отправлено' end
+    return 'время истекло'
+end
+
+-- Вызывается из фонового цикла
+function Collect.TgTick()
+    local tg = collectReminder.tg
+    if tg.resCh then
+        local id, status, text = tg.resCh:pop(0)
+        while id ~= nil do
+            Collect.TgHandleResult(id, tonumber(status) or 0, text)
+            id, status, text = tg.resCh:pop(0)
+        end
+    end
+
+    local nowClock = os.clock()
+    if (nowClock - tg.tickAt) < 5 then return end
+    tg.tickAt = nowClock
+
+    local cfg = settings.notifications
+    local anyOn = false
+    for _, kind in ipairs(Collect.TG_KINDS) do
+        if cfg.tg[kind.id] then anyOn = true end
+    end
+    if not anyOn or tg.initError or Collect.TgConfigProblem() then return end
+
+    local now = os.time()
+    for _, kind in ipairs(Collect.TG_KINDS) do
+        local id = kind.id
+        local lastAt, minutes = Collect.TgReminderSource(id)
+        if cfg.tg[id] and minutes > 0 and lastAt > 0
+            and tonumber(cfg.sent[id]) ~= lastAt
+            and (now - lastAt) >= minutes * 60
+            and now >= (tg.retryAt[id] or 0)
+            and not Collect.TgKindBusy(id)
+        then
+            cfg.sent[id] = lastAt
+            Storage.SaveSettings()
+            Collect.TgSend(Collect.TgReminderText(id, lastAt, now - lastAt), id)
+        end
+    end
+end
+
+-- Поток отправки живёт вне скрипта: при выгрузке MMT его нужно погасить,
+-- иначе после каждого /mmtr остаётся лишний поток
+function Collect.TgShutdown()
+    local tg = collectReminder.tg
+    if tg.worker then
+        pcall(function() tg.worker:cancel(0) end)
+        tg.worker = nil
+    end
+end
+
+function onScriptTerminate(scr)
+    if scr == thisScript() then
+        Collect.TgShutdown()
+    end
+end
+
+-- ===== Облачный лог сборов (API MCR /v1/mmt/collect) =====
+-- Каждый сбор (один дом с криптой, теплица, майнер) - отдельное событие. События
+-- сначала ложатся в очередь на диске и уходят по одному через поток отправки Telegram.
+-- Повтор идёт с тем же event_id, поэтому сервер не посчитает сбор дважды.
+
+collectReminder.sync = {
+    queue = nil,               -- загружается при первом обращении
+    inflight = false,
+    pausedUntil = 0,
+    failCount = 0,
+    lastOkAt = 0,
+    lastError = '',
+    tickAt = -1000,
+    seq = 0,
+    unit = nil,                -- дом с криптой, который сейчас собирается
+    sessionId = nil,
+    itemIds = {},              -- кэш: название -> id (false - не найден)
+    catalogs = nil,
+    summary = { data = nil, key = '', autoKey = '', loading = false, error = '', at = 0 },
+}
+
+Collect.SYNC_URLS = {
+    'https://api.arz-mcr.ru/v1/mmt/collect',
+    'https://api.arz-mcr.top/v1/mmt/collect',
+}
+Collect.SUMMARY_URLS = {
+    'https://api.arz-mcr.ru/v1/mmt/collect/summary',
+    'https://api.arz-mcr.top/v1/mmt/collect/summary',
+}
+Collect.SYNC_QUEUE_FILE = PATCHCONFIG .. 'CollectSyncQueue.json'
+Collect.SYNC_QUEUE_MAX = 1000
+-- cjson кодирует пустую таблицу как объект, а серверу нужен массив
+Collect.SYNC_EMPTY_ARRAY = '__MMT_EMPTY_ARRAY__'
+
+-- Ресурсы теплиц и майнера: склад показывает только названия (ё заменена на е)
+Collect.SYNC_ITEM_IDS = {
+    ['Лен'] = 595,
+    ['Хлопок'] = 594,
+    ['Укроп'] = 510,
+    ['Кусок редкой ткани'] = 1692,
+    ['Темная материя'] = 7281,
+}
+
+function Collect.SyncEnabled()
+    return settings.cloud.sendCollects == true
+end
+
+function Collect.SyncQueue()
+    local sync = collectReminder.sync
+    if not sync.queue then
+        local data = Storage.LoadJSON(Collect.SYNC_QUEUE_FILE)
+        sync.queue = (type(data) == 'table' and type(data.events) == 'table') and data.events or {}
+    end
+    return sync.queue
+end
+
+function Collect.SyncSaveQueue()
+    Storage.SaveJSON(Collect.SYNC_QUEUE_FILE, { events = Collect.SyncQueue() })
+end
+
+function Collect.SyncNewId(tag)
+    local sync = collectReminder.sync
+    sync.seq = sync.seq + 1
+    return string.format('%d-%s-%d-%04x', os.time(), tostring(tag), sync.seq, math.random(0, 65535))
+end
+
+function Collect.SyncAccount()
+    local nick = Collect.TgNickname()
+    local server = ''
+    if type(sampGetCurrentServerAddress) == 'function' then
+        local ok, ip, port = pcall(sampGetCurrentServerAddress)
+        if ok and ip then
+            server = tostring(ip) .. ':' .. tostring(port or 0)
+        end
+    end
+    return { nick = (nick ~= '') and nick or 'unknown', server_ip = (server ~= '') and server or 'unknown' }
+end
+
+-- Общие поля события. key_user подставляется при отправке, в очереди ключ не хранится
+function Collect.SyncBase(kind, status, reason, startedAt)
+    local version = tostring(thisScript().version or '')
+    return {
+        event_id = Collect.SyncNewId(kind),
+        session_id = collectReminder.sync.sessionId or Collect.SyncNewId('s'),
+        type = kind,
+        status = status,
+        stop_reason = reason and u8(tostring(reason)) or json.null,
+        started_at = tonumber(startedAt) or os.time(),
+        finished_at = os.time(),
+        account = Collect.SyncAccount(),
+        client = { name = 'mmt', version = (version ~= '') and version or '0', platform = ISMONETLOADER and 'mobile' or 'pc' },
+    }
+end
+
+function Collect.SyncEnqueue(event)
+    local queue = Collect.SyncQueue()
+    table.insert(queue, event)
+    while #queue > Collect.SYNC_QUEUE_MAX do
+        table.remove(queue, 1)
+    end
+    Collect.SyncSaveQueue()
+end
+
+-- ----- Крипта: один дом = одно событие -----
+
+-- Новый запуск сбора или заливки
+function Collect.SyncStartSession()
+    local sync = collectReminder.sync
+    sync.unit = nil
+    sync.sessionId = Collect.SyncNewId('s')
+end
+
+-- houseId = nil - подвал или дом не определён; unitKey различает дома в одном проходе
+function Collect.SyncBeginHouse(houseId, unitKey)
+    local sync = collectReminder.sync
+    if not (processes.take or processes.fill) then return end
+    if sync.unit and sync.unit.key == unitKey then return end
+    Collect.SyncEndHouse('complete')
+
+    local summary = collectStats.summary
+    local source = (summary and summary.source == 'flash') and 'flash' or 'manual'
+    if source == 'flash' and flashCollect.fromCommand then
+        source = 'command'
+    end
+
+    sync.unit = {
+        key = unitKey,
+        houseId = houseId,
+        startedAt = os.time(),
+        source = source,
+        BTC = 0,
+        ASC = 0,
+        visited = 0,
+        collected = 0,
+        cardsEnabled = 0,
+        lastShelf = nil,
+        liquid = { btc = 0, super_btc = 0, asc = 0 },
+    }
+end
+
+function Collect.SyncEndHouse(status, reason)
+    local sync = collectReminder.sync
+    local unit = sync.unit
+    if not unit then return end
+    sync.unit = nil
+    if not Collect.SyncEnabled() then return end
+
+    local liquidTotal = unit.liquid.btc + unit.liquid.super_btc + unit.liquid.asc
+    if unit.BTC <= 0 and unit.ASC <= 0 and liquidTotal <= 0 then return end
+
+    local event = Collect.SyncBase('crypto', status or 'complete', reason, unit.startedAt)
+    event.source = unit.source
+    event.house_id = (unit.houseId ~= nil and tostring(unit.houseId) ~= '' and tostring(unit.houseId) ~= '0')
+        and tostring(unit.houseId) or json.null
+    event.collected = {
+        BTC = Collect.NormalizeCryptoAmount(unit.BTC),
+        ASC = Collect.NormalizeCryptoAmount(unit.ASC),
+    }
+    event.shelves = { visited = unit.visited, collected = unit.collected, cards_enabled = unit.cardsEnabled }
+    if liquidTotal > 0 then
+        event.liquid_used = unit.liquid
+    end
+    Collect.SyncEnqueue(event)
+end
+
+function Collect.SyncOnVisit()
+    local unit = collectReminder.sync.unit
+    if unit then unit.visited = unit.visited + 1 end
+end
+
+function Collect.SyncOnTake(currency, amount)
+    local unit = collectReminder.sync.unit
+    if not unit or (currency ~= 'BTC' and currency ~= 'ASC') then return end
+    unit[currency] = unit[currency] + (tonumber(amount) or 0)
+    -- с одной полки может прийти и BTC, и ASC - полку считаем один раз
+    local shelfKey = tostring(stateCrypto.progressShelves)
+    if unit.lastShelf ~= shelfKey then
+        unit.lastShelf = shelfKey
+        unit.collected = unit.collected + 1
+    end
+end
+
+function Collect.SyncOnCardEnabled()
+    local unit = collectReminder.sync.unit
+    if unit then unit.cardsEnabled = unit.cardsEnabled + 1 end
+end
+
+-- liquidType - выбор из диалога жидкости: btc | supper_btc | asc
+function Collect.SyncOnLiquid(liquidType)
+    local unit = collectReminder.sync.unit
+    if not unit then return end
+    local field = (liquidType == 'supper_btc') and 'super_btc' or liquidType
+    if unit.liquid[field] then
+        unit.liquid[field] = unit.liquid[field] + 1
+    end
+end
+
+-- ----- Пополнение банка домов: один дом = одно событие -----
+
+function Collect.SyncBankBegin(houseData)
+    local sync = collectReminder.sync
+    Collect.SyncBankEnd('complete')
+    sync.bank = {
+        houseId = houseData and houseData.house_number,
+        startedAt = os.time(),
+        before = tonumber(houseData and houseData.bankNow) or 0,
+        deposited = 0,
+        operations = 0,
+    }
+end
+
+-- Сервер подтвердил пополнение на сумму, которую ввёл скрипт
+function Collect.SyncOnDeposit(amount)
+    local bank = collectReminder.sync.bank
+    amount = math.floor(tonumber(amount) or 0)
+    if not bank or amount <= 0 then return end
+    bank.deposited = bank.deposited + amount
+    bank.operations = bank.operations + 1
+end
+
+function Collect.SyncBankEnd(status, reason)
+    local sync = collectReminder.sync
+    local bank = sync.bank
+    if not bank then return end
+    sync.bank = nil
+    if not Collect.SyncEnabled() or bank.deposited <= 0 then return end
+
+    local event = Collect.SyncBase('bank', status or 'complete', reason, bank.startedAt)
+    event.house_id = bank.houseId and tostring(bank.houseId) or json.null
+    event.deposited = bank.deposited
+    event.operations = bank.operations
+    event.bank_before = bank.before
+    event.bank_after = bank.before + bank.deposited
+    Collect.SyncEnqueue(event)
+end
+
+-- ----- Теплицы и майнер -----
+
+function Collect.SyncNormName(name)
+    local s = tostring(name or '')
+    s = s:gsub('\184', '\229')
+    s = s:gsub('\168', '\197')
+    return s
+end
+
+-- id из каталога MCR: ПК - UTF-8, мобилка - CP1251
+function Collect.SyncCatalogId(name)
+    local sync = collectReminder.sync
+    if not sync.catalogs then
+        local base = getWorkingDirectory() .. SEPORATORPATCH
+        sync.catalogs = {
+            { raw = Collect.TgReadFile(base .. 'MCR' .. SEPORATORPATCH .. 'data' .. SEPORATORPATCH .. 'ItemCatalog.json'), utf8 = true },
+            { raw = Collect.TgReadFile(base .. 'config' .. SEPORATORPATCH .. 'MCRM CFGs' .. SEPORATORPATCH .. 'AllItemsID.json'), utf8 = false },
+        }
+    end
+    for _, catalog in ipairs(sync.catalogs) do
+        if catalog.raw then
+            local needle = catalog.utf8 and u8(name) or name
+            local pos = catalog.raw:find('":"' .. needle .. '"', 1, true)
+            if pos then
+                local id = catalog.raw:sub(math.maxEx(1, pos - 12), pos):match('"(%d+)"$')
+                if id then return tonumber(id) end
+            end
+        end
+    end
+    return nil
+end
+
+function Collect.SyncItemId(name)
+    local sync = collectReminder.sync
+    local norm = Collect.SyncNormName(name)
+    local cached = sync.itemIds[norm]
+    if cached ~= nil then return cached or nil end
+
+    local id = Collect.SYNC_ITEM_IDS[norm] or Collect.SyncCatalogId(name)
+    if not id and norm ~= name then
+        id = Collect.SyncCatalogId(norm)
+    end
+    sync.itemIds[norm] = id or false
+    return id
+end
+
+function Collect.SyncItems(collected)
+    local items = {}
+    for name, amount in pairs(collected or {}) do
+        amount = math.floor(tonumber(amount) or 0)
+        if amount > 0 then
+            local id = Collect.SyncItemId(name)
+            table.insert(items, { item_id = id or json.null, name = u8(tostring(name)), amount = amount })
+        end
+    end
+    return items
+end
+
+-- kind = 'greenhouse' | 'miner'. Одно событие на запуск: повторный вызов ничего не шлёт
+function Collect.SyncResource(kind, status, reason)
+    local st = (kind == 'greenhouse') and farmer or miner
+    if not st.syncPending then return end
+    st.syncPending = false
+    if not Collect.SyncEnabled() then return end
+
+    local items = Collect.SyncItems(st.collected)
+    local added = (kind == 'greenhouse') and (tonumber(farmer.waterSpent) or 0) or (tonumber(miner.chargeSpent) or 0)
+    if #items == 0 and added <= 0 then return end
+
+    local event = Collect.SyncBase(kind, status, reason, st.syncStartedAt)
+    event.items = (#items > 0) and items or Collect.SYNC_EMPTY_ARRAY
+    local menu = st.menu or {}
+    event.store_after = { now = tonumber(menu.storeNow) or 0, max = tonumber(menu.storeMax) or 0 }
+    if kind == 'greenhouse' then
+        event.water_added = added
+        event.water_after = { now = tonumber(farmer.wareWaterNow) or 0, max = tonumber(farmer.wareWaterMax) or 0 }
+    else
+        event.charge_added = added
+        event.charge_after = { now = tonumber(miner.chargeNow) or 0, max = tonumber(miner.chargeMax) or 0 }
+    end
+    -- у каждого сбора теплицы/майнера своя сессия
+    event.session_id = Collect.SyncNewId('s')
+    Collect.SyncEnqueue(event)
+end
+
+function Collect.SyncResourceStart(kind)
+    local st = (kind == 'greenhouse') and farmer or miner
+    st.syncPending = true
+    st.syncStartedAt = os.time()
+end
+
+-- ----- Отправка -----
+
+function Collect.SyncOnResult(event, status, text)
+    local sync = collectReminder.sync
+    sync.inflight = false
+    local queue = Collect.SyncQueue()
+    local now = os.time()
+
+    local function dropEvent()
+        for i, e in ipairs(queue) do
+            if e.event_id == event.event_id then
+                table.remove(queue, i)
+                break
+            end
+        end
+        Collect.SyncSaveQueue()
+    end
+
+    if status >= 200 and status < 300 then
+        dropEvent()
+        sync.failCount = 0
+        sync.lastOkAt = now
+        sync.lastError = ''
         return
     end
 
-    local info = Collect.GetLastCollectInfo()
-    if not info then
+    if status == 403 then
+        sync.pausedUntil = now + 1800
+        sync.lastError = 'ключ не найден или выключен'
+        Chat.Add('Облачный лог: ' .. sync.lastError .. '. Повторю через 30 минут.', TYPECHATMESSAGES.WARNING)
+    elseif status == 422 then
+        -- сервер такой сбор не примет никогда - повторять бессмысленно
+        dropEvent()
+        sync.lastError = 'сервер отклонил сбор (ошибка данных)'
+        local raw = tostring(text or ''):sub(1, 200)
+        local okDecode, detail = pcall(u8.decode, u8, raw)
+        Chat.Add('Облачный лог: сбор отклонён: ' .. tostring(okDecode and detail or raw), TYPECHATMESSAGES.DEBUG)
+    elseif status == 429 then
+        sync.pausedUntil = now + 60
+        sync.lastError = 'слишком много запросов'
+    else
+        sync.failCount = sync.failCount + 1
+        local delays = { 60, 300, 900 }
+        sync.pausedUntil = now + delays[math.minEx(sync.failCount, #delays)]
+        sync.lastError = (status == 0) and 'нет связи с сервером' or ('ошибка сервера ' .. status)
+    end
+end
+
+-- Вызывается из фонового цикла
+function Collect.SyncTick()
+    local sync = collectReminder.sync
+    if sync.inflight then return end
+
+    local nowClock = os.clock()
+    if (nowClock - sync.tickAt) < 1 then return end
+    sync.tickAt = nowClock
+
+    if not Collect.SyncEnabled() or os.time() < sync.pausedUntil then return end
+    local queue = Collect.SyncQueue()
+    if #queue == 0 then return end
+
+    local key = Collect.TgGetKey()
+    if key == '' then
+        sync.lastError = 'не найден ключ MCR'
+        return
+    end
+    if not Collect.TgInitWorker() then
+        sync.lastError = 'нет библиотеки effil/requests'
         return
     end
 
-    if collectReminder.lastNotifiedCollectAt == info.timestamp then
+    local event = queue[1]
+    event.key_user = key
+    local okEncode, encoded = pcall(json.encode, event)
+    event.key_user = nil
+    if not okEncode then
+        table.remove(queue, 1)
+        Collect.SyncSaveQueue()
+        return
+    end
+    local body = encoded:gsub('"' .. Collect.SYNC_EMPTY_ARRAY .. '"', '[]')
+
+    sync.inflight = true
+    Collect.TgPush({
+        kind = 'sync',
+        urls = Collect.SYNC_URLS,
+        urlIndex = 1,
+        body = body,
+        isJson = true,
+        onDone = function(status, text)
+            Collect.SyncOnResult(event, status, text)
+        end,
+    })
+end
+
+-- ----- Итоги из облака -----
+
+function Collect.JsonValue(v)
+    if v == json.null then return nil end
+    return v
+end
+
+-- Поля-идентификаторы при слиянии не складываются
+Collect.CLOUD_ID_FIELDS = { house_id = true, item_id = true, id = true, number = true }
+
+-- Сложить две секции итогов: числа суммируются, списки домов и предметов
+-- сливаются по house_id / item_id / name, остальное берётся из первой
+function Collect.CloudSum(a, b)
+    a, b = Collect.JsonValue(a), Collect.JsonValue(b)
+    if a == nil then return b end
+    if b == nil then return a end
+    if type(a) == 'number' and type(b) == 'number' then return a + b end
+    if type(a) ~= 'table' or type(b) ~= 'table' then return a end
+
+    if #a > 0 or #b > 0 then
+        local out, index = {}, {}
+        for _, list in ipairs({ a, b }) do
+            for _, row in ipairs(list) do
+                local key = type(row) == 'table' and tostring(Collect.JsonValue(row.house_id)
+                    or Collect.JsonValue(row.item_id) or Collect.JsonValue(row.name) or '') or ''
+                if index[key] then
+                    out[index[key]] = Collect.CloudSum(out[index[key]], row)
+                else
+                    table.insert(out, row)
+                    index[key] = #out
+                end
+            end
+        end
+        return out
+    end
+
+    local out = {}
+    for k, v in pairs(a) do out[k] = v end
+    for k, v in pairs(b) do
+        if Collect.CLOUD_ID_FIELDS[k] then
+            if Collect.JsonValue(out[k]) == nil then out[k] = v end
+        else
+            out[k] = Collect.CloudSum(out[k], v)
+        end
+    end
+    return out
+end
+
+-- У сервера бывает несколько адресов (IP, домен), а бэкенд различает аккаунты по
+-- нику и адресу - один персонаж приходит несколькими строками. Сливаем их по нику
+-- и серверу из справочника (id, иначе название, иначе адрес).
+function Collect.CloudMergeAccounts(accounts)
+    local out, index = {}, {}
+    for _, acc in ipairs(Collect.JsonValue(accounts) or {}) do
+        local server = Collect.JsonValue(acc.server) or {}
+        local serverKey = Collect.JsonValue(server.id) or Collect.JsonValue(server.title) or Collect.JsonValue(server.ip) or '?'
+        local key = tostring(Collect.JsonValue(acc.nick) or '?') .. '|' .. tostring(serverKey)
+        local pos = index[key]
+        if pos then
+            local merged = out[pos]
+            for field, value in pairs(acc) do
+                if field ~= 'nick' and field ~= 'server' then
+                    merged[field] = Collect.CloudSum(merged[field], value)
+                end
+            end
+        else
+            local copy = {}
+            for field, value in pairs(acc) do copy[field] = value end
+            table.insert(out, copy)
+            index[key] = #out
+        end
+    end
+    return out
+end
+
+function Collect.CloudFetchSummary(periodDays)
+    local st = collectReminder.sync.summary
+    if st.loading then return end
+
+    local key = Collect.TgGetKey()
+    if key == '' then
+        st.error = 'не найден ключ MCR - укажите его в настройках (вкладка "Основное")'
+        return
+    end
+    if not Collect.TgInitWorker() then
+        st.error = 'нет библиотеки effil/requests'
         return
     end
 
-    local elapsedSeconds = nowTime - info.timestamp
-    if elapsedSeconds < thresholdSeconds then
-        return
-    end
+    periodDays = math.maxEx(1, math.minEx(93, tonumber(periodDays) or 7))
+    local now = os.time()
+    local body = json.encode({
+        key_user = key,
+        date_from = os.date('%Y-%m-%d', now - (periodDays - 1) * 86400),
+        date_to = os.date('%Y-%m-%d', now),
+    })
 
-    Collect.SendReminderNotification(info, elapsedSeconds)
+    local reqKey = tostring(periodDays)
+    st.loading = true
+    st.error = ''
+    Collect.TgPush({
+        kind = 'summary',
+        urls = Collect.SUMMARY_URLS,
+        urlIndex = 1,
+        body = body,
+        isJson = true,
+        onDone = function(status, text)
+            st.loading = false
+            st.key = reqKey
+            if status == 200 then
+                local ok, data = pcall(json.decode, text)
+                if ok and type(data) == 'table' and data.ok then
+                    for _, day in ipairs(Collect.JsonValue(data.days) or {}) do
+                        day.accounts = Collect.CloudMergeAccounts(day.accounts)
+                    end
+                    st.data = data
+                    st.at = os.time()
+                    return
+                end
+                st.error = 'сервер прислал непонятный ответ'
+            elseif status == 403 then
+                st.error = 'ключ не найден или выключен'
+            elseif status == 422 then
+                st.error = 'сервер не принял период'
+            elseif status == 429 then
+                st.error = 'слишком часто, попробуйте через минуту'
+            elseif status == 0 then
+                st.error = 'нет связи с сервером'
+            else
+                st.error = 'ошибка сервера ' .. tostring(status)
+            end
+        end,
+    })
+end
+
+-- Старые логи без lastCollectAt: берём последний день, в котором что-то собрано
+function Collect.LastCollectFromDays(days)
+    local best = 0
+    for _, d in pairs(days or {}) do
+        if type(d) == 'table' and type(d.collected) == 'table' and next(d.collected) ~= nil then
+            best = math.maxEx(best, tonumber(d.updatedAt) or 0)
+        end
+    end
+    return best
 end
 
 -- ===== Расширенная сводка сбора =====
@@ -4912,6 +6320,7 @@ end
 
 -- Скрипт сам включил простаивавшую видеокарту
 function Collect.SummaryCardEnabled()
+    Collect.SyncOnCardEnabled()
     local summary = collectStats.summary
     if summary and processes.take then
         summary.cardsEnabled = summary.cardsEnabled + 1
@@ -5527,6 +6936,7 @@ function Farmer.Finish(reason)
     Storage.RequestSaveGreenhouseLog(true)
     farmer.active = false
     farmer.statusText = tostring(reason or "Готово")
+    Collect.SyncResource("greenhouse", "complete")
 
     local parts = {}
     for name, amt in pairs(farmer.collected) do
@@ -5613,6 +7023,7 @@ function Farmer.Process()
         farmer.active = false
         return
     end
+    Collect.SyncResourceStart("greenhouse")
     farmer.collected = {}
     farmer.waterSpent = 0
     farmer.logs = {}
@@ -5624,9 +7035,15 @@ function Farmer.Process()
         or "Пополняю воду")
 
     if doTake then Farmer.DoTake() end
-    if not farmer.active then return end
+    if not farmer.active then
+        Collect.SyncResource("greenhouse", "interrupted", "остановлено")
+        return
+    end
     if doFill then Farmer.DoFill() end
-    if not farmer.active then return end
+    if not farmer.active then
+        Collect.SyncResource("greenhouse", "interrupted", "остановлено")
+        return
+    end
 
     Farmer.Finish("Готово")
 end
@@ -5652,6 +7069,7 @@ function Farmer.Cancel()
     farmer.menuOpen = false
     if farmer.menu then farmer.menu.id = nil end
     farmer.statusText = "Отменено"
+    Collect.SyncResource("greenhouse", "interrupted", "отменено игроком")
     Storage.RequestSaveGreenhouseLog(true)
     Farmer.Log("Вы отменили процесс")
     Chat.Add("Ферма: процесс отменён", TYPECHATMESSAGES.SECONDARY)
@@ -5677,6 +7095,7 @@ function Greenhouse.AddCollected(name, amount)
     local d = Greenhouse.Day()
     d.collected[name] = (tonumber(d.collected[name]) or 0) + amount
     d.updatedAt = os.time()
+    greenhouseLog.lastCollectAt = d.updatedAt
     Storage.RequestSaveGreenhouseLog(false)
 end
 
@@ -5715,11 +7134,12 @@ function Storage.LoadGreenhouseLog()
     local ok, data = pcall(Storage.LoadJSON, GREENHOUSE_STATS_FILE)
     if not ok or type(data) ~= "table" then data = {} end
     greenhouseLog.days = (type(data.days) == "table") and data.days or {}
+    greenhouseLog.lastCollectAt = tonumber(data.lastCollectAt) or Collect.LastCollectFromDays(greenhouseLog.days)
     Greenhouse.TrimOldDays()
 end
 
 function Storage.SaveGreenhouseLog()
-    local ok, res = pcall(Storage.SaveJSON, GREENHOUSE_STATS_FILE, { days = greenhouseLog.days })
+    local ok, res = pcall(Storage.SaveJSON, GREENHOUSE_STATS_FILE, { days = greenhouseLog.days, lastCollectAt = greenhouseLog.lastCollectAt })
     if ok and res then
         greenhouseLog.dirty = false
         greenhouseLog.lastSaveAt = os.clock()
@@ -6151,6 +7571,7 @@ function Miner.Finish(reason)
     Storage.RequestSaveMinerLog(true)
     miner.active = false
     miner.statusText = tostring(reason or "Готово")
+    Collect.SyncResource("miner", "complete")
 
     local parts = {}
     for name, amt in pairs(miner.collected) do
@@ -6236,6 +7657,7 @@ function Miner.Process()
         miner.active = false
         return
     end
+    Collect.SyncResourceStart("miner")
     miner.collected = {}
     miner.chargeSpent = 0
     miner.skipLines = {}
@@ -6248,9 +7670,15 @@ function Miner.Process()
         or "Заряжаю майнера")
 
     if doTake then Miner.DoTake() end
-    if not miner.active then return end
+    if not miner.active then
+        Collect.SyncResource("miner", "interrupted", "остановлено")
+        return
+    end
     if doFill then Miner.DoFill() end
-    if not miner.active then return end
+    if not miner.active then
+        Collect.SyncResource("miner", "interrupted", "остановлено")
+        return
+    end
 
     Miner.Finish("Готово")
 end
@@ -6276,6 +7704,7 @@ function Miner.Cancel()
     miner.menuOpen = false
     if miner.menu then miner.menu.id = nil end
     miner.statusText = "Отменено"
+    Collect.SyncResource("miner", "interrupted", "отменено игроком")
     Storage.RequestSaveMinerLog(true)
     Miner.Log("Вы отменили процесс")
     Chat.Add("Майнер: процесс отменён", TYPECHATMESSAGES.SECONDARY)
@@ -6301,6 +7730,7 @@ function Miner.LogCollected(name, amount)
     local d = Miner.Day()
     d.collected[name] = (tonumber(d.collected[name]) or 0) + amount
     d.updatedAt = os.time()
+    minerLog.lastCollectAt = d.updatedAt
     Storage.RequestSaveMinerLog(false)
 end
 
@@ -6329,11 +7759,12 @@ function Storage.LoadMinerLog()
     local ok, data = pcall(Storage.LoadJSON, MINER_STATS_FILE)
     if not ok or type(data) ~= "table" then data = {} end
     minerLog.days = (type(data.days) == "table") and data.days or {}
+    minerLog.lastCollectAt = tonumber(data.lastCollectAt) or Collect.LastCollectFromDays(minerLog.days)
     Miner.TrimOldDays()
 end
 
 function Storage.SaveMinerLog()
-    local ok, res = pcall(Storage.SaveJSON, MINER_STATS_FILE, { days = minerLog.days })
+    local ok, res = pcall(Storage.SaveJSON, MINER_STATS_FILE, { days = minerLog.days, lastCollectAt = minerLog.lastCollectAt })
     if ok and res then
         minerLog.dirty = false
         minerLog.lastSaveAt = os.clock()
@@ -6352,6 +7783,346 @@ function Storage.RequestSaveMinerLog(force)
 end
 
 Storage.LoadMinerLog()
+
+-- =====================================================================================================================
+--                                                          MIRAGE (сарай миража)
+-- =====================================================================================================================
+-- Сарай копит монеты миража (до 10). Номер дома и остаток на складе видны в 3D-тексте
+-- над сараем, по Alt открывается диалог с накоплением и ценой. Забор - кнопка "Выбрать".
+-- Сбор засчитывается только после подтверждения: 3D-текст сарая показал меньше монет
+-- или сервер написал про монеты миража.
+
+Mirage.FILE = PATCHCONFIG .. 'MirageStats.json'
+Mirage.ITEM_ID = 8094
+Mirage.ITEM_NAME = 'Монета Миража'
+-- Каждый сбор стоит фиксированную сумму: потрачено = число сборов * цена
+Mirage.COLLECT_COST = 200000
+Mirage.CONFIRM_TIMEOUT = 8
+-- на каком расстоянии от надписи считать, что игрок стоит у этого сарая
+Mirage.SHED_RADIUS = 15
+
+function Mirage.Clean(s)
+    return Farmer.stripColors(tostring(s or ''))
+end
+
+-- "200.000" / "$ 200 000" -> 200000
+function Mirage.Money(s)
+    local digits = tostring(s or ''):gsub('[^%d]', '')
+    return tonumber(digits) or 0
+end
+
+function Mirage.Log(msg)
+    local st = Mirage.st
+    table.insert(st.logs, { time = os.date('%H:%M:%S'), text = tostring(msg) })
+    while #st.logs > 200 do
+        table.remove(st.logs, 1)
+    end
+end
+
+-- ----- 3D-текст над сараем -----
+
+function Mirage.On3DText(id, position, text)
+    local low = Farmer.lower(Mirage.Clean(text))
+    if not low:find('сарай миража', 1, true) then return end
+
+    local house = low:match('дому%s*№%s*(%d+)')
+    local coins = tonumber(low:match('на складе:%s*(%d+)'))
+    local pos = type(position) == 'table' and position or {}
+    -- ключ - номер дома: при входе в дом и выходе сервер пересоздаёт надписи
+    -- с новыми id, а старые не удаляет, и сараи в списке задваивались
+    local key = house and ('house' .. house) or ('label' .. tostring(id))
+    Mirage.st.shedKeys[id] = key
+    Mirage.st.sheds[key] = {
+        id = id,
+        house = house,
+        coins = coins,
+        x = tonumber(pos.x) or 0,
+        y = tonumber(pos.y) or 0,
+        z = tonumber(pos.z) or 0,
+        at = os.time(),
+    }
+
+    -- сервер пересоздал надпись после оплаты: монет на складе стало меньше
+    local pending = Mirage.st.pending
+    if pending and coins and pending.house and house == pending.house and coins < pending.before then
+        Mirage.Confirm()
+    end
+end
+
+function Mirage.Remove3DText(id)
+    local st = Mirage.st
+    local key = st.shedKeys[id]
+    st.shedKeys[id] = nil
+    -- надпись могли уже пересоздать с другим id - такую запись не трогаем
+    if key and st.sheds[key] and st.sheds[key].id == id then
+        st.sheds[key] = nil
+    end
+end
+
+-- Расстояние от игрока до сарая, метров (nil - координаты игрока неизвестны)
+function Mirage.Distance(shed)
+    local ok, x, y, z = pcall(getCharCoordinates, PLAYER_PED)
+    if not ok or not x then return nil end
+    return math.sqrt((shed.x - x) ^ 2 + (shed.y - y) ^ 2 + (shed.z - z) ^ 2)
+end
+
+-- Сараи в радиусе из настроек, от ближнего к дальнему
+function Mirage.NearbySheds()
+    local radius = tonumber(settings.mirage.nearRadius) or 50
+    local rows = {}
+    for _, shed in pairs(Mirage.st.sheds) do
+        local dist = Mirage.Distance(shed)
+        if dist and dist <= radius then
+            table.insert(rows, { shed = shed, dist = dist })
+        end
+    end
+    table.sort(rows, function(a, b) return a.dist < b.dist end)
+    return rows
+end
+
+-- Сарай, возле которого стоит игрок (по 3D-тексту)
+function Mirage.NearestShed()
+    local ok, x, y, z = pcall(getCharCoordinates, PLAYER_PED)
+    if not ok or not x then return nil end
+    local best, bestDist = nil, nil
+    for _, shed in pairs(Mirage.st.sheds) do
+        local d = (shed.x - x) ^ 2 + (shed.y - y) ^ 2 + (shed.z - z) ^ 2
+        if not bestDist or d < bestDist then
+            best, bestDist = shed, d
+        end
+    end
+    if best and bestDist <= Mirage.SHED_RADIUS ^ 2 then
+        return best
+    end
+    return nil
+end
+
+-- ----- Диалог сарая -----
+
+function Mirage.HandleDialog(dialogId, style, title, text)
+    local low = Farmer.lower(Mirage.Clean(title))
+    if not low:find('сарай миража', 1, true) then return nil end
+
+    local st = Mirage.st
+    local body = Farmer.lower(Mirage.Clean(text))
+    local now, max = body:match('накопилось:%s*(%d+)%s*/%s*(%d+)')
+
+    -- после оплаты сервер может спросить подтверждение: если забор начал скрипт, соглашаемся
+    if not now and st.pending then
+        Mirage.Log('Сервер попросил подтвердить оплату')
+        if st.pending.auto then
+            sampSendDialogResponse(dialogId, 1, 0, '')
+            return false
+        end
+        return true
+    end
+
+    st.dialogId = dialogId
+    st.dialogStyle = style
+    st.open = true
+    st.now = tonumber(now) or 0
+    st.max = tonumber(max) or 10
+    st.cost = 0
+    for line in body:gmatch('[^\r\n]+') do
+        if line:find('стоимость', 1, true) then
+            st.cost = Mirage.Money(line)
+        end
+    end
+    if st.cost == 0 then
+        st.cost = Mirage.COLLECT_COST
+    end
+    st.dialogAt = os.time()
+    local shed = Mirage.NearestShed()
+    st.house = shed and shed.house or nil
+
+    Mirage.Log(string.format('Открыт сарай%s: %d/%d монет',
+        st.house and (' дома №' .. st.house) or '', st.now, st.max))
+
+    local autoTake = settings.mirage.autoTake and st.now > 0
+    if not (autoTake and settings.mirage.hideOnAutoTake) then
+        imguiWindows.main[0] = true
+        activeMode = 'mirage'
+        if activeTabScript == 'improve' then activeTabScript = 'main' end
+    end
+
+    if autoTake then
+        Mirage.Take(true)
+        return false
+    end
+    if settings.main.replaceDialog then return false end
+    return true
+end
+
+-- Игрок сам нажал "Выбрать" в окне сарая
+function Mirage.OnDialogResponse(dialogId, button)
+    local st = Mirage.st
+    if not st.open or dialogId ~= st.dialogId then return end
+    st.open = false
+    if button == 1 and st.now > 0 and not st.pending then
+        Mirage.BeginPending(false)
+    end
+end
+
+function Mirage.BeginPending(auto)
+    local st = Mirage.st
+    st.pending = {
+        auto = auto == true,
+        house = st.house,
+        before = st.now,
+        coins = st.now,
+        cost = st.cost,
+        at = os.clock(),
+        startedAt = os.time(),
+    }
+    st.statusText = 'Забираю монеты...'
+end
+
+function Mirage.Take(auto)
+    local st = Mirage.st
+    if not (st.open and st.dialogId) then return false end
+    if st.now <= 0 then
+        st.statusText = 'Монет в сарае пока нет'
+        return false
+    end
+    Mirage.BeginPending(auto ~= false)
+    st.open = false
+    sampSendDialogResponse(st.dialogId, 1, 0, '')
+    return true
+end
+
+-- Закрыть окно сарая, ничего не забирая
+function Mirage.Close()
+    local st = Mirage.st
+    if st.open and st.dialogId then
+        sampSendDialogResponse(st.dialogId, 0, 0, '')
+    end
+    st.open = false
+end
+
+-- ----- Подтверждение -----
+
+function Mirage.HandleServerMessage(text)
+    local st = Mirage.st
+    if not st.pending then return end
+    local low = Farmer.lower(Mirage.Clean(text))
+
+    if low:find('недостаточно', 1, true) then
+        st.pending = nil
+        st.statusText = 'Не хватает денег на сбор'
+        Mirage.Log('Сервер: недостаточно денег - монеты не забраны')
+        return
+    end
+
+    if text:find(':item' .. Mirage.ITEM_ID .. ':', 1, true)
+        or (low:find('мираж', 1, true) and low:find('монет', 1, true))
+    then
+        Mirage.Confirm()
+    end
+end
+
+function Mirage.Confirm()
+    local st = Mirage.st
+    local pending = st.pending
+    if not pending then return end
+    st.pending = nil
+
+    local coins = pending.coins
+    st.now = 0
+    st.sessionCoins = (st.sessionCoins or 0) + coins
+    st.sessionCollects = (st.sessionCollects or 0) + 1
+    st.sessionSpent = st.sessionCollects * Mirage.COLLECT_COST
+    Mirage.AddLog(coins)
+
+    st.statusText = string.format('Забрано монет: %d', coins)
+    Mirage.Log(string.format('Забрал %d монет, заплатил $%d', coins, Mirage.COLLECT_COST))
+    Chat.Add(string.format('Сарай миража: забрано монет: %d%s', coins,
+        pending.house and (' (дом №' .. pending.house .. ')') or ''), TYPECHATMESSAGES.SUCCESS)
+
+    Collect.SyncMirage(pending, coins)
+end
+
+-- Вызывается из фонового цикла
+function Mirage.Tick()
+    local st = Mirage.st
+    local pending = st.pending
+    if pending and (os.clock() - pending.at) > Mirage.CONFIRM_TIMEOUT then
+        st.pending = nil
+        st.statusText = 'Сервер не подтвердил сбор'
+        Mirage.Log('Подтверждения от сервера не было - сбор не записан')
+    end
+
+    local log = Mirage.log
+    if log.dirty and (os.clock() - (log.lastSaveAt or 0)) >= 5 then
+        Storage.SaveMirageLog()
+    end
+end
+
+-- ----- Лог по дням -----
+
+function Mirage.Day(dateKey)
+    dateKey = dateKey or os.date('%Y-%m-%d')
+    Mirage.log.days[dateKey] = Mirage.log.days[dateKey] or { collected = {}, spent = 0, updatedAt = os.time() }
+    local d = Mirage.log.days[dateKey]
+    d.collected = d.collected or {}
+    d.spent = tonumber(d.spent) or 0
+    return d
+end
+
+function Mirage.AddLog(coins)
+    local d = Mirage.Day()
+    d.collected[Mirage.ITEM_NAME] = (tonumber(d.collected[Mirage.ITEM_NAME]) or 0) + coins
+    -- потрачено считаем от числа сборов: каждый сбор - фиксированная плата
+    d.collects = (tonumber(d.collects) or 0) + 1
+    d.spent = d.collects * Mirage.COLLECT_COST
+    d.updatedAt = os.time()
+    Mirage.log.lastCollectAt = d.updatedAt
+    Mirage.log.dirty = true
+    Storage.SaveMirageLog()
+end
+
+function Mirage.TrimOldDays()
+    local keep = tonumber(settings.mirage and settings.mirage.logMaxDays) or 0
+    if keep <= 0 then return end
+    local fromKey = os.date('%Y-%m-%d', os.time() - (keep - 1) * 86400)
+    for k in pairs(Mirage.log.days) do
+        if tostring(k) < fromKey then
+            Mirage.log.days[k] = nil
+        end
+    end
+end
+
+function Storage.LoadMirageLog()
+    local ok, data = pcall(Storage.LoadJSON, Mirage.FILE)
+    if not ok or type(data) ~= 'table' then data = {} end
+    Mirage.log.days = (type(data.days) == 'table') and data.days or {}
+    Mirage.log.lastCollectAt = tonumber(data.lastCollectAt) or Collect.LastCollectFromDays(Mirage.log.days)
+    Mirage.TrimOldDays()
+end
+
+function Storage.SaveMirageLog()
+    local ok, res = pcall(Storage.SaveJSON, Mirage.FILE, { days = Mirage.log.days, lastCollectAt = Mirage.log.lastCollectAt })
+    if ok and res then
+        Mirage.log.dirty = false
+        Mirage.log.lastSaveAt = os.clock()
+        return true
+    end
+    return false
+end
+
+Storage.LoadMirageLog()
+
+-- ----- Облачный лог -----
+
+function Collect.SyncMirage(pending, coins)
+    if not Collect.SyncEnabled() then return end
+    local event = Collect.SyncBase('mirage', 'complete', nil, pending.startedAt)
+    event.session_id = Collect.SyncNewId('s')
+    event.house_id = pending.house and tostring(pending.house) or json.null
+    event.items = { { item_id = Mirage.ITEM_ID, name = u8(Mirage.ITEM_NAME), amount = coins } }
+    event.spent = Mirage.COLLECT_COST
+    event.store_after = { now = 0, max = tonumber(Mirage.st.max) or 10 }
+    Collect.SyncEnqueue(event)
+end
 
 -- Хранилище запомненных уровней видеокарт
 function Storage.LoadCardLevels()
@@ -6993,14 +8764,24 @@ local mainFrame = imgui.OnFrame( function() return imguiWindows.main[0] end, fun
                 imgui.ScrollMouse()
                 Draw.MinerMain()
                 imgui.EndChild()
+            elseif activeMode == "mirage" then
+                imgui.BeginChild("mirage_main_area", imgui.ImVec2(-1, -1))
+                imgui.ScrollMouse()
+                Draw.MirageMain()
+                imgui.EndChild()
             else
                 Draw.MainMenu()
             end
         elseif activeTabScript == "logs" then
-            if activeMode == "farmer" then
+            if Draw.LogsSourceSwitch() then
+                local cloudKinds = { farmer = "greenhouse", miner = "miner", mirage = "mirage" }
+                Draw.CloudLogs(cloudKinds[activeMode] or "crypto")
+            elseif activeMode == "farmer" then
                 Draw.FarmerLogs()
             elseif activeMode == "miner" then
                 Draw.MinerLogs()
+            elseif activeMode == "mirage" then
+                Draw.MirageLogs()
             else
                 Draw.CollectLogs()
             end
@@ -7822,6 +9603,104 @@ function Draw.MinerMain()
     Draw.Journal("miner", miner.logs)
 end
 
+function Draw.MirageMain()
+    local st = Mirage.st
+
+    local title = st.house and ("Сарай миража дома №" .. st.house) or "Сарай миража"
+    Draw.SectionTitle(title)
+
+    if (st.dialogAt or 0) > 0 then
+        local labelW = imgui.CalcTextSize(u8"Монет в сарае").x + UI.Scale(10)
+        Draw.FillBar("Монет в сарае", labelW, st.now or 0, st.max or 10, Draw.FillColor(st.now or 0, st.max or 10))
+        if (st.cost or 0) > 0 then
+            imgui.Text(u8("Стоимость сбора: " .. Draw.CloudMoney(st.cost)))
+        end
+        imgui.TextDisabled(u8("Данные на " .. os.date('%H:%M:%S', st.dialogAt)))
+    else
+        imgui.TextDisabled(u8"Подойдите к сараю миража и нажмите Alt - окно сарая откроется здесь.")
+    end
+    imgui.Separator()
+
+    local spacing = imgui.GetStyle().ItemSpacing.x
+    local halfW = (imgui.GetWindowContentRegionWidth() - spacing) / 2
+    local canTake = st.open and (st.now or 0) > 0 and not st.pending
+    if imgui.AccentButtonClickable(canTake, fa.GEM .. u8"\tЗабрать монеты", imgui.ImVec2(halfW, 0)) then
+        Mirage.Take(true)
+    end
+    imgui.SameLine()
+    local autoIcon = settings.mirage.autoTake and fa.TOGGLE_ON or fa.TOGGLE_OFF
+    if imgui.Button(autoIcon .. "\t" .. (settings.mirage.autoTake and u8"Автосбор: вкл" or u8"Автосбор: выкл") .. "##mirage_auto_take", imgui.ImVec2(-1, 0)) then
+        settings.mirage.autoTake = not settings.mirage.autoTake
+        Storage.SaveSettings()
+    end
+    imgui.TextDisabled(u8"Автосбор забирает монеты сразу при открытии сарая, если они есть.")
+    if imgui.Checkbox(u8"Не открывать окно скрипта при автосборе", new.bool(settings.mirage.hideOnAutoTake)) then
+        settings.mirage.hideOnAutoTake = not settings.mirage.hideOnAutoTake
+        Storage.SaveSettings()
+    end
+
+    if st.open then
+        if imgui.Button(fa.CIRCLE_XMARK .. u8"\tЗакрыть окно сарая##mirage_close", imgui.ImVec2(-1, 0)) then
+            Mirage.Close()
+        end
+    end
+
+    if st.pending then
+        imgui.TextColoredRGB(string.format("{%s}Идёт процесс: {%s}%s", COLORS.YELLOW, COLORS.WHITE, tostring(st.statusText or "")))
+    elseif (st.statusText or "") ~= "" then
+        imgui.TextDisabled(u8(tostring(st.statusText)))
+    end
+
+    Draw.SectionTitle("Собрано за сессию")
+    if (st.sessionCoins or 0) > 0 then
+        imgui.Text(u8(string.format("Монет миража: %d, сборов: %d", st.sessionCoins, st.sessionCollects or 0)))
+        imgui.Text(u8(string.format("Потрачено: %s", Draw.CloudMoney(st.sessionSpent or 0))))
+    else
+        imgui.TextDisabled(u8"Пока ничего не собрано")
+    end
+
+    -- сараи, чьи 3D-надписи видны рядом: сколько монет на складе
+    Draw.SectionTitle("Сараи рядом")
+    imgui.Text(u8"Радиус поиска:")
+    imgui.SameLine()
+    imgui.PushItemWidth(-1)
+    local radius = new.int(tonumber(settings.mirage.nearRadius) or 50)
+    if imgui.SliderInt("##mirage_near_radius", radius, 5, 300, u8"%d м") then
+        settings.mirage.nearRadius = radius[0]
+        Storage.SaveSettings()
+    end
+    imgui.PopItemWidth()
+
+    local rows = Mirage.NearbySheds()
+    if #rows == 0 then
+        imgui.TextDisabled(u8"В этом радиусе сараев не видно.")
+    end
+    for i, row in ipairs(rows) do
+        local shed = row.shed
+        local name = shed.house and ("Дом №" .. shed.house) or "Дом не указан"
+        Draw.WareRow(i, string.format("%s (%d м)", name, math.floor(row.dist + 0.5)), shed.coins or 0)
+    end
+
+    Draw.Journal("mirage", st.logs)
+end
+
+function Draw.MirageLogs()
+    Draw.ResourceLogs({
+        id = "mirage",
+        days = Mirage.log.days or {},
+        state = ui_state.mirageLogs,
+        opts = settings.mirage,
+        extraKey = "spent",
+        extraLabel = "Потрачено $",
+        emptyText = "Логи сарая миража пока пустые.",
+        refresh = function()
+            Storage.SaveMirageLog()
+            Storage.LoadMirageLog()
+            return Mirage.log.days or {}
+        end,
+    })
+end
+
 function Draw.MinerSettings()
     imgui.Spacing()
     imgui.TextDisabled(u8"Замена диалога окном скрипта общая для всего скрипта - вкладка \"Основное\".")
@@ -7928,7 +9807,7 @@ function Draw.MainMenu()
             local remainSeconds = thresholdSeconds - elapsedSeconds
             if remainSeconds > 0 then
                 imgui.Text(u8("Напоминание через: " .. Collect.FormatDuration(remainSeconds)))
-            elseif collectReminder.lastNotifiedCollectAt == (lastCollectInfo.timestamp or 0) then
+            elseif Collect.GameState('crypto').notifiedAt == (lastCollectInfo.timestamp or 0) then
                 imgui.Text(u8("Напоминание: уведомление уже отправлено"))
             else
                 imgui.Text(u8("Напоминание: время ожидания истекло"))
@@ -8436,6 +10315,13 @@ function Draw.ImproveSettingsTab()
     imgui.CenterText(u8("Память уровней видеокарт:"))
     imgui.TextDisabled(u8"Уровни запоминаются по слотам и переживают перезапуск скрипта,\nпоэтому после обрыва сканирование продолжается, а не начинается заново.")
 
+    local _pktLevels = imgui.new.bool(settings.improve.packetLevels ~= false)
+    if imgui.Checkbox(u8"Брать уровни из пакетов инвентаря", _pktLevels) then
+        settings.improve.packetLevels = not (settings.improve.packetLevels ~= false)
+        Storage.SaveSettings()
+    end
+    imgui.TextDisabled(u8"Сервер сам присылает уровни карт вместе с инвентарём.\nС этой галочкой карты не нужно открывать по одной.")
+
     local _fast = imgui.new.bool(settings.improve.fastProbe ~= false)
     if imgui.Checkbox(u8"Быстрая проверка (не переоткрывать инвентарь между картами)", _fast) then
         settings.improve.fastProbe = not (settings.improve.fastProbe ~= false)
@@ -8462,6 +10348,7 @@ function Draw.ImproveSettingsTab()
 
     if imgui.ButtonClickable(not improve.cef.probing, u8"Забыть запомненные уровни", imgui.ImVec2(-1, UI.Scale(26))) then
         Improve.CardCacheClear(0)
+        Improve.ForgetPacketLevels()
         for _, c in ipairs(improve.cef.cards or {}) do
             c.levelKnown = false
             c.probeFailed = false
@@ -8630,6 +10517,516 @@ function Draw.ImproveLogsTab()
 end
 
 
+-- Поле ввода настройки уведомлений. Буфер живёт между кадрами, иначе ввод сбрасывается
+function Draw.TgInput(id, field, flags)
+    local tg = collectReminder.tg
+    local buf = tg.buf[field]
+    if not buf then
+        buf = new.char[256]()
+        buf_set(buf, u8(tostring(settings.notifications[field] or '')))
+        tg.buf[field] = buf
+    end
+    imgui.PushItemWidth(-1)
+    if imgui.InputText(id, buf, 256, flags or 0) then
+        settings.notifications[field] = Collect.TgTrim(u8:decode(ffi.string(buf)))
+        Storage.SaveSettings()
+    end
+    imgui.PopItemWidth()
+end
+
+-- Таблица событий: галочки "В игре" и "Telegram", интервал и когда придёт напоминание
+function Draw.ReminderTable()
+    local cfg = settings.notifications
+    Draw.SectionTitle("Напоминания о сборе")
+
+    local x0 = imgui.GetCursorPosX()
+    local colGame = x0 + UI.Scale(130)
+    local colTg = colGame + UI.Scale(70)
+    local colMin = colTg + UI.Scale(80)
+    local colStatus = colMin + UI.Scale(80)
+
+    imgui.TextDisabled(u8"Событие")
+    imgui.SameLine(colGame)
+    imgui.TextDisabled(u8"В игре")
+    imgui.SameLine(colTg)
+    imgui.TextDisabled(u8"Telegram")
+    imgui.SameLine(colMin)
+    imgui.TextDisabled(u8"Через, мин")
+    imgui.SameLine(colStatus)
+    imgui.TextDisabled(u8"Когда")
+
+    for _, kind in ipairs(Collect.TG_KINDS) do
+        local id = kind.id
+        imgui.AlignTextToFramePadding()
+        imgui.Text(u8(kind.short))
+
+        imgui.SameLine(colGame)
+        if imgui.Checkbox("##reminderGame" .. id, new.bool(cfg.game[id] == true)) then
+            cfg.game[id] = not cfg.game[id]
+            Storage.SaveSettings()
+        end
+
+        imgui.SameLine(colTg)
+        if imgui.Checkbox("##reminderTg" .. id, new.bool(cfg.tg[id] == true)) then
+            cfg.tg[id] = not cfg.tg[id]
+            Storage.SaveSettings()
+        end
+
+        local where = Collect.REMINDER_MINUTES[id]
+        imgui.SameLine(colMin)
+        imgui.PushItemWidth(UI.Scale(70))
+        local ptr = new.int(tonumber(settings[where[1]][where[2]]) or 0)
+        if imgui.InputInt("##reminderMin" .. id, ptr, 0, 0) then
+            settings[where[1]][where[2]] = math.maxEx(0, ptr[0])
+            Storage.SaveSettings()
+        end
+        imgui.PopItemWidth()
+
+        imgui.SameLine(colStatus)
+        imgui.TextDisabled(u8(Collect.TgReminderStatus(id)))
+    end
+
+    imgui.TextDisabled(u8"Напоминание приходит через заданное число минут после последнего сбора, одно на каждый сбор.\n0 минут - напоминание выключено. Интервал крипты общий с вкладкой \"Видеокарты\".")
+
+    local problem = Collect.TgConfigProblem()
+    local anyTg = false
+    for _, kind in ipairs(Collect.TG_KINDS) do
+        if cfg.tg[kind.id] then anyTg = true end
+    end
+    if anyTg and problem then
+        imgui.TextColored(UI.Vec4('warnColor'), u8("Telegram не настроен: " .. problem .. " (ниже)"))
+    end
+end
+
+-- Состояние менеджера уведомлений: без него напоминания в игре приходят сообщением в чат
+function Draw.NotifyManagerBlock()
+    local notifyState = Collect.GetNotifySystemState()
+    if not notifyState.ready then
+        imgui.TextDisabled(u8(notifyState.message))
+        if collectReminder.managerEnsurePending then
+            imgui.TextDisabled(u8"Подготовка менеджера уведомлений...")
+        else
+            if imgui.Button(u8(Collect.GetNotifyInstallButtonText(notifyState)), imgui.ImVec2(-1, 0)) then
+                Collect.EnsureNotificationManager()
+            end
+            if not notifyState.available then
+                if collectReminder.managerDownloadPending then
+                    imgui.TextDisabled(u8"Скачивание менеджера уведомлений и библиотеки...")
+                elseif imgui.Button(u8"Скачать менеджер и библиотеку", imgui.ImVec2(-1, 0)) then
+                    Collect.DownloadNotificationSystem()
+                end
+            end
+        end
+        imgui.TextDisabled(u8("GitHub: " .. NOTIFY_MANAGER_REPO_URL))
+        if collectReminder.managerStatusMessage ~= "" then
+            imgui.TextDisabled(u8(collectReminder.managerStatusMessage))
+        end
+    end
+    if notifyState.ready then
+        imgui.TextDisabled(u8"Менеджер уведомлений работает: напоминания появятся всплывающим окном.")
+    else
+        imgui.TextDisabled(u8"Пока менеджер не установлен, напоминания в игре приходят сообщением в чат.")
+    end
+end
+
+function Draw.SettingsNotifications()
+    local cfg = settings.notifications
+    local tg = collectReminder.tg
+    imgui.Spacing()
+
+    Draw.ReminderTable()
+
+    imgui.Spacing()
+    Draw.SectionTitle("Telegram")
+    imgui.Text(u8"Через какого бота:")
+    local half = (imgui.GetContentRegionAvail().x - imgui.GetStyle().ItemSpacing.x) / 2
+    local own = tonumber(cfg.methodBot) ~= 2
+    if (own and imgui.AccentButton or imgui.Button)(u8"Свой бот", imgui.ImVec2(half, 0)) then
+        cfg.methodBot = 1
+        Storage.SaveSettings()
+    end
+    imgui.SameLine()
+    if ((not own) and imgui.AccentButton or imgui.Button)(u8"Бот MCR Notification", imgui.ImVec2(-1, 0)) then
+        cfg.methodBot = 2
+        Storage.SaveSettings()
+    end
+
+    imgui.Spacing()
+    if own then
+        imgui.Text(u8"Токен бота:")
+        Draw.TgInput("##tgToken", "botToken", imgui.InputTextFlags.Password)
+        imgui.Text(u8"ID чата:")
+        Draw.TgInput("##tgChatId", "chatId")
+        imgui.TextDisabled(u8"Бота создайте в @BotFather, свой ID узнайте в @getmyid_bot и напишите своему боту /start.")
+        if imgui.Button(u8"Инструкция по созданию бота", imgui.ImVec2(-1, 0)) then
+            Util.OpenUrl("https://docs.arz-mcr.ru/create-tg-bot/")
+        end
+    else
+        imgui.Text(u8"Ваш ID в боте MCR Notification:")
+        Draw.TgInput("##tgMcrChatId", "mcrChatId")
+        if imgui.Button(u8"Открыть @MCR_NotificationBot", imgui.ImVec2(-1, 0)) then
+            Util.OpenUrl("https://t.me/MCR_NotificationBot")
+        end
+        imgui.TextDisabled(u8"В боте отправьте /start и следуйте инструкции - бот пришлёт ваш ID.")
+
+        imgui.Spacing()
+        Draw.McrKeyBlock()
+    end
+
+    local problem = Collect.TgConfigProblem()
+    if problem then
+        imgui.TextColored(UI.Vec4('badColor'), u8("Не заполнено: " .. problem))
+    end
+
+    if imgui.ButtonClickable(problem == nil, u8"Тестовое сообщение", imgui.ImVec2(-1, 0)) then
+        local ok, err = Collect.TgSend("[MMT] Тестовое сообщение. Уведомления работают.", 'test')
+        tg.lastResult = ok and (os.date('%H:%M:%S') .. " - отправляю...") or ("не отправлено: " .. tostring(err))
+    end
+    if tg.initError then
+        imgui.TextColored(UI.Vec4('badColor'), u8("Отправка недоступна: " .. tg.initError))
+    elseif tg.lastResult ~= '' then
+        imgui.TextDisabled(u8(tg.lastResult))
+    end
+
+    imgui.Spacing()
+    Draw.SectionTitle("Уведомления в игре")
+    Draw.NotifyManagerBlock()
+end
+
+-- Ключ MCR: общий для бота MCR Notification и облачного лога
+function Draw.McrKeyBlock()
+    local cfg = settings.notifications
+    local tg = collectReminder.tg
+    local key, source = Collect.TgGetKey()
+    if key ~= '' and not tg.keyEdit then
+        imgui.Text(u8(string.format("Ключ MCR: %s (%s)", Collect.TgMaskKey(key), source)))
+        if source == 'MMT' then
+            if imgui.Button(u8"Очистить ключ##mcrKey", imgui.ImVec2(-1, 0)) then
+                cfg.mcrKey = ''
+                tg.keyCheckedAt = -1000
+                Storage.SaveSettings()
+            end
+        elseif imgui.Button(u8"Указать другой ключ##mcrKey", imgui.ImVec2(-1, 0)) then
+            tg.keyEdit = true
+        end
+        return
+    end
+
+    imgui.Text(u8"Ключ MCR:")
+    imgui.TextDisabled(u8"Ключ не найден в MCR ПК и MLoader - введите его и нажмите Enter.")
+    local buf = tg.buf.mcrKey
+    if not buf then
+        buf = new.char[64]()
+        tg.buf.mcrKey = buf
+    end
+    imgui.PushItemWidth(-1)
+    if imgui.InputText("##tgMcrKey", buf, 64, imgui.InputTextFlags.Password + imgui.InputTextFlags.EnterReturnsTrue) then
+        cfg.mcrKey = Collect.TgTrim(ffi.string(buf))
+        buf_set(buf, '')
+        tg.keyEdit = false
+        Storage.SaveSettings()
+    end
+    imgui.PopItemWidth()
+    if tg.keyEdit and imgui.Button(u8"Отмена##mcrKey", imgui.ImVec2(-1, 0)) then
+        buf_set(buf, '')
+        tg.keyEdit = false
+    end
+end
+
+-- Настройка отправки сборов в облако (вкладка "Основное")
+function Draw.CloudSettings()
+    local sync = collectReminder.sync
+    Draw.SectionTitle("Облачный лог сборов")
+    imgui.TextDisabled(u8"Сборы крипты, теплиц и майнера уходят на сервер MCR по ключу.\nЛог можно смотреть с другого устройства; в разделе \"Логи\" - кнопка \"Облако\".")
+
+    if imgui.Checkbox(u8"Отправлять сборы на сервер", new.bool(settings.cloud.sendCollects)) then
+        settings.cloud.sendCollects = not settings.cloud.sendCollects
+        Storage.SaveSettings()
+    end
+
+    Draw.McrKeyBlock()
+
+    local queued = #Collect.SyncQueue()
+    local parts = { string.format("В очереди: %d", queued) }
+    if sync.lastOkAt > 0 then
+        table.insert(parts, "последняя отправка " .. os.date('%H:%M:%S', sync.lastOkAt))
+    end
+    imgui.TextDisabled(u8(table.concat(parts, ", ")))
+    if sync.lastError ~= '' and queued > 0 then
+        imgui.TextColored(UI.Vec4('warnColor'), u8("Не отправлено: " .. sync.lastError))
+        if os.time() < sync.pausedUntil and imgui.Button(u8"Отправить сейчас##cloudRetry", imgui.ImVec2(-1, 0)) then
+            sync.pausedUntil = 0
+            sync.failCount = 0
+        end
+    end
+end
+
+-- Переключатель "Локальный / Облако" над логами
+function Draw.LogsSourceSwitch()
+    local w = (imgui.GetWindowContentRegionWidth() - imgui.GetStyle().ItemSpacing.x) / 2
+    local isCloud = settings.cloud.logsSource == 'cloud'
+    if imgui.ButtonClickable(isCloud, u8"Локальный лог##logsSrcLocal", imgui.ImVec2(w, 0)) then
+        settings.cloud.logsSource = 'local'
+        Storage.SaveSettings()
+    end
+    imgui.SameLine()
+    if imgui.ButtonClickable(not isCloud, u8"Облако##logsSrcCloud", imgui.ImVec2(-1, 0)) then
+        settings.cloud.logsSource = 'cloud'
+        Storage.SaveSettings()
+    end
+    imgui.Separator()
+    return settings.cloud.logsSource == 'cloud'
+end
+
+function Draw.CloudAmount(v)
+    local n = tonumber(Collect.JsonValue(v)) or 0
+    local s = string.format('%.3f', n)
+    s = s:gsub('0+$', '')
+    s = s:gsub('%.$', '')
+    return s
+end
+
+-- Итог дня по выбранному виду сбора (сумма по всем аккаунтам)
+function Draw.CloudDayLabel(day, kind)
+    local collects, btc, asc, added, deposited = 0, 0, 0, 0, 0
+    for _, acc in ipairs(day.accounts or {}) do
+        local bank = (kind == 'crypto') and Collect.JsonValue(acc.bank) or nil
+        if bank then
+            deposited = deposited + (tonumber(Collect.JsonValue(bank.deposited)) or 0)
+        end
+        local sec = Collect.JsonValue(acc[kind])
+        if sec then
+            collects = collects + (tonumber(sec.collects) or 0)
+            if kind == 'crypto' then
+                local c = Collect.JsonValue(sec.collected) or {}
+                btc = btc + (tonumber(Collect.JsonValue(c.BTC)) or 0)
+                asc = asc + (tonumber(Collect.JsonValue(c.ASC)) or 0)
+            else
+                added = added + (tonumber(Collect.JsonValue(sec.water_added) or Collect.JsonValue(sec.charge_added) or Collect.JsonValue(sec.spent)) or 0)
+            end
+        end
+    end
+    if collects == 0 and deposited <= 0 then return nil end
+    if kind == 'crypto' then
+        local label = string.format('%s | BTC: %s | ASC: %s | сборов: %d', tostring(day.date), Draw.CloudAmount(btc), Draw.CloudAmount(asc), collects)
+        if deposited > 0 then
+            label = label .. ' | банк: ' .. Draw.CloudMoney(deposited)
+        end
+        return label
+    end
+    if kind == 'mirage' then
+        return string.format('%s | сборов: %d | потрачено: %s', tostring(day.date), collects, Draw.CloudMoney(added))
+    end
+    local addedLabel = (kind == 'greenhouse') and 'воды' or 'зарядки'
+    return string.format('%s | сборов: %d | %s залито: %d', tostring(day.date), collects, addedLabel, added)
+end
+
+function Draw.CloudCrypto(sec)
+    local c = Collect.JsonValue(sec.collected) or {}
+    imgui.Text(u8(string.format('BTC: %s | ASC: %s', Draw.CloudAmount(c.BTC), Draw.CloudAmount(c.ASC))))
+    local sh = Collect.JsonValue(sec.shelves) or {}
+    imgui.TextDisabled(u8(string.format('Полок: %d, с выплатой: %d, включено карт: %d',
+        tonumber(sh.visited) or 0, tonumber(sh.collected) or 0, tonumber(sh.cards_enabled) or 0)))
+    local l = Collect.JsonValue(sec.liquid_used) or {}
+    local lb, ls, la = tonumber(l.btc) or 0, tonumber(l.super_btc) or 0, tonumber(l.asc) or 0
+    if lb + ls + la > 0 then
+        imgui.TextDisabled(u8(string.format('Охлаждайка: BTC %d, супер %d, ASC %d', lb, ls, la)))
+    end
+    for hi, house in ipairs(Collect.JsonValue(sec.houses) or {}) do
+        local hc = Collect.JsonValue(house.collected) or {}
+        local label = string.format('Дом №%s | BTC: %s | ASC: %s | сборов: %d',
+            tostring(Collect.JsonValue(house.house_id) or '?'), Draw.CloudAmount(hc.BTC), Draw.CloudAmount(hc.ASC), tonumber(house.collects) or 0)
+        local interrupted = tonumber(house.interrupted) or 0
+        if interrupted > 0 then
+            label = label .. string.format(' (прервано: %d)', interrupted)
+        end
+        imgui.BulletText(u8(label))
+    end
+end
+
+function Draw.CloudMoney(v)
+    local digits = tostring(math.floor(tonumber(Collect.JsonValue(v)) or 0))
+    local grouped = digits:reverse():gsub('(%d%d%d)', '%1.')
+    grouped = grouped:reverse():gsub('^%.', '')
+    return '$' .. grouped
+end
+
+function Draw.CloudBank(bank)
+    imgui.Text(u8(string.format('Пополнено банков: %s, операций: %d',
+        Draw.CloudMoney(bank.deposited), tonumber(Collect.JsonValue(bank.operations)) or 0)))
+    for _, house in ipairs(Collect.JsonValue(bank.houses) or {}) do
+        imgui.BulletText(u8(string.format('Дом №%s | %s',
+            tostring(Collect.JsonValue(house.house_id) or '?'), Draw.CloudMoney(house.deposited))))
+    end
+end
+
+function Draw.CloudResource(sec, kind)
+    if kind == 'mirage' then
+        imgui.Text(u8('Потрачено: ' .. Draw.CloudMoney(sec.spent)))
+    else
+        local added = tonumber(Collect.JsonValue(sec.water_added) or Collect.JsonValue(sec.charge_added)) or 0
+        imgui.Text(u8(string.format('%s залито: %d', (kind == 'greenhouse') and 'Воды' or 'Зарядки', added)))
+    end
+    local items = Collect.JsonValue(sec.items) or {}
+    if #items == 0 then
+        imgui.TextDisabled(u8'Ресурсы не собирались.')
+    end
+    for _, item in ipairs(items) do
+        -- названия приходят в UTF-8, их отдаём imgui как есть
+        imgui.BulletText('%s', tostring(Collect.JsonValue(item.name) or '?') .. u8(string.format(' - %d', tonumber(item.amount) or 0)))
+    end
+end
+
+-- kind = 'crypto' | 'greenhouse' | 'miner'
+function Draw.CloudLogs(kind)
+    local st = collectReminder.sync.summary
+    local period = tonumber(settings.cloud.period) or 7
+    local periodKey = tostring(period)
+
+    -- при первом открытии и смене периода подтягиваем данные сами (один раз, чтобы не долбить сервер)
+    if not st.loading and st.key ~= periodKey and st.autoKey ~= periodKey then
+        st.autoKey = periodKey
+        Collect.CloudFetchSummary(period)
+    end
+
+    if imgui.ButtonClickable(not st.loading, u8"Обновить##cloudRefresh") then
+        Collect.CloudFetchSummary(period)
+    end
+    imgui.SameLine()
+    if st.loading then
+        imgui.TextDisabled(u8"Загружаю...")
+    elseif st.error ~= '' then
+        imgui.TextColored(UI.Vec4('badColor'), u8(st.error))
+    elseif st.at > 0 then
+        imgui.TextDisabled(u8("Обновлено в " .. os.date('%H:%M:%S', st.at)))
+    end
+
+    local periodOptions = { 1, 3, 7, 14, 30, 93 }
+    local periodW = (imgui.GetWindowContentRegionWidth() - imgui.GetStyle().ItemSpacing.x * (#periodOptions - 1)) / #periodOptions
+    for i, days in ipairs(periodOptions) do
+        if i > 1 then imgui.SameLine() end
+        local label = (days == 1) and 'Сегодня' or (days .. ' дн.')
+        if imgui.ButtonClickable(period ~= days, u8(label) .. "##cloudPeriod" .. days, imgui.ImVec2(i == #periodOptions and -1 or periodW, 0)) then
+            settings.cloud.period = days
+            Storage.SaveSettings()
+        end
+    end
+    imgui.Separator()
+
+    imgui.BeginChild('cloud_logs_' .. kind, imgui.ImVec2(-1, -1), true)
+    imgui.ScrollMouse()
+    local data = st.data
+    if not data or st.key ~= periodKey then
+        imgui.TextDisabled(u8(st.loading and "Загружаю лог из облака..." or "Нет данных. Нажмите \"Обновить\"."))
+        imgui.EndChild()
+        return
+    end
+
+    local shown = 0
+    for di, day in ipairs(Collect.JsonValue(data.days) or {}) do
+        local label = Draw.CloudDayLabel(day, kind)
+        if label then
+            shown = shown + 1
+            if imgui.TreeNodeStr(u8(label) .. '##cloudDay' .. kind .. di) then
+                for ai, acc in ipairs(day.accounts or {}) do
+                    local sec = Collect.JsonValue(acc[kind])
+                    local bank = (kind == 'crypto') and Collect.JsonValue(acc.bank) or nil
+                    if sec or bank then
+                        local server = Collect.JsonValue(acc.server) or {}
+                        local serverName = Collect.JsonValue(server.title) or Collect.JsonValue(server.ip) or '?'
+                        local head = tostring(Collect.JsonValue(acc.nick) or '?') .. ' | ' .. tostring(serverName)
+                        if sec then
+                            head = head .. u8(string.format(' | сборов: %d', tonumber(sec.collects) or 0))
+                            local interrupted = tonumber(sec.interrupted) or 0
+                            if interrupted > 0 then
+                                head = head .. u8(string.format(' (прервано: %d)', interrupted))
+                            end
+                        end
+                        if imgui.TreeNodeStr(head .. '##cloudAcc' .. kind .. di .. '_' .. ai) then
+                            if sec and kind == 'crypto' then
+                                Draw.CloudCrypto(sec)
+                            elseif sec then
+                                Draw.CloudResource(sec, kind)
+                            end
+                            if bank then
+                                Draw.CloudBank(bank)
+                            end
+                            imgui.TreePop()
+                        end
+                    end
+                end
+                imgui.TreePop()
+            end
+        end
+    end
+    if shown == 0 then
+        imgui.TextDisabled(u8"За этот период сборов в облаке нет.")
+    end
+    imgui.EndChild()
+end
+
+-- Настройки майнинга крипты: сбор, заливка, напоминание, заточка
+function Draw.CryptoSettings()
+    imgui.Spacing()
+    if imgui.Checkbox(u8"Скрыть текст получения крипты в чате", new.bool(settings.main.hideMessagesCollect)) then
+        settings.main.hideMessagesCollect = not settings.main.hideMessagesCollect 
+        Storage.SaveSettings()
+    end
+
+    if imgui.Checkbox(u8"Общая сводка в чат после сбора", new.bool(settings.main.showCollectSummary)) then
+        settings.main.showCollectSummary = not settings.main.showCollectSummary
+        Storage.SaveSettings()
+    end
+    imgui.TextDisabled(u8"Уровни видеокарт, суммы по домам, время и детали сбора")
+
+    if imgui.Checkbox(u8"Закрывать окно скрипта после /mmtflash", new.bool(settings.main.hideWindowOnFlashCmd)) then
+        settings.main.hideWindowOnFlashCmd = not settings.main.hideWindowOnFlashCmd
+        Storage.SaveSettings()
+    end
+    imgui.TextDisabled(u8"Окно не будет всплывать на диалогах дома и видеокарт во время такого сбора")
+
+    if imgui.Checkbox(u8"Проверять смазку при старте заточки", new.bool(settings.improve.checkOilsOnStart)) then
+        settings.improve.checkOilsOnStart = not settings.improve.checkOilsOnStart
+        Storage.SaveSettings()
+    end
+    imgui.TextDisabled(u8"Если выключено, заточка стартует без принудительной проверки")
+
+    imgui.Text(u8"Напомнить, если не было сбора:")
+    imgui.PushItemWidth(UI.Scale(120))
+    local collectNotifyMinutesPtr = imgui.new.int(tonumber(settings.main.collectNotifyMinutes) or 0)
+    if imgui.InputInt("##collectNotifyMinutes", collectNotifyMinutesPtr, 0, 0) then
+        settings.main.collectNotifyMinutes = math.maxEx(0, collectNotifyMinutesPtr[0])
+        Storage.SaveSettings()
+    end
+    imgui.PopItemWidth()
+    imgui.SameLine()
+    imgui.TextDisabled(u8"мин (0 = выкл)")
+    imgui.TextDisabled(u8"Куда присылать напоминания - в игру или в Telegram - вкладка \"Уведомления\".")
+
+    imgui.Spacing()
+    imgui.Separator()
+    imgui.Spacing()
+
+    imgui.Text(u8(string.format("Заливать при %.0f%%%% или ниже:", settings.main.fillFrom)))
+    imgui.PushItemWidth(-1)
+    local _fillFrom = new.float(settings.main.fillFrom)
+    if imgui.SliderFloat("##fillFrom", _fillFrom, 0, 99, "%.0f%%") then
+        settings.main.fillFrom = Util.Round(_fillFrom[0], 2)
+        Storage.SaveSettings()
+    end
+    imgui.PopItemWidth()
+
+    imgui.Text(u8(string.format("Подсвечивать дом красным от %.0f крипты:", settings.main.maxCollectAlert)))
+    imgui.PushItemWidth(-1)
+    local _maxCollectAlert = new.float(tonumber(settings.main.maxCollectAlert) or 11.0)
+    if imgui.SliderFloat("##maxCollectAlert", _maxCollectAlert, 1, 30, "%.0f") then
+        settings.main.maxCollectAlert = Util.Round(_maxCollectAlert[0], 2)
+        Storage.SaveSettings()
+    end
+    imgui.PopItemWidth()
+    imgui.TextDisabled(u8"Столбец \"Мкс. крипты\" в списке домов: выше порога - хранилище пора разгружать")
+end
+
 function Draw.Settings()
     -- Верхняя панель статуса (если включена)
     if settings.main.showStatusPanel then
@@ -8674,91 +11071,14 @@ function Draw.Settings()
                 Storage.SaveSettings()
             end
 
-            if imgui.Checkbox(u8"Скрыть текст получения крипты в чате", new.bool(settings.main.hideMessagesCollect)) then
-                settings.main.hideMessagesCollect = not settings.main.hideMessagesCollect 
-                Storage.SaveSettings()
-            end
-
-            if imgui.Checkbox(u8"Общая сводка в чат после сбора", new.bool(settings.main.showCollectSummary)) then
-                settings.main.showCollectSummary = not settings.main.showCollectSummary
-                Storage.SaveSettings()
-            end
-            imgui.TextDisabled(u8"Уровни видеокарт, суммы по домам, время и детали сбора")
-
-            if imgui.Checkbox(u8"Закрывать окно скрипта после /mmtflash", new.bool(settings.main.hideWindowOnFlashCmd)) then
-                settings.main.hideWindowOnFlashCmd = not settings.main.hideWindowOnFlashCmd
-                Storage.SaveSettings()
-            end
-            imgui.TextDisabled(u8"Окно не будет всплывать на диалогах дома и видеокарт во время такого сбора")
-
             if imgui.Checkbox(u8"Отображать панель статуса (дебаг информация)", new.bool(settings.main.showStatusPanel)) then
                 settings.main.showStatusPanel = not settings.main.showStatusPanel 
                 Storage.SaveSettings()
             end
             imgui.TextDisabled(u8"Отображать информацию о работающих процессах вверху окна")
 
-            if imgui.Checkbox(u8"Проверять смазку при старте заточки", new.bool(settings.improve.checkOilsOnStart)) then
-                settings.improve.checkOilsOnStart = not settings.improve.checkOilsOnStart
-                Storage.SaveSettings()
-            end
-            imgui.TextDisabled(u8"Если выключено, заточка стартует без принудительной проверки")
-
-            imgui.Text(u8"Напомнить, если не было сбора:")
-            imgui.PushItemWidth(UI.Scale(120))
-            local collectNotifyMinutesPtr = imgui.new.int(tonumber(settings.main.collectNotifyMinutes) or 0)
-            if imgui.InputInt("##collectNotifyMinutes", collectNotifyMinutesPtr, 0, 0) then
-                settings.main.collectNotifyMinutes = math.maxEx(0, collectNotifyMinutesPtr[0])
-                Storage.SaveSettings()
-            end
-            imgui.PopItemWidth()
-            imgui.SameLine()
-            imgui.TextDisabled(u8"мин (0 = выкл)")
-
-            local notifyState = Collect.GetNotifySystemState()
-            if not notifyState.ready then
-                imgui.TextDisabled(u8(notifyState.message))
-                if collectReminder.managerEnsurePending then
-                    imgui.TextDisabled(u8"Подготовка менеджера уведомлений...")
-                else
-                    if imgui.Button(u8(Collect.GetNotifyInstallButtonText(notifyState)), imgui.ImVec2(-1, 0)) then
-                        Collect.EnsureNotificationManager()
-                    end
-                    if not notifyState.available then
-                        if collectReminder.managerDownloadPending then
-                            imgui.TextDisabled(u8"Скачивание менеджера уведомлений и библиотеки...")
-                        elseif imgui.Button(u8"Скачать менеджер и библиотеку", imgui.ImVec2(-1, 0)) then
-                            Collect.DownloadNotificationSystem()
-                        end
-                    end
-                end
-                imgui.TextDisabled(u8("GitHub: " .. NOTIFY_MANAGER_REPO_URL))
-                if collectReminder.managerStatusMessage ~= "" then
-                    imgui.TextDisabled(u8(collectReminder.managerStatusMessage))
-                end
-            end
-
             imgui.Spacing()
-            imgui.Separator()
-            imgui.Spacing()
-
-            imgui.Text(u8(string.format("Заливать при %.0f%%%% или ниже:", settings.main.fillFrom)))
-            imgui.PushItemWidth(-1)
-            local _fillFrom = new.float(settings.main.fillFrom)
-            if imgui.SliderFloat("##fillFrom", _fillFrom, 0, 99, "%.0f%%") then
-                settings.main.fillFrom = Util.Round(_fillFrom[0], 2)
-                Storage.SaveSettings()
-            end
-            imgui.PopItemWidth()
-
-            imgui.Text(u8(string.format("Подсвечивать дом красным от %.0f крипты:", settings.main.maxCollectAlert)))
-            imgui.PushItemWidth(-1)
-            local _maxCollectAlert = new.float(tonumber(settings.main.maxCollectAlert) or 11.0)
-            if imgui.SliderFloat("##maxCollectAlert", _maxCollectAlert, 1, 30, "%.0f") then
-                settings.main.maxCollectAlert = Util.Round(_maxCollectAlert[0], 2)
-                Storage.SaveSettings()
-            end
-            imgui.PopItemWidth()
-            imgui.TextDisabled(u8"Столбец \"Мкс. крипты\" в списке домов: выше порога - хранилище пора разгружать")
+            Draw.CloudSettings()
 
             imgui.EndChild()
             imgui.EndTabItem()
@@ -9142,6 +11462,15 @@ function Draw.Settings()
             imgui.EndTabItem()
         end
 
+        -- ТАБ: Видеокарты (майнинг крипты)
+        if imgui.BeginTabItem(u8"Видеокарты") then
+            imgui.BeginChild("tab_crypto", imgui.ImVec2(-1, -1))
+            imgui.ScrollMouse()
+            Draw.CryptoSettings()
+            imgui.EndChild()
+            imgui.EndTabItem()
+        end
+
         -- ТАБ: Теплицы (фермер)
         if imgui.BeginTabItem(u8"Теплицы") then
             imgui.BeginChild("tab_farmer", imgui.ImVec2(-1, -1))
@@ -9156,6 +11485,15 @@ function Draw.Settings()
             imgui.BeginChild("tab_miner", imgui.ImVec2(-1, -1))
             imgui.ScrollMouse()
             Draw.MinerSettings()
+            imgui.EndChild()
+            imgui.EndTabItem()
+        end
+
+        -- ТАБ: Уведомления в Telegram
+        if imgui.BeginTabItem(u8"Уведомления") then
+            imgui.BeginChild("tab_notifications", imgui.ImVec2(-1, -1))
+            imgui.ScrollMouse()
+            Draw.SettingsNotifications()
             imgui.EndChild()
             imgui.EndTabItem()
         end
