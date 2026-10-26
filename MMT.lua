@@ -5,7 +5,7 @@
 script_authors('Sand')
 script_name('MMT | Mining Tool')
 script_description('Mining assistant TG: @Mister_Sand')
-script_version("2.3")
+script_version("2.4")
 
 -- =====================================================================================================================
 --                                                          Import
@@ -59,7 +59,13 @@ ISMONETLOADER = true
 SEPORATORPATCH = "/"
 if MONET_DPI_SCALE == nil then MONET_DPI_SCALE = 1.0 ISMONETLOADER = false SEPORATORPATCH = "\\" end
 
+-- На ПК относительный путь считается от папки игры, а не от moonloader, поэтому
+-- раньше данные лежали в <папка игры>\config\MMT CFGs. Теперь, как у остальных
+-- скриптов, - в moonloader\config\MMT CFGs (перенос: Storage.MigrateLegacyConfig).
 local folderConfig = 'config'..SEPORATORPATCH
+if not ISMONETLOADER then
+    folderConfig = getWorkingDirectory()..SEPORATORPATCH..folderConfig
+end
 local PATCHCONFIG = folderConfig..'MMT CFGs'..SEPORATORPATCH
 
 -- === Логи / статистика заточки видеокарт ===
@@ -300,7 +306,7 @@ local defaultSettings = {
         levelCacheHours = 0,
         -- Сколько повторов делать, если слот не ответил при проверке уровня
         probeRetries = 2,
-        -- Быстрая проверка: не переоткрывать /invent между картами
+        -- Не переоткрывать /invent между картами: при проверке уровней и при заточке
         fastProbe = true,
         -- Брать уровни карт из пакетов инвентаря, а не из диалога по каждой карте
         packetLevels = true,
@@ -634,6 +640,8 @@ local improve = {
     -- Кэш видеокарт из CEF-инвентаря
     videoCards   = {},     -- { { slot = <int>, level = <int>, storageUpgrade = <bool> } ... }
     select       = 0,      -- индекс выбранной карты (когда menuAll=false)
+    selectSlot   = nil,    -- слот выбранной карты: индекс меняется при пересборке списка
+    lastResult   = nil,    -- последний результат заточки для экрана «Процесс»
     currentIndex = 0,      -- индекс карты, которую сейчас точим
 
     oils = { -- инвентарь смазок
@@ -682,6 +690,12 @@ local improve = {
         inventoryFresh = false,   -- инвентарь уже открыт, можно кликать без /invent
         inventoryOpen = false,    -- мы открывали инвентарь и ещё не закрывали его
         inventoryBlockedUntil = 0,-- сервер попросил подождать перед следующим /invent
+        upgradeFast = false,      -- текущий клик заточки ушёл без /invent
+        pktSnapshot = false,      -- весь инвентарь пришёл пакетом (при входе в игру)
+        listDirty = false,        -- список карт изменился по пакетам, пересобрать videoCards
+        lastClickSlot = nil,      -- слот последнего клика в инвентаре
+        lastClickAt = 0,
+        upgradeFastFails = 0,     -- сколько раз подряд такой клик не открыл окно
         unknownCount = 0,         -- сколько карт выбранного типа остались без уровня
         probing = false,
         probeDone = false,
@@ -855,11 +869,170 @@ function Improve.ApplyPacketCardSlot(slot, itemId, itemData)
             c.levelGuessed = false
             c.probeFailed = false
             Improve.CardCacheSet(c.slot, c.name, _level, _cardType, c.storageUpgrade)
-            break
+            return true
         end
     end
 
+    -- карты ещё нет в списке (переложили из хранилища, список не обновлялся),
+    -- но кэш всё равно переписываем: у всех карт одно имя, и по нему не понять,
+    -- что в слоте лежит уже другая карта. Иначе после перезапуска всплывёт старый уровень
+    local _cached = cardLevels.slots[tostring(slot)]
+    local _name, _storage = (_cardType == 2) and 'Arizona Video Card' or 'Видеокарта', false
+    if type(_cached) == 'table' and (tonumber(_cached.cardType) or 0) == _cardType then
+        _name, _storage = _cached.name or _name, _cached.storage == true
+    end
+    Improve.CardCacheSet(slot, _name, _level, _cardType, _storage)
+
+    -- инвентарь известен целиком (пришёл при входе) или список уже собран через /stats:
+    -- новая карта сразу попадает в список, /stats для этого не нужен
+    if improve.cef.pktSnapshot or #(improve.cef.cards or {}) > 0 then
+        Improve.AddCefCardSlot(slot, _name, _storage, _cardType)
+        improve.cef.listDirty = true
+    end
+
     return true
+end
+
+-- В слоте теперь не видеокарта: запомненный уровень больше ни о чём не говорит,
+-- а сама карта ушла из инвентаря или переехала в другой слот
+function Improve.ForgetPacketSlot(slot)
+    improve.cef.pktLevels[slot] = nil
+    if cardLevels.slots[tostring(slot)] ~= nil then
+        Improve.CardCacheForget(slot)
+    end
+
+    local _cards = improve.cef.cards or {}
+    for i = #_cards, 1, -1 do
+        if (tonumber(_cards[i].slot) or 0) == slot then
+            table.remove(_cards, i)
+            improve.cef.listDirty = true
+        end
+    end
+end
+
+-- Список карт на экране пересобираем, когда это ничему не мешает:
+-- посреди заточки или проверки индексы карт должны оставаться прежними
+function Improve.FlushCardListDirty()
+    if not improve.cef.listDirty or improve.cef.probing or improve.oils.busy then return end
+    if improve.isOn and improve.step ~= Improve.STEP.SELECT_CARD then return end
+    improve.cef.listDirty = false
+    Improve.SyncVideoCardsFromCef()
+end
+
+-- Последний слот, по которому кликнули в инвентаре: к нему относится окно
+-- улучшения или «Информация о предмете», которое придёт следом
+function Improve.NoteClickSlot(slot)
+    slot = tonumber(slot)
+    if not slot or slot < 0 then return end
+    improve.cef.lastClickSlot = slot
+    improve.cef.lastClickAt = os.clock()
+end
+
+-- Исходящий CEF-пакет: ПК шлёт тип 18 строкой, мобильный клиент - 0x3F с iface
+function Improve.CaptureSentClick(id, bs)
+    if id ~= 220 or not bs then return end
+
+    pcall(raknetBitStreamResetReadPointer, bs)
+    local _ok, _payload, _mobile = pcall(function()
+        raknetBitStreamIgnoreBits(bs, 8)
+        local _type = raknetBitStreamReadInt8(bs)
+        if _type == 18 then
+            local _len = raknetBitStreamReadInt16(bs)
+            if not _len or _len <= 0 or _len > 4096 then return nil end
+            if not Util.BitStreamHasBytes(bs, 4, _len) then return nil end
+            return raknetBitStreamReadString(bs, _len), false
+        end
+        if _type == 0x3F then
+            local _iface = raknetBitStreamReadInt8(bs)
+            raknetBitStreamIgnoreBits(bs, 64)
+            local _len = raknetBitStreamReadInt16(bs)
+            if _iface ~= 52 or not _len or _len <= 0 or _len > 4096 then return nil end
+            if not Util.BitStreamHasBytes(bs, 13, _len) then return nil end
+            return raknetBitStreamReadString(bs, _len), true
+        end
+        return nil
+    end)
+    pcall(raknetBitStreamResetReadPointer, bs)
+    if not _ok or type(_payload) ~= 'string' then return end
+
+    if not _mobile then
+        if _payload:sub(1, 14) ~= 'clickOnButton|' and _payload:sub(1, 18) ~= 'rightClickOnBlock|' then return end
+    elseif _payload:find('"from"', 1, true) then
+        return
+    end
+
+    local _slot = _payload:match('"slot":%s*(%d+)')
+    local _itemType = tonumber(_payload:match('"type":%s*(%d+)') or 1)
+    if _slot and _itemType == 1 then
+        Improve.NoteClickSlot(_slot)
+    end
+end
+
+-- Тип карты в слоте по тому, что о нём уже известно
+function Improve.KnownCardTypeForSlot(slot)
+    for _, c in ipairs(improve.cef.cards or {}) do
+        if (tonumber(c.slot) or 0) == slot then return tonumber(c.cardType) end
+    end
+    local _pkt = improve.cef.pktLevels[slot]
+    if type(_pkt) == 'table' then return tonumber(_pkt.cardType) end
+    local _cached = cardLevels.slots[tostring(slot)]
+    if type(_cached) == 'table' then return tonumber(_cached.cardType) end
+    return nil
+end
+
+-- Уровень карты из окна, которое игрок открыл сам: выбор вида улучшения
+-- ("до N уровня" = сейчас N-1) или «Информация о предмете» ("Уровень производительности: N из 10")
+function Improve.CaptureCardDialog(title, text)
+    if improve.cef.probing then return end
+
+    local _slot = tonumber(improve.cef.lastClickSlot)
+    if not _slot or (os.clock() - (improve.cef.lastClickAt or 0)) > 5 then return end
+
+    local _title = Farmer.stripColors(tostring(title or ''))
+    local _text = Farmer.stripColors(tostring(text or ''))
+    local _level, _storage, _cardType
+
+    if _title:find('Выберите вид улучшения для видеокарты', 1, true) then
+        _level = Improve.ParseCardLevelFromDialog(_text)
+        _storage = not _text:find('Увеличить объем хранения криптовалюты на видео-карте', 1, true)
+        _cardType = Improve.KnownCardTypeForSlot(_slot)
+    elseif _title:find('Информация о предмете', 1, true) then
+        local _item = _text:match('Предмет:%s*([^\r\n]+)') or ''
+        if _item:find('Arizona Video Card', 1, true) then
+            _cardType = 2
+        elseif _item:find('Видеокарта', 1, true) then
+            _cardType = 1
+        end
+        _level = tonumber(_text:match('Уровень производительности:%s*(%d+)%s*из%s*10'))
+    else
+        return
+    end
+
+    if not _level or not _cardType or _level < 1 or _level > 10 then return end
+    improve.cef.lastClickSlot = nil
+
+    improve.cef.pktLevels[_slot] = { level = _level, cardType = _cardType, at = os.time() }
+
+    for _, c in ipairs(improve.cef.cards or {}) do
+        if (tonumber(c.slot) or 0) == _slot and (tonumber(c.cardType) or 0) == _cardType then
+            if (not c.levelKnown) or (tonumber(c.level) or 0) ~= _level then
+                Improve.LogAdd('INFO', string.format('Окно видеокарты: слот %d - уровень %d.', _slot, _level))
+            end
+            Improve.UpdateCefCardLevel(_slot, _level, _storage)
+            c.levelGuessed = false
+            improve.cef.listDirty = true
+            return
+        end
+    end
+
+    local _cached = cardLevels.slots[tostring(_slot)]
+    local _name = (_cardType == 2) and 'Arizona Video Card' or 'Видеокарта'
+    if _storage == nil then _storage = false end
+    if type(_cached) == 'table' and (tonumber(_cached.cardType) or 0) == _cardType then
+        _name = _cached.name or _name
+        if _storage == false then _storage = _cached.storage == true end
+    end
+    Improve.CardCacheSet(_slot, _name, _level, _cardType, _storage)
 end
 
 -- Разбор страницы инвентаря: {"action":0|2,"data":{"type":1,"items":[...]}}
@@ -873,15 +1046,23 @@ function Improve.ApplyPacketInventoryPage(page)
     local _action = tonumber(page.action) or tonumber(_body.action)
     if _action ~= nil and _action ~= 0 and _action ~= 2 then return end
 
+    -- action 0 по основному инвентарю приходит при входе в игру: весь инвентарь
+    -- кусками по диапазонам слотов, пустые слоты - без поля item
+    if _action == 0 then improve.cef.pktSnapshot = true end
+
     for _, itemData in ipairs(_body.items) do
         if type(itemData) == 'table' then
             local _slot = tonumber(itemData.slot)
             local _item = tonumber(itemData.item)
             if _slot and _item then
-                Improve.ApplyPacketCardSlot(_slot, _item, itemData)
+                if not CEF_CARD_ITEMS[_item] then
+                    Improve.ForgetPacketSlot(_slot)
+                else
+                    Improve.ApplyPacketCardSlot(_slot, _item, itemData)
+                end
             elseif _slot and itemData.item == nil then
-                -- слот опустел: прошлый уровень тут больше ни о чём не говорит
-                improve.cef.pktLevels[_slot] = nil
+                -- слот опустел
+                Improve.ForgetPacketSlot(_slot)
             end
         end
     end
@@ -905,8 +1086,11 @@ function Improve.ReadCefPacket(id, bs)
             local _encoded = raknetBitStreamReadInt8(bs)
             if not _len or _len < 0 or _encoded == nil then return nil end
             if _encoded ~= 0 then
+                -- сжатая строка короче _len, поэтому проверяем только, что данные есть
+                if not Util.BitStreamHasBytes(bs, 9, 1) then return nil end
                 return nil, nil, raknetBitStreamDecodeString(bs, _len + _encoded)
             end
+            if not Util.BitStreamHasBytes(bs, 9, _len) then return nil end
             return nil, nil, raknetBitStreamReadString(bs, _len)
         end
 
@@ -917,8 +1101,10 @@ function Improve.ReadCefPacket(id, bs)
             local _encoded = raknetBitStreamReadInt8(bs)
             if not _len or _len < 0 or _encoded == nil then return nil end
             if _encoded ~= 0 then
+                if not Util.BitStreamHasBytes(bs, 7, 1) then return nil end
                 return _ifaceId, _subId, raknetBitStreamDecodeString(bs, _len + 1)
             end
+            if not Util.BitStreamHasBytes(bs, 7, _len) then return nil end
             return _ifaceId, _subId, raknetBitStreamReadString(bs, _len)
         end
 
@@ -967,6 +1153,10 @@ end
 
 addEventHandler('onReceivePacket', function(id, bs)
     pcall(Improve.CaptureInventoryPacket, id, bs)
+end)
+
+addEventHandler('onSendPacket', function(id, bs)
+    pcall(Improve.CaptureSentClick, id, bs)
 end)
 
 -- Попросить сервер прислать инвентарь целиком: один такой запрос заменяет
@@ -1254,6 +1444,7 @@ function Improve.SendCefClickOnSlot(slot, action, clickType)
     clickType = tonumber(clickType or 1) or 1
     if slot <= 0 then return false end
 
+    Improve.NoteClickSlot(slot)
     local packet = string.format('clickOnButton|{"type": %d,"slot": %d, "action": %d}', clickType, slot, action)
     improve.cef.lastPacketId = 220
     improve.cef.lastPacket = packet
@@ -1289,6 +1480,7 @@ function Improve.OpenCardDialog(slot, action, clickType, skipInvent)
     end
 
     if ISMONETLOADER then
+        Improve.NoteClickSlot(slot)
         local payload = string.format('{"action":1,"id":0,"slot":%d,"type":1}', slot)
         improve.cef.lastPacketId = 220
         improve.cef.lastPacket = payload
@@ -1418,13 +1610,7 @@ function FlashCollect.Start(hideWindow, fromCommand)
     flashCollect.hideWindow = hideWindow == true
     flashCollect.fromCommand = fromCommand == true
 
-    if flashCollect.thread and (flashCollect.thread:status() == "suspended"
-        or flashCollect.thread:status() == "dead")
-    then
-        flashCollect.thread:run()
-    else
-        flashCollect.thread = lua_thread.create(FlashCollect.Process)
-    end
+    flashCollect.thread = RunThreadFresh(flashCollect.thread, FlashCollect.Process)
 
     return true
 end
@@ -1607,6 +1793,7 @@ function Improve.AddCefCardSlot(slot, itemName, hasStorageUpgrade, cardType)
                 c.levelKnown = true
                 c.levelGuessed = false
                 c.probeFailed = false
+                Improve.CardCacheSet(slot, c.name, _pktLevel, ctype, c.storageUpgrade)
             end
             return
         end
@@ -1622,6 +1809,7 @@ function Improve.AddCefCardSlot(slot, itemName, hasStorageUpgrade, cardType)
     if pktLevel then
         level = pktLevel
         known = true
+        Improve.CardCacheSet(slot, itemName, pktLevel, ctype, storage)
     elseif cached and (tonumber(cached.cardType or 0) or 0) == ctype then
         level = tonumber(cached.level) or 0
         known = true
@@ -1728,7 +1916,8 @@ function Improve.RunNewStyleProbeLoop(allowWhenStopped, rescanAll)
     -- Уровни приходят в пакете инвентаря. Если с запуска скрипта такого пакета
     -- ещё не было, просим инвентарь один раз - это дешевле, чем диалог по каждой карте
     if Improve.UsePacketLevels() then
-        if rescanAll then Improve.ForgetPacketLevels() end
+        -- уровни из пакетов точные, их не забываем даже при полном пересканировании:
+        -- сбрасывается только кэш на диске
 
         if (improve.cef.pktInvAt or 0) == 0 then
             local _hasUnknown = false
@@ -2085,6 +2274,11 @@ function Improve.HandleNewStyleConfirmDialog(dialogId, title)
         end
     end
 
+    if improve.cef.upgradeFast then
+        improve.cef.upgradeFast = false
+        improve.cef.upgradeFastFails = 0
+    end
+
     sampSendDialogResponse(dialogId, 1, 0, '')
     improve.waitStart = true
     improve.waitStartAt = os.clock()
@@ -2154,6 +2348,15 @@ function Improve.TickNewStyle()
             end
         end
     else
+        if improve.selectSlot then
+            improve.select = 0
+            for idx, v in ipairs(improve.videoCards) do
+                if v.slot == improve.selectSlot then
+                    improve.select = idx
+                    break
+                end
+            end
+        end
         if improve.select == 0 then
             Improve.Say('Выбери видеокарту внизу списка.')
             Improve.Stop('Новый стиль: не выбрана видеокарта')
@@ -2184,7 +2387,14 @@ function Improve.TickNewStyle()
 
     improve.currentIndex = idxCandidate
     improve.consumedThisTry = false
-    Improve.OpenCardDialog(slot, 1, 1)
+
+    -- после заточки инвентарь остаётся открытым: кликаем по карте сразу, без /invent.
+    -- Если окно не открылось, автоповтор в TickWaitWatchdogs переоткроет инвентарь
+    local useFast = settings.improve.fastProbe ~= false
+        and improve.cef.inventoryOpen
+        and (improve.cef.upgradeFastFails or 0) < 2
+    improve.cef.upgradeFast = useFast
+    Improve.OpenCardDialog(slot, 1, 1, useFast)
     improve.lastUseAt = os.clock()
     improve.step = Improve.STEP.CONFIRM
 end
@@ -2221,6 +2431,9 @@ imgui.OnInitialize(function()
 end)
 
 function main()
+    -- Версия в консоли: она попадает в лог NeoMLoader и в отчёты о крашах
+    print("[MMT] Версия скрипта: " .. tostring(thisScript().version))
+
     while not isSampAvailable() do wait(0) end
 
     -- цвет префикса в чате и смысловые цвета берём из настроек до первого сообщения
@@ -2246,7 +2459,8 @@ function main()
     end)
     sampRegisterChatCommand("mmtsr", function ()
         settings.style.scaleUI = 1.0
-        settings.style.sizeWindow = defaultSettings.style.sizeWindow
+        -- копия: окно пишет свой размер прямо в settings.style.sizeWindow
+        settings.style.sizeWindow = { x = defaultSettings.style.sizeWindow.x, y = defaultSettings.style.sizeWindow.y }
         Storage.SaveSettings()
         thisScript():reload()
     end)
@@ -2328,6 +2542,7 @@ function main()
 
 
             Improve.Tick()
+            Improve.FlushCardListDirty()
             Improve.ProbeWatchdogTick()
             Improve.MobileStatusTick()
             Collect.ReminderTick()
@@ -2490,6 +2705,7 @@ function Improve.HandleUseRetryServerMessage(text)
 
     if text:find('Подождите немного') then
         Improve.LogAdd("WARN", "Сервер ответил \"Подождите немного.\" - повторяем CEF-клик по текущему слоту.")
+        improve.cef.upgradeFast = false
         lua_thread.create(function ()
             wait(1000)
             if improve.isOn and improve.step == Improve.STEP.CONFIRM then
@@ -2867,7 +3083,10 @@ local function HandleLiquidChoiceDialog(dialogId, title, text)
     elseif not card or card == "ASIC" then
         reason = "нет охлаждайки BTC/super/ASC"
     end
-    Chat.Add("Охлаждение: " .. reason .. " для текущей карты", TYPECHATMESSAGES.CRITICAL)
+    -- останавливаем весь процесс и не даём автозаливке тут же запустить его снова
+    stateCrypto.stopReason = reason
+    stateCrypto.autoFillNoLiquid = true
+    Chat.Add("Охлаждение: " .. reason .. " для текущей карты. Заливка остановлена", TYPECHATMESSAGES.CRITICAL)
     return nil
 end
 
@@ -2901,7 +3120,8 @@ local function HandleVideoCardSelectionDialog(dialogId, title, text)
     end
     shelves = Parser.ShelfData(text)
 
-    if settings.main.autoFillEnabled and not stateCrypto.work and not openedViaFlash then
+    if settings.main.autoFillEnabled and not stateCrypto.work and not openedViaFlash
+        and not stateCrypto.autoFillNoLiquid then
         local needFill = false
         for _, s in ipairs(shelves) do
             if (s.percentage or 0) <= (settings.main.fillFrom or 50.0) then
@@ -3012,6 +3232,8 @@ function sampev.onShowDialog(dialogId, style, title, button1, button2, text)
 
     lastIDDialog = dialogId
     stateCrypto.dialogSerial = (stateCrypto.dialogSerial or 0) + 1
+
+    pcall(Improve.CaptureCardDialog, title, text)
 
     local minerHandled = Miner.HandleDialog(dialogId, style, title, text)
     if minerHandled ~= nil then
@@ -3132,35 +3354,6 @@ end
 -- --------------------------------------------------------
 --                           onWindowMessage
 -- --------------------------------------------------------
-
-function sampev.onReceiveRpc(id, bs)
-    if not flashCollect.active then
-        return
-    end
-
-    if id ~= 220 then
-        return
-    end
-
-    raknetBitStreamIgnoreBits(bs, 8)
-    if raknetBitStreamReadInt8(bs) ~= 17 then
-        raknetBitStreamResetReadPointer(bs)
-        return
-    end
-
-    raknetBitStreamIgnoreBits(bs, 32)
-    local length = raknetBitStreamReadInt16(bs)
-    local encoded = raknetBitStreamReadInt8(bs)
-    local str = (encoded ~= 0)
-        and raknetBitStreamDecodeString(bs, length + encoded)
-        or raknetBitStreamReadString(bs, length)
-
-    if flashCollect.active and str and str:find('event.inventory.playerInventory', 1, true) then
-        flashCollect.inventoryOpened = true
-    end
-
-    raknetBitStreamResetReadPointer(bs)
-end
 
 function IsArrowNavigationAvailable()
     if activeTabScript ~= "main" then
@@ -3877,6 +4070,7 @@ function Interacting.Start(action, source)
 
     if action == "fill" then
         processes.fill = true
+        stateCrypto.autoFillNoLiquid = false
     elseif action == "take" then
         processes.take = true
         collectStats = { total = { BTC = 0, ASC = 0 }, house = {}, summary = Collect.NewSummary(source) }
@@ -3892,12 +4086,13 @@ function Interacting.Start(action, source)
         return false
     end
 
-    if processInteractingThread:status() == "suspended"
-        or processInteractingThread:status() == "dead"
-    then
-        processInteractingThread:run()
-    else
+    -- Занят ли поток, проверяем по running/yielded: на NeoMLoader status() отработавшего
+    -- потока может вернуть "suspended"
+    local _status = processInteractingThread and processInteractingThread:status() or nil
+    if _status == "running" or _status == "yielded" then
         processInteractingThread:terminate()
+    else
+        processInteractingThread = RunThreadFresh(processInteractingThread, Interacting.Process)
     end
 end
 
@@ -4270,6 +4465,8 @@ function Improve.Stop(reason)
     improve.cef.waitInventory = false
     improve.cef.probing = false
     improve.cef.probed = false
+    improve.cef.upgradeFast = false
+    improve.cef.upgradeFastFails = 0
     improve.cef.pendingSlot = nil
     improve.cef.pendingIndex = 0
     improve.cef.probeAbort = false
@@ -4400,13 +4597,7 @@ function Improve.RefreshOils(async)
     if async then
         -- ждать /stats уходим в отдельный поток; он создан заранее приостановленным,
         -- потому что RefreshOils зовут в том числе из фонового потока
-        if improve.oilsThread and (improve.oilsThread:status() == "suspended"
-            or improve.oilsThread:status() == "dead")
-        then
-            improve.oilsThread:run()
-        else
-            improve.oilsThread = lua_thread.create(Improve.OilsWaitProcess)
-        end
+        improve.oilsThread = RunThreadFresh(improve.oilsThread, Improve.OilsWaitProcess)
     else
         Improve.OilsWaitProcess()
         return true
@@ -4441,6 +4632,12 @@ function Improve.OnResult(success, serverMsg)
 
     local card = improve.videoCards[improve.currentIndex]
     if not card then return end
+
+    local _resFrom = tonumber(card.level) or 0
+    improve.lastResult = {
+        ok = success == true, slot = card.slot, from = _resFrom, to = _resFrom,
+        storage = improve.useStorageUpgrade == true, at = os.time(),
+    }
 
     if improve.useStorageUpgrade then
 
@@ -4534,10 +4731,14 @@ function Improve.OnResult(success, serverMsg)
             end)
         end
         improve.videoCards = Improve.MoveMaxLevelCardsToEnd(improve.videoCards)
+        improve.lastResult.to = tonumber(card.level) or _resFrom
     end
 end
 
 function Improve.MarkAttemptTimedOut()
+    local _card = improve.videoCards[tonumber(improve.currentIndex or 0) or 0]
+    improve.lastResult = { timeout = true, slot = _card and _card.slot or 0, at = os.time() }
+
     local s = improve.stats
     if not (s and s.active) then return end
 
@@ -4567,6 +4768,13 @@ function Improve.TickWaitWatchdogs()
             if (improve.lastUseAt or 0) <= 0 then
                 improve.lastUseAt = now
             elseif (now - improve.lastUseAt) * 1000 >= retryMs then
+                if improve.cef.upgradeFast then
+                    improve.cef.upgradeFast = false
+                    improve.cef.upgradeFastFails = (improve.cef.upgradeFastFails or 0) + 1
+                    if improve.cef.upgradeFastFails >= 2 then
+                        Improve.LogAdd('INFO', 'Новый стиль: клик без /invent не срабатывает, переоткрываю инвентарь перед каждой картой.')
+                    end
+                end
                 local idx = tonumber(improve.currentIndex or 0) or 0
                 local card = improve.videoCards[idx]
                 local slot = card and tonumber(card.slot or 0) or 0
@@ -4758,12 +4966,85 @@ function Storage.MergeSettings(dest, source)
     end
 end
 
+--- Копирует файл побайтно: запасной путь, если os.rename не сработал
+function Storage.CopyFile(src, dst)
+    local input = io.open(src, "rb")
+    if not input then return false end
+    local data = input:read("*a")
+    input:close()
+
+    local output = io.open(dst, "wb")
+    if not output then return false end
+    output:write(data or "")
+    output:close()
+    return true
+end
+
+--- Переносит данные MMT на ПК из старой папки (<папка игры>\config\MMT CFGs)
+--- в moonloader\config\MMT CFGs. Файл, который уже есть на новом месте, не трогаем.
+function Storage.MigrateLegacyConfig()
+    if ISMONETLOADER or type(getGameDirectory) ~= 'function' then return end
+
+    local oldDir = getGameDirectory()..SEPORATORPATCH..'config'..SEPORATORPATCH..'MMT CFGs'
+    local newDir = folderConfig..'MMT CFGs'
+    if oldDir:lower() == newDir:lower() or lfs.attributes(oldDir, "mode") ~= "directory" then return end
+
+    local moved, failed = 0, 0
+    local function moveDir(from, to)
+        Util.EnsureDirectoryExists(to)
+
+        -- сначала собираем имена: переименование во время обхода lfs.dir пропускает файлы
+        local names = {}
+        for name in lfs.dir(from) do
+            if name ~= "." and name ~= ".." then
+                names[#names + 1] = name
+            end
+        end
+
+        for _, name in ipairs(names) do
+            local src, dst = from..SEPORATORPATCH..name, to..SEPORATORPATCH..name
+            local mode = lfs.attributes(src, "mode")
+            if mode == "directory" then
+                moveDir(src, dst)
+            elseif mode == "file" and not lfs.attributes(dst, "mode") then
+                if os.rename(src, dst) or (Storage.CopyFile(src, dst) and os.remove(src)) then
+                    moved = moved + 1
+                else
+                    failed = failed + 1
+                end
+            end
+        end
+
+        -- папка удалится, только если опустела
+        lfs.rmdir(from)
+    end
+
+    local ok, err = pcall(moveDir, oldDir, newDir)
+    if not ok then
+        Storage.NoticeBrokenFile("Не удалось перенести данные из "..oldDir..": "..tostring(err))
+    elseif moved > 0 or failed > 0 then
+        Storage.NoticeBrokenFile(string.format("Данные перенесены в %s (файлов: %d%s).",
+            newDir, moved, failed > 0 and (", не перенесено: "..failed..", они остались в "..oldDir) or ""))
+    end
+end
+
+Storage.MigrateLegacyConfig()
 Storage.LoadSettings()
 
 if ISMONETLOADER and settings.style.scaleUI ~= 1.0 then
     MONET_DPI_SCALE = settings.style.scaleUI
 elseif ISMONETLOADER then
     settings.style.scaleUI = MONET_DPI_SCALE
+end
+
+-- Окно на мобилке по умолчанию такого же размера, как у MCR Mobile. Старый дефолт
+-- 600x400 без учёта масштаба на телефоне выходил крошечным - его тоже заменяем.
+if ISMONETLOADER then
+    defaultSettings.style.sizeWindow = { x = 700 * MONET_DPI_SCALE, y = 400 * MONET_DPI_SCALE }
+    local size = settings.style.sizeWindow
+    if type(size) ~= 'table' or (tonumber(size.x) == 600 and tonumber(size.y) == 400) then
+        settings.style.sizeWindow = { x = defaultSettings.style.sizeWindow.x, y = defaultSettings.style.sizeWindow.y }
+    end
 end
 
 -- --------------------------------------------------------
@@ -7054,11 +7335,7 @@ function Farmer.Start(mode)
         return
     end
     farmer.mode = mode
-    if farmer.thread and (farmer.thread:status() == "suspended" or farmer.thread:status() == "dead") then
-        farmer.thread:run()
-    else
-        farmer.thread = lua_thread.create(Farmer.Process)
-    end
+    farmer.thread = RunThreadFresh(farmer.thread, Farmer.Process)
 end
 
 function Farmer.Cancel()
@@ -7689,11 +7966,7 @@ function Miner.Start(mode)
         return
     end
     miner.mode = mode
-    if miner.thread and (miner.thread:status() == "suspended" or miner.thread:status() == "dead") then
-        miner.thread:run()
-    else
-        miner.thread = lua_thread.create(Miner.Process)
-    end
+    miner.thread = RunThreadFresh(miner.thread, Miner.Process)
 end
 
 function Miner.Cancel()
@@ -8529,6 +8802,30 @@ end
 -- =====================================================================================================================
 --                                                          UTLITES
 -- =====================================================================================================================
+
+--- Запустить поток, всегда создавая новый. На NeoMLoader повторный run() уже запускавшегося
+--- потока роняет игру (SIGSEGV в LuaThread::run): после terminate() или завершения status()
+--- может вернуть "suspended", хотя поток внутри уже освобождён. На MoonLoader он просто перезапускался.
+--- Новый поток создаётся приостановленным и запускается run(): lua_thread.create изнутри
+--- работающего потока роняет moonloader. Проверку "поток занят" делает вызывающий код
+---@param thread table|nil Прежний поток lua_thread - повторно не запускается
+---@param entryPoint function Функция потока, из неё создаётся новый
+---@return table thread Запущенный поток - его нужно сохранить вместо прежнего
+function RunThreadFresh(thread, entryPoint)
+    thread = lua_thread.create_suspended(entryPoint)
+    thread:run()
+    return thread
+end
+
+--- Хватит ли в пакете байт на строку: offset - сколько байт уже прочитано от начала пакета
+--- (с его id), len - длина строки. На NeoMLoader чтение за концом пакета роняет игру нативно,
+--- pcall от этого не спасает. Если размер пакета узнать нельзя, читаем как раньше
+function Util.BitStreamHasBytes(bs, offset, len)
+    local _ok, _size = pcall(raknetBitStreamGetNumberOfBytesUsed, bs)
+    _size = _ok and tonumber(_size) or 0
+    if _size <= 0 then return true end
+    return offset + len <= _size
+end
 
 -- Получить текущее время в формате %H:%M:%S
 function Util.GetTimeNow()
@@ -10100,418 +10397,908 @@ function Draw.ImproveSharp()
     end
 end
 
-function Draw.ImproveProcessTab()
-    imgui.Columns(3, nil, false)
-        imgui.Text(u8("Материалы для улучшения:"))
-    imgui.NextColumn()
-        imgui.Text(u8("BTC вид-карты:"))
-        imgui.SameLine()
-        imgui.TextColored(imgui.ImVec4(0.8,0.9,1,1), u8(tostring(improve.oils.classic)))
-    imgui.NextColumn()
-        imgui.Text(u8("Arizona вид-карты:"))
-        imgui.SameLine()
-        imgui.TextColored(imgui.ImVec4(0.8,0.9,1,1), u8(tostring(improve.oils.arizona)))
-    imgui.Columns(1)
-    imgui.Spacing()
+-- =====================================================================================================================
+--                        Вкладка «Процесс» заточки
+-- =====================================================================================================================
 
-    if imgui.AccentButton(u8(improve.oils.busy and "Сканирую…" or "Обновить инвентарь"), imgui.ImVec2(-1, UI.Scale(26))) then
-        Improve.RefreshOils(true)
+-- Карта, которую скрипт точит прямо сейчас
+function Improve.CurrentCard()
+    if not improve.isOn then return nil end
+    return improve.videoCards[tonumber(improve.currentIndex or 0) or 0]
+end
+
+-- Карте больше не нужна заточка в текущем режиме
+function Improve.IsCardDone(v)
+    if improve.useStorageUpgrade then return v.storageUpgrade == true end
+    return (tonumber(v.level) or 0) >= (tonumber(settings.improve.maxLevel) or 2)
+end
+
+-- Выбранная карта (режим «одна карта»)
+function Improve.SelectedCard()
+    if not improve.selectSlot then return nil end
+    for _, v in ipairs(improve.videoCards or {}) do
+        if v.slot == improve.selectSlot then return v end
     end
+    return nil
+end
 
-    if Improve.IsNewStyleMode() then
-        local known, unknown = Improve.CountKnownLevels()
-        local pTotal = known + unknown
-        local halfW = (imgui.GetWindowContentRegionWidth() - imgui.GetStyle().ItemSpacing.x) / 2
-
-        if imgui.AccentButtonClickable(not improve.cef.probing, u8(improve.cef.probing and "Проверяю уровни…" or "Проверить уровни"), imgui.ImVec2(halfW, UI.Scale(26))) then
-            Improve.ManualCheckCardLevels(false)
+-- Какие карты пойдут в работу: первая из них и сколько всего
+function Improve.PlanCards()
+    if not settings.improve.menuAll then
+        local v = Improve.SelectedCard()
+        if v and not Improve.IsCardDone(v) then return v, 1 end
+        return nil, 0
+    end
+    local first, todo = nil, 0
+    for _, v in ipairs(improve.videoCards or {}) do
+        if not Improve.IsCardDone(v) then
+            todo = todo + 1
+            first = first or v
         end
-        imgui.SameLine()
-        if imgui.ButtonClickable(not improve.cef.probing, u8"Сканировать заново", imgui.ImVec2(-1, UI.Scale(26))) then
-            Improve.ManualCheckCardLevels(true)
-        end
+    end
+    return first, todo
+end
 
-        local status
-        if improve.cef.probing then
-            status = string.format("Проверяю уровни: %d из %d", math.maxEx(0, improve.cef.pendingIndex or 0), math.maxEx(1, tonumber(improve.cef.probeTotal or pTotal) or pTotal))
-        elseif pTotal == 0 then
-            status = "Видеокарты не найдены - обновите инвентарь"
-        elseif unknown == 0 then
-            status = string.format("Уровни известны у всех %d карт", pTotal)
-        elseif (improve.cef.probeAbortReason or "") ~= "" then
-            status = string.format("Прервано (%s). Известно %d из %d, продолжу с этого места", tostring(improve.cef.probeAbortReason), known, pTotal)
+-- Что мешает запуску; nil - можно запускать
+function Improve.GetStartBlocker()
+    local cards = improve.videoCards or {}
+    if #cards > 0 then
+        if not settings.improve.menuAll then
+            local v = Improve.SelectedCard()
+            if not v then
+                return 'Выберите карту в списке ниже или переключите "Какие карты" на "Все по очереди"'
+            end
+            if Improve.IsCardDone(v) then
+                return improve.useStorageUpgrade and 'У выбранной карты хранилище уже улучшено'
+                    or string.format('Выбранная карта уже на %d ур. - поднимите цель или выберите другую', v.level or 0)
+            end
         else
-            status = string.format("Известно уровней: %d из %d", known, pTotal)
+            local _, todo = Improve.PlanCards()
+            if todo == 0 then
+                return improve.useStorageUpgrade and 'Хранилище уже улучшено у всех карт'
+                    or string.format('Все карты уже на %d ур. или выше - поднимите цель', settings.improve.maxLevel or 2)
+            end
         end
-        imgui.TextDisabled(u8(status))
-
-        local frac = (pTotal > 0) and math.maxEx(0.0, math.minEx(1.0, known / pTotal)) or 0.0
-        imgui.ProgressBar(frac, imgui.ImVec2(-1, UI.Scale(16)))
     end
 
-    imgui.Separator()
+    if settings.improve.checkOilsOnStart and not improve.useStorageUpgrade and improve.oils.lastAt ~= '-' then
+        local count = Improve.GetOilCountByType()
+        if count < 2 then return 'Нет смазки: на одну попытку нужно 2 шт.' end
+    end
+    return nil
+end
 
-    imgui.CenterText(u8("Этап: " .. (Improve.stepNames[improve.step] or "?")))
+function Improve.FormatDuration(sec)
+    sec = math.maxEx(0, tonumber(sec) or 0)
+    if sec < 60 then return string.format('%d с', sec) end
+    if sec < 3600 then return string.format('%d мин %d с', math.floor(sec / 60), sec % 60) end
+    return string.format('%d ч %d мин', math.floor(sec / 3600), math.floor((sec % 3600) / 60))
+end
 
-    -- Краткая текущая статистика сессии
-    local s = improve.stats
-    if s and (s.sessionId or 0) > 0 then
-        local status = s.active and "идёт" or "завершена"
-        imgui.Text(u8(string.format(
-            "Сессия #%d (%s). Попыток: %d, успехов: %d, ошибок: %d, смазки: %d",
-            s.sessionId or 0,
-            status,
-            s.attempts or 0,
-            s.success or 0,
-            s.fail or 0,
-            s.oilsUsed or 0
-        )))
+-- Что скрипт делает сейчас: текст, иконка, ключ цвета
+function Improve.GetStatusLine()
+    local probeText = string.format('Проверяю уровни карт: %d из %d',
+        math.maxEx(0, improve.cef.pendingIndex or 0), math.maxEx(1, tonumber(improve.cef.probeTotal) or 1))
+
+    if not improve.isOn then
+        if improve.cef.probing then return probeText, fa.MAGNIFYING_GLASS, 'warnColor' end
+        if improve.oils.busy then return 'Обновляю инвентарь через /stats…', fa.ARROWS_ROTATE, 'warnColor' end
+        local s = improve.stats or {}
+        if (s.sessionId or 0) > 0 and (s.lastReason or '') ~= '' then
+            local reason = tostring(s.lastReason):gsub('^Новый стиль:%s*', '')
+            return 'Остановлено: ' .. reason, fa.STOP, nil
+        end
+        return 'Заточка выключена', fa.STOP, nil
+    end
+
+    if improve.needCheckOils or improve.waitOils or improve.oils.busy or improve.cef.waitInventory then
+        return 'Готовлю: проверяю смазку и инвентарь…', fa.ARROWS_ROTATE, 'warnColor'
+    end
+    if improve.cef.probing then return probeText, fa.MAGNIFYING_GLASS, 'warnColor' end
+
+    local card = Improve.CurrentCard()
+    if card and improve.step ~= Improve.STEP.SELECT_CARD then
+        local what = improve.useStorageUpgrade
+            and string.format('слот %d, хранилище', card.slot or 0)
+            or string.format('слот %d, %d -> %d ур.', card.slot or 0, card.level or 0, (card.level or 0) + 1)
+        if improve.step == Improve.STEP.WAIT_RESULT then
+            local sec = math.floor(os.clock() - (tonumber(improve.waitResultAt) or os.clock()))
+            return string.format('Карта точится (%s), жду результат: %d с', what, math.maxEx(0, sec)), fa.PLAY, 'okColor'
+        end
+        if improve.waitStart then
+            return 'Подтверждаю улучшение (' .. what .. ')', fa.PLAY, 'okColor'
+        end
+        return 'Открываю окно улучшения (' .. what .. ')', fa.PLAY, 'okColor'
+    end
+    return 'Выбираю следующую карту…', fa.PLAY, 'okColor'
+end
+
+-- Запуск заточки кнопкой
+function Improve.StartFromUI()
+    if ISMONETLOADER then
+        mobileImproveDialog.suppressUntil = 0
+        mobileImproveDialog.lastShowAt = 0
+        mobileImproveDialog.lastText = ''
+        mobileImproveDialog.wasActive = false
+    end
+    improve.isOn            = true
+    improve.consumedThisTry = false
+    improve.waitStartAt = 0
+    improve.waitResultAt = 0
+    improve.lastUseAt = 0
+    improve.cef.needInventoryRefresh = false
+    improve.cef.waitInventory = false
+    improve.cef.probed = false
+    improve.cef.probing = false
+    improve.cef.stubNotified = false
+
+    if settings.improve.checkOilsOnStart or Improve.IsNewStyleMode() then
+        -- сначала проверяем смазку
+        improve.step          = Improve.STEP.STOPPED
+        improve.needCheckOils = true
+        improve.waitOils      = false
     else
-        imgui.TextDisabled(u8"Сессия заточки ещё не запускалась.")
+        -- сразу начинаем с первого шага без проверки
+        improve.step          = Improve.STEP.SELECT_CARD
+        improve.needCheckOils = false
+        improve.waitOils      = false
     end
 
-    if imgui.AccentButton(u8(improve.isOn and "Выключить" or "Включить"), imgui.ImVec2(-1, UI.Scale(30))) then
-        if improve.isOn then
-            -- стоп заточки
+    Improve.SessionStart()
+    Improve.Say("Заточка видеокарт запущена.")
+end
+
+-- Кнопка в один ряд с другими: выбранный вариант подсвечен акцентом
+function Draw.ImproveSegment(id, labels, current, locked)
+    local spacing = imgui.GetStyle().ItemSpacing.x
+    local w = (imgui.GetContentRegionAvail().x - spacing * (#labels - 1)) / #labels
+    local picked
+    for i, label in ipairs(labels) do
+        if i > 1 then imgui.SameLine() end
+        local text = u8(label) .. '##' .. id .. i
+        local size = imgui.ImVec2(i == #labels and -1 or w, 0)
+        if i == current then
+            imgui.AccentButton(text, size)
+        elseif imgui.ButtonClickable(not locked, text, size) and not locked then
+            picked = i
+        end
+    end
+    return picked
+end
+
+-- Подпись слева и элемент управления справа - на одной высоте
+function Draw.ImproveRowLabel(text, labelW)
+    imgui.AlignTextToFramePadding()
+    imgui.Text(u8(text))
+    imgui.SameLine(labelW)
+end
+
+-- Строка статуса и три главные цифры
+function Draw.ImproveHeader()
+    local text, icon, colorKey = Improve.GetStatusLine()
+    local col = colorKey and UI.Vec4(colorKey) or imgui.GetStyle().Colors[imgui.Col.TextDisabled]
+    imgui.TextColored(col, icon)
+    imgui.SameLine()
+    imgui.TextColored(colorKey and col or UI.Vec4('textColor'), u8(text))
+
+    local first, todo = Improve.PlanCards()
+    local cardsTotal = #(improve.videoCards or {})
+    local oil = Improve.GetOilCountByType()
+
+    imgui.Columns(3, 'improve_head', false)
+        imgui.TextDisabled(u8'Видеокарты')
+        if cardsTotal > 0 then
+            imgui.Text(u8(string.format('%d шт., точить: %d', cardsTotal, todo)))
+        else
+            imgui.Text(u8'не найдены')
+        end
+    imgui.NextColumn()
+        imgui.TextDisabled(u8'Смазка')
+        if improve.useStorageUpgrade then
+            imgui.Text(u8'не нужна для хранилища')
+        elseif improve.oils.lastAt == '-' then
+            imgui.Text(u8'ещё не проверена')
+        else
+            local col2 = oil >= 2 and UI.Vec4('textColor') or UI.Vec4('badColor')
+            imgui.TextColored(col2, u8(string.format('%s шт. (на %d попыток)', Util.GetCommaValue(oil), math.floor(oil / 2))))
+        end
+    imgui.NextColumn()
+        imgui.TextDisabled(u8'Цена попытки')
+        local price = (first and not improve.useStorageUpgrade) and Improve.GetPriceByFromLevel(first.level) or 0
+        if price > 0 then
+            imgui.Text(u8(string.format('$%s (с %d ур.)', Util.GetCommaValue(price), first.level or 0)))
+        else
+            imgui.Text(u8'-')
+        end
+    imgui.Columns(1)
+end
+
+-- Что и как точить: меняется только пока заточка остановлена
+function Draw.ImproveQuickSettings()
+    local locked = improve.isOn
+    local labelW = UI.Scale(120)
+
+    Draw.ImproveRowLabel('Что улучшать:', labelW)
+    local mode = Draw.ImproveSegment('imp_mode', { 'Производительность', 'Хранилище крипты' }, improve.useStorageUpgrade and 2 or 1, locked)
+    if mode then
+        improve.useStorageUpgrade = (mode == 2)
+        Improve.SyncVideoCardsFromCef()
+    end
+
+    Draw.ImproveRowLabel('Какие карты:', labelW)
+    local which = Draw.ImproveSegment('imp_which', { 'Все по очереди', 'Одну выбранную' }, settings.improve.menuAll and 1 or 2, locked)
+    if which then
+        settings.improve.menuAll = (which == 1)
+        if settings.improve.menuAll then
+            improve.select = 0
+            improve.selectSlot = nil
+        end
+        Storage.SaveSettings()
+    end
+
+    if not improve.useStorageUpgrade then
+        Draw.ImproveRowLabel('Точить до:', labelW)
+        imgui.PushItemWidth(-1)
+        local _maxLevel = imgui.new.int(settings.improve.maxLevel or 2)
+        if imgui.SliderInt('##imp_quick_level', _maxLevel, 2, 10, u8('%d ур.')) then
+            settings.improve.maxLevel = _maxLevel[0]
+            Storage.SaveSettings()
+        end
+        imgui.PopItemWidth()
+    end
+
+    if locked then
+        imgui.TextDisabled(u8'Режим и выбор карт меняются, когда заточка остановлена.')
+    end
+end
+
+-- Большая кнопка запуска; если запускать нельзя - объясняем почему
+function Draw.ImproveStartButton()
+    local h = UI.Scale(32)
+    if improve.isOn then
+        local col = UI.Vec4('badColor')
+        imgui.PushStyleColor(imgui.Col.Button, col)
+        imgui.PushStyleColor(imgui.Col.ButtonHovered, Shade(col, 1.15))
+        imgui.PushStyleColor(imgui.Col.ButtonActive, Shade(col, 0.85))
+        local pressed = imgui.Button(fa.STOP .. u8'\tОстановить заточку', imgui.ImVec2(-1, h))
+        imgui.PopStyleColor(3)
+        if pressed then
             Improve.Stop("Остановлено вручную через UI")
             Improve.Say("Заточка остановлена вручную.")
-        else
-            -- старт заточки
-            if ISMONETLOADER then
-                mobileImproveDialog.suppressUntil = 0
-                mobileImproveDialog.lastShowAt = 0
-                mobileImproveDialog.lastText = ''
-                mobileImproveDialog.wasActive = false
-            end
-            improve.isOn            = true
-            improve.consumedThisTry = false
-            improve.waitStartAt = 0
-            improve.waitResultAt = 0
-            improve.lastUseAt = 0
-            improve.cef.needInventoryRefresh = false
-            improve.cef.waitInventory = false
-            improve.cef.probed = false
-            improve.cef.probing = false
-            improve.cef.stubNotified = false
-
-            if settings.improve.checkOilsOnStart or Improve.IsNewStyleMode() then
-                -- сначала проверяем смазку
-                improve.step          = Improve.STEP.STOPPED
-                improve.needCheckOils = true
-                improve.waitOils      = false
-            else
-                -- сразу начинаем с первого шага без проверки
-                improve.step          = Improve.STEP.SELECT_CARD
-                improve.needCheckOils = false
-                improve.waitOils      = false
-            end
-
-            Improve.SessionStart()
-            Improve.Say("Заточка видеокарт запущена.")
         end
+        return
     end
 
-    imgui.TextDisabled(u8("Режим инвентаря: " .. Improve.GetInventoryModeName()))
-
-    -- Кнопка выбора режима улучшения: производительность / хранилище крипты
-    local modeLabel = improve.useStorageUpgrade
-        and "Режим улучшения: ХРАНИЛИЩЕ криптовалюты"
-        or  "Режим улучшения: ПРОИЗВОДИТЕЛЬНОСТЬ"
-
-    if imgui.Button(u8(modeLabel), imgui.ImVec2(-1, UI.Scale(24))) then
-        improve.useStorageUpgrade = not improve.useStorageUpgrade
-        if improve.useStorageUpgrade then
-            Improve.Say("Теперь в диалоге будет выбираться улучшение объёма хранения криптовалюты")
-        else
-            Improve.Say("Теперь в диалоге будет выбираться улучшение производительности видеокарты")
-        end
+    local blocker = Improve.GetStartBlocker()
+    if imgui.AccentButtonClickable(blocker == nil, fa.PLAY .. u8'\tНачать заточку', imgui.ImVec2(-1, h)) then
+        Improve.StartFromUI()
     end
 
-    imgui.Spacing()
+    if blocker then
+        imgui.TextColored(UI.Vec4('warnColor'), fa.TRIANGLE_EXCLAMATION)
+        imgui.SameLine()
+        imgui.TextColored(UI.Vec4('warnColor'), u8(blocker))
+        return
+    end
 
+    -- что произойдёт после нажатия
+    local first, todo = Improve.PlanCards()
+    local plan
+    if #(improve.videoCards or {}) == 0 then
+        plan = 'Скрипт обновит инвентарь через /stats, найдёт карты и начнёт заточку.'
+    elseif improve.useStorageUpgrade then
+        plan = string.format('Улучшит хранилище у %d карт, начиная со слота %d.', todo, first and first.slot or 0)
+    elseif not settings.improve.menuAll then
+        plan = string.format('Будет точить карту в слоте %d до %d ур.', first and first.slot or 0, settings.improve.maxLevel or 2)
+    else
+        plan = string.format('Будет точить %d карт до %d ур., %s.', todo, settings.improve.maxLevel or 2,
+            settings.improve.mode == 1 and 'сначала самые слабые' or 'по порядку в списке')
+    end
+    imgui.TextDisabled(u8(plan .. ' Стойте у стола для улучшения видеокарт.'))
+end
 
-    imgui.BeginChild("improve_bottom_proc", imgui.ImVec2(-1, -1), true)
+-- Итоги текущей или последней сессии и последний результат
+function Draw.ImproveSession()
+    local s = improve.stats
+    if not s or (s.sessionId or 0) == 0 then
+        imgui.TextDisabled(u8'Сессий заточки ещё не было.')
+        return
+    end
+
+    local att = s.attempts or 0
+    local rate = att > 0 and math.floor((s.success or 0) * 100 / att + 0.5) or 0
+    local endAt = s.active and os.time() or (tonumber(s.finishedAt) or os.time())
+    local dur = endAt - (tonumber(s.startedAt) or endAt)
+
+    imgui.Text(u8(string.format('Сессия #%d - %s, %s', s.sessionId, s.active and 'идёт' or 'завершена', Improve.FormatDuration(dur))))
+    imgui.TextColoredRGB(string.format(
+        'Попыток: %d   {%s}Успехов: %d (%d%%%%){%s}   {%s}Неудач: %d{%s}   Смазки: %d   Потрачено: $%s',
+        att, COLORS.GREEN, s.success or 0, rate, COLORS.WHITE, COLORS.RED, s.fail or 0, COLORS.WHITE,
+        s.oilsUsed or 0, Util.GetCommaValue(math.floor(tonumber(s.spent) or 0))
+    ))
+
+    local r = improve.lastResult
+    if r then
+        local when = os.date('%H:%M:%S', r.at or os.time())
+        local line
+        if r.timeout then
+            line = string.format('{%s}%s  слот %d: сервер не ответил, попытка засчитана как неудачная', COLORS.YELLOW, when, r.slot or 0)
+        elseif r.storage then
+            line = string.format('{%s}%s  слот %d: %s', r.ok and COLORS.GREEN or COLORS.RED, when, r.slot or 0,
+                r.ok and 'хранилище улучшено' or 'хранилище не улучшилось')
+        elseif r.ok then
+            line = string.format('{%s}%s  слот %d: %d -> %d ур., успех', COLORS.GREEN, when, r.slot or 0, r.from or 0, r.to or 0)
+        else
+            line = string.format('{%s}%s  слот %d: неудача, остался %d ур.', COLORS.RED, when, r.slot or 0, r.from or 0)
+        end
+        imgui.TextColoredRGB('Последний результат: ' .. line)
+    end
+end
+
+-- Кнопки инвентаря и прогресс проверки уровней
+function Draw.ImproveCardTools()
+    local busy = improve.isOn or improve.cef.probing or improve.oils.busy
+    local third = imgui.GetMiddleButtonX(3)
+
+    if imgui.ButtonClickable(not busy, fa.ARROWS_ROTATE .. u8(improve.oils.busy and '\tОбновляю…' or '\tОбновить инвентарь'), imgui.ImVec2(third, 0)) and not busy then
+        Improve.RefreshOils(true)
+    end
+    imgui.SameLine()
+    if imgui.ButtonClickable(not busy, fa.MAGNIFYING_GLASS .. u8'\tПроверить уровни', imgui.ImVec2(third, 0)) and not busy then
+        Improve.ManualCheckCardLevels(false)
+    end
+    imgui.SameLine()
+    if imgui.ButtonClickable(not busy, u8'Сканировать заново', imgui.ImVec2(-1, 0)) and not busy then
+        Improve.ManualCheckCardLevels(true)
+    end
+    if imgui.IsItemHovered() then
+        imgui.SetTooltip(u8'Забыть запомненные уровни и проверить все карты ещё раз')
+    end
+
+    local known, unknown = Improve.CountKnownLevels()
+    local total = known + unknown
+    if improve.cef.probing or unknown > 0 then
+        local frac = (total > 0) and math.maxEx(0.0, math.minEx(1.0, known / total)) or 0.0
+        local caption = improve.cef.probing
+            and string.format('Проверяю: %d из %d', math.maxEx(0, improve.cef.pendingIndex or 0), math.maxEx(1, tonumber(improve.cef.probeTotal) or total))
+            or string.format('Уровень неизвестен у %d карт из %d', unknown, total)
+        imgui.ProgressBar(frac, imgui.ImVec2(-1, UI.Scale(16)), u8(caption))
+    end
+    if not improve.cef.probing and (improve.cef.probeAbortReason or '') ~= '' then
+        imgui.TextColored(UI.Vec4('warnColor'), u8('Проверка прервана: ' .. tostring(improve.cef.probeAbortReason)))
+    end
+end
+
+-- Одна плитка видеокарты
+function Draw.ImproveCardTile(i, v, w, isCurrent, isSelected)
+    local known = v.levelKnown ~= false
+    local lvlText = known and string.format('%d ур.', v.level or 0) or '? ур.'
+    if v.storageUpgrade then lvlText = lvlText .. '  ХР+' end
+    local label = u8(string.format('%s\nслот %d', lvlText, v.slot or 0)) .. '##imp_card' .. i
+
+    local col
+    if isCurrent or isSelected then
+        col = UI.Vec4('accentColor')
+    elseif not known then
+        col = UI.Vec4('warnColor', 0.45)
+    elseif Improve.IsCardDone(v) then
+        col = UI.Vec4('okColor', 0.30)
+    end
+    if col then
+        imgui.PushStyleColor(imgui.Col.Button, col)
+        imgui.PushStyleColor(imgui.Col.ButtonHovered, Shade(col, 1.15))
+        imgui.PushStyleColor(imgui.Col.ButtonActive, Shade(col, 0.85))
+    end
+    local clicked = imgui.Button(label, imgui.ImVec2(w, UI.Scale(38)))
+    if col then imgui.PopStyleColor(3) end
+
+    if imgui.IsItemHovered() then
+        local unit = (tonumber(v.cardType) or 1) == 2 and 'ASC' or 'BTC'
+        local tip = string.format('Слот %d\nУровень: %s\nХранилище: %s', v.slot or 0,
+            known and string.format('%d из 10', v.level or 0) or 'неизвестен',
+            v.storageUpgrade and 'улучшено' or 'не улучшено')
+        local hourly = known and GPU_HOURLY_BY_LEVEL[tonumber(v.level) or 0]
+        if hourly then tip = tip .. string.format('\nДоход: %.6f %s в час', hourly, unit) end
+        if isCurrent then
+            tip = tip .. '\n\nСейчас точится'
+        elseif not settings.improve.menuAll then
+            tip = tip .. '\n\nНажмите, чтобы выбрать эту карту'
+        else
+            tip = tip .. '\n\nЧтобы точить только её, включите "Одну выбранную"'
+        end
+        imgui.SetTooltip(u8(tip))
+    end
+    return clicked
+end
+
+-- Список карт плитками: порядок = очередь заточки
+function Draw.ImproveCardGrid()
+    local cards = improve.videoCards or {}
+    if #cards == 0 then
+        imgui.TextDisabled(u8'Карты ещё не найдены. Нажмите "Обновить инвентарь" или просто начните заточку.')
+        return
+    end
+
+    local legend = {
+        { 'okColor', 'на цели' },
+        { 'accentColor', 'точится / выбрана' },
+        { 'warnColor', 'уровень неизвестен' },
+    }
+    for _, l in ipairs(legend) do
+        imgui.TextColored(UI.Vec4(l[1]), fa.SQUARE)
+        imgui.SameLine()
+        imgui.TextDisabled(u8(l[2]))
+        imgui.SameLine()
+    end
+    imgui.TextDisabled(u8(settings.improve.menuAll and '  Порядок = очередь заточки' or '  Нажмите на карту, чтобы выбрать'))
+
+    local current = Improve.CurrentCard()
+    imgui.BeginChild('improve_cards', imgui.ImVec2(-1, -1), true)
         imgui.ScrollMouse()
-        imgui.CenterText(u8("Найденные видеокарты:"))
+        local spacing = imgui.GetStyle().ItemSpacing.x
+        local avail = imgui.GetContentRegionAvail().x
+        local cols = math.maxEx(2, math.floor((avail + spacing) / (UI.Scale(110) + spacing)))
+        local w = (avail - spacing * (cols - 1)) / cols
 
-        for i, v in ipairs(improve.videoCards) do
-            local btnW  = imgui.GetMiddleButtonX(4)
-            local storageMark = (v.storageUpgrade == true) and u8" [ХР+]" or ""
-            local label = (Improve.IsNewStyleMode() and v.slot)
-                and string.format("%d LVL%s [slot %d]##%d", v.level, storageMark, v.slot, i)
-                or string.format("%d LVL%s##%d", v.level, storageMark, i)
-            local canClick = (improve.useStorageUpgrade and not v.storageUpgrade) or ((not improve.useStorageUpgrade) and (v.level < (settings.improve.maxLevel or 2)))
-            if imgui.ButtonClickable(canClick, label, imgui.ImVec2(btnW, 0)) then
-                if not settings.improve.menuAll then
-                    improve.select = i
-                    Improve.Say("Выбрана видеокарта #" .. i .. " (ур. " .. v.level .. ")")
-                end
+        for i, v in ipairs(cards) do
+            local isCurrent = current ~= nil and current.slot == v.slot
+            local isSelected = (not settings.improve.menuAll) and improve.selectSlot == v.slot
+            if Draw.ImproveCardTile(i, v, w, isCurrent, isSelected)
+                and not settings.improve.menuAll and not improve.isOn then
+                improve.select = i
+                improve.selectSlot = v.slot
             end
-            if i % 4 ~= 0 and i ~= #improve.videoCards then imgui.SameLine() end
+            if i % cols ~= 0 and i ~= #cards then imgui.SameLine() end
         end
     imgui.EndChild()
 end
 
+function Draw.ImproveProcessTab()
+    Draw.ImproveHeader()
+    imgui.Separator()
+    Draw.ImproveQuickSettings()
+    imgui.Spacing()
+    Draw.ImproveStartButton()
+    imgui.Separator()
+    Draw.ImproveSession()
+    imgui.Spacing()
+    Draw.SectionTitle(settings.improve.typeCards == 2 and 'Видеокарты Arizona' or 'Видеокарты')
+    Draw.ImproveCardTools()
+    Draw.ImproveCardGrid()
+end
+
+-- Кнопка опасного действия: первое нажатие просит подтверждения, второе выполняет
+function Draw.ConfirmButton(key, label, confirmLabel, size)
+    improve.ui = improve.ui or {}
+    local armedAt = tonumber(improve.ui[key]) or 0
+    local armed = (os.clock() - armedAt) < 4
+    if armed then
+        local col = UI.Vec4('badColor')
+        imgui.PushStyleColor(imgui.Col.Button, col)
+        imgui.PushStyleColor(imgui.Col.ButtonHovered, Shade(col, 1.15))
+        imgui.PushStyleColor(imgui.Col.ButtonActive, Shade(col, 0.85))
+        local pressed = imgui.Button(u8(confirmLabel) .. '##' .. key, size)
+        imgui.PopStyleColor(3)
+        if pressed then improve.ui[key] = 0 end
+        return pressed
+    end
+    if imgui.Button(u8(label) .. '##' .. key, size) then
+        improve.ui[key] = os.clock()
+    end
+    return false
+end
+
+-- Слайдер с подписью сверху и пояснением снизу
+function Draw.ImproveSlider(label, id, value, minV, maxV, fmt, hint)
+    imgui.Text(u8(label))
+    imgui.PushItemWidth(-1)
+    local ptr = imgui.new.int(tonumber(value) or minV)
+    local changed = imgui.SliderInt('##' .. id, ptr, minV, maxV, u8(fmt))
+    imgui.PopItemWidth()
+    if hint then imgui.TextDisabled(u8(hint)) end
+    return changed and ptr[0] or nil
+end
+
+-- Задержки и таймауты заточки: общие для вкладки заточки и раздела «Задержки»
+function Draw.ImproveDelaySettings()
+    local d = settings.deley
+    local v
+
+    v = Draw.ImproveSlider('Пауза после результата улучшения:', 'improve_waitResult', d.improve_waitResult or 500, 10, 1000, '%d мс',
+        'Сколько подождать после "успешно" или "ошибка", прежде чем браться за следующую карту')
+    if v then d.improve_waitResult = v; Storage.SaveSettings() end
+
+    v = Draw.ImproveSlider('Пауза перед нажатием на видеокарту:', 'improve_waitTryClick', d.improve_waitTryClick or 500, 10, 1000, '%d мс',
+        'Пауза перед кликом по карте в инвентаре')
+    if v then d.improve_waitTryClick = v; Storage.SaveSettings() end
+
+    v = Draw.ImproveSlider('Пауза после /invent:', 'improve_waitInventory', d.improve_waitInventory or 1500, 300, 5000, '%d мс',
+        'Сколько ждать, пока откроется инвентарь. Увеличьте, если окно улучшения не открывается')
+    if v then d.improve_waitInventory = v; Storage.SaveSettings() end
+
+    v = Draw.ImproveSlider('Повторный клик, если окно не открылось:', 'improve_retryUseDelay', d.improve_retryUseDelay or 1200, 200, 5000, '%d мс',
+        'Если за это время окно улучшения не появилось, скрипт кликнет по карте снова')
+    if v then d.improve_retryUseDelay = v; Storage.SaveSettings() end
+
+    v = Draw.ImproveSlider('Ждать начала улучшения:', 'improve_waitStartTimeout', d.improve_waitStartTimeout or 8, 2, 30, '%d сек',
+        'Если сервер не написал "Вы начали процесс улучшения", попытка начинается заново')
+    if v then d.improve_waitStartTimeout = v; Storage.SaveSettings() end
+
+    v = Draw.ImproveSlider('Ждать результата улучшения:', 'improve_waitResultTimeout', d.improve_waitResultTimeout or 20, 3, 60, '%d сек',
+        'Если результата нет, попытка считается неудачной и заточка идёт дальше')
+    if v then d.improve_waitResultTimeout = v; Storage.SaveSettings() end
+end
+
+-- Сколько слотов с запомненным уровнем
+function Improve.CountCachedLevels()
+    local n = 0
+    for _ in pairs(cardLevels.slots or {}) do n = n + 1 end
+    return n
+end
+
 function Draw.ImproveSettingsTab()
-    imgui.CenterText(u8("Режим работы:"))
-    if imgui.Button(u8(settings.improve.menuAll and "Улучшение всех видеокарт" or "Улучшение определенной видеокарты"), imgui.ImVec2(-1, UI.Scale(30))) then
-        settings.improve.menuAll = not settings.improve.menuAll
+    local locked = improve.isOn
+    local labelW = UI.Scale(130)
+
+    imgui.BeginChild('improve_settings_scroll', imgui.ImVec2(-1, -1), false)
+    imgui.ScrollMouse()
+
+    -- ---------- Что точить ----------
+    Draw.SectionTitle('Что точить')
+
+    Draw.ImproveRowLabel('Тип карт:', labelW)
+    local cardType = Draw.ImproveSegment('imp_set_type', { 'Обычные (BTC)', 'Arizona (ASC)' }, settings.improve.typeCards == 2 and 2 or 1, locked)
+    if cardType then
+        settings.improve.typeCards = cardType
         Storage.SaveSettings()
-        if settings.improve.menuAll then improve.select = 0 end
+        Improve.SyncVideoCardsFromCef()
+        improve.select = 0
+        improve.selectSlot = nil
     end
 
-    imgui.Separator()
-
-    imgui.CenterText(u8("Вид улучшаемых видеокарт:"))
-    local w = (imgui.GetWindowWidth() - UI.Scale(6)) / 2
-    if imgui.ButtonClickable(settings.improve.typeCards ~= 1, u8("Обычные"), imgui.ImVec2(w, 0)) then
-        settings.improve.typeCards = 1; Storage.SaveSettings(); Improve.SyncVideoCardsFromCef(); improve.select = 0
+    Draw.ImproveRowLabel('Какие карты:', labelW)
+    local which = Draw.ImproveSegment('imp_set_which', { 'Все по очереди', 'Одну выбранную' }, settings.improve.menuAll and 1 or 2, locked)
+    if which then
+        settings.improve.menuAll = (which == 1)
+        if settings.improve.menuAll then
+            improve.select = 0
+            improve.selectSlot = nil
+        end
+        Storage.SaveSettings()
     end
-    imgui.SameLine()
-    if imgui.ButtonClickable(settings.improve.typeCards ~= 2, "Arizona", imgui.ImVec2(-1, 0)) then
-        settings.improve.typeCards = 2; Storage.SaveSettings(); Improve.SyncVideoCardsFromCef(); improve.select = 0
+
+    if settings.improve.menuAll then
+        Draw.ImproveRowLabel('Порядок:', labelW)
+        local order = Draw.ImproveSegment('imp_set_order', { 'Сначала слабые', 'Как в инвентаре' }, settings.improve.mode == 2 and 2 or 1, locked)
+        if order then
+            settings.improve.mode = order
+            Storage.SaveSettings()
+            Improve.SyncVideoCardsFromCef()
+        end
     end
 
-    imgui.Separator()
-
-    settings.improve.inventoryMode = 2
-    imgui.CenterText(u8("Режим инвентаря: Новый стиль"))
-    imgui.TextDisabled(u8"Новый стиль работает через CEF-пакеты")
-
-    imgui.Separator()
-
-    imgui.CenterText(u8("Вид улучшения:"))
-    if imgui.ButtonClickable(settings.improve.mode ~= 1, u8("Последовательное"), imgui.ImVec2(w, 0)) then
-        settings.improve.mode = 1; Storage.SaveSettings()
-    end
-    imgui.SameLine()
-    if imgui.ButtonClickable(settings.improve.mode ~= 2, u8("Поочередное"), imgui.ImVec2(-1, 0)) then
-        settings.improve.mode = 2; Storage.SaveSettings()
-    end
-    imgui.TextDisabled(u8"Последовательное (сначала низкий уровень) | Поочередное (как на экране)")
-
-    imgui.Separator()
-
-    imgui.CenterText(u8("Уровень улучшения видеокарт:"))
+    Draw.ImproveRowLabel('Точить до:', labelW)
     imgui.PushItemWidth(-1)
     local _maxLevel = imgui.new.int(settings.improve.maxLevel or 2)
-    if imgui.SliderInt("##maximumValueLevel", _maxLevel, 2, 10, u8("%d ур.")) then
-        settings.improve.maxLevel = _maxLevel[0]; Storage.SaveSettings()
+    if imgui.SliderInt('##imp_set_level', _maxLevel, 2, 10, u8('%d ур.')) then
+        settings.improve.maxLevel = _maxLevel[0]
+        Storage.SaveSettings()
     end
     imgui.PopItemWidth()
 
-    imgui.Separator()
+    local summary
+    if not settings.improve.menuAll then
+        summary = string.format('Скрипт точит одну карту, которую вы выберете на вкладке "Процесс", до %d ур.', settings.improve.maxLevel or 2)
+    elseif settings.improve.mode == 2 then
+        summary = string.format('Скрипт точит все карты до %d ур. в том порядке, как они лежат в инвентаре.', settings.improve.maxLevel or 2)
+    else
+        summary = string.format('Скрипт точит все карты до %d ур., сначала самые слабые: так дешевле поднять общий доход.', settings.improve.maxLevel or 2)
+    end
+    imgui.TextDisabled(u8(summary .. ' Карты, которые уже на цели, пропускаются.'))
+    if locked then
+        imgui.TextColored(UI.Vec4('warnColor'), u8'Пока идёт заточка, тип карт, выбор и порядок не меняются.')
+    end
 
-    -- проверять ли смазку при старте заточки
+    imgui.Spacing()
+
+    -- ---------- Перед стартом ----------
+    Draw.SectionTitle('Перед стартом')
     local _checkOils = imgui.new.bool(settings.improve.checkOilsOnStart)
-    if imgui.Checkbox(u8"Проверять смазку при старте заточки", _checkOils) then
+    if imgui.Checkbox(u8'Проверять смазку при старте заточки', _checkOils) then
         settings.improve.checkOilsOnStart = not settings.improve.checkOilsOnStart
         Storage.SaveSettings()
     end
-    imgui.TextDisabled(u8"Если выключено, заточка стартует без принудительной проверки")
+    imgui.TextDisabled(u8'Скрипт откроет /stats, посчитает смазку и не начнёт, если её меньше 2 шт.\nЕсли выключить, заточка стартует сразу, а счётчик смазки не останавливает её.')
 
-    imgui.Separator()
+    imgui.Spacing()
 
-    imgui.CenterText(u8("Память уровней видеокарт:"))
-    imgui.TextDisabled(u8"Уровни запоминаются по слотам и переживают перезапуск скрипта,\nпоэтому после обрыва сканирование продолжается, а не начинается заново.")
+    -- ---------- Уровни видеокарт ----------
+    Draw.SectionTitle('Уровни видеокарт')
+    imgui.TextDisabled(u8(string.format(
+        'Скрипт помнит уровни по слотам (сейчас: %d) и обновляет их по пакетам инвентаря,\nпо окну улучшения и по "Информации о предмете".',
+        Improve.CountCachedLevels())))
 
     local _pktLevels = imgui.new.bool(settings.improve.packetLevels ~= false)
-    if imgui.Checkbox(u8"Брать уровни из пакетов инвентаря", _pktLevels) then
+    if imgui.Checkbox(u8'Брать уровни из пакетов инвентаря', _pktLevels) then
         settings.improve.packetLevels = not (settings.improve.packetLevels ~= false)
         Storage.SaveSettings()
     end
-    imgui.TextDisabled(u8"Сервер сам присылает уровни карт вместе с инвентарём.\nС этой галочкой карты не нужно открывать по одной.")
+    imgui.TextDisabled(u8'Уровни приходят от сервера при входе в игру и при каждом изменении карты.\nБез этой галочки каждую карту придётся открывать по одной.')
 
     local _fast = imgui.new.bool(settings.improve.fastProbe ~= false)
-    if imgui.Checkbox(u8"Быстрая проверка (не переоткрывать инвентарь между картами)", _fast) then
+    if imgui.Checkbox(u8'Не переоткрывать инвентарь между картами', _fast) then
         settings.improve.fastProbe = not (settings.improve.fastProbe ~= false)
         Storage.SaveSettings()
     end
+    imgui.TextDisabled(u8'Экономит 2-3 с на каждой карте при проверке и заточке.\nЕсли клик не сработал, инвентарь всё равно переоткроется.')
 
-    imgui.Text(u8"Срок актуальности запомненного уровня (часов, 0 = бессрочно):")
-    imgui.PushItemWidth(UI.Scale(120))
+    Draw.ImproveRowLabel('Помнить уровень:', labelW)
+    imgui.PushItemWidth(UI.Scale(90))
     local _ttl = imgui.new.int(tonumber(settings.improve.levelCacheHours) or 0)
-    if imgui.InputInt("##levelCacheHours", _ttl, 0, 0) then
+    if imgui.InputInt('##levelCacheHours', _ttl, 0, 0) then
         settings.improve.levelCacheHours = math.maxEx(0, _ttl[0])
         Storage.SaveSettings()
     end
     imgui.PopItemWidth()
+    imgui.SameLine()
+    local ttl = tonumber(settings.improve.levelCacheHours) or 0
+    imgui.TextDisabled(u8(ttl > 0 and string.format('ч. - потом карта проверяется заново', ttl) or 'ч. (0 = бессрочно)'))
 
-    imgui.Text(u8"Повторов при неответившем слоте:")
+    Draw.ImproveRowLabel('Повторов на карту:', labelW)
     imgui.PushItemWidth(-1)
     local _retries = imgui.new.int(tonumber(settings.improve.probeRetries) or 2)
-    if imgui.SliderInt("##probeRetries", _retries, 0, 5, u8"%d") then
+    if imgui.SliderInt('##probeRetries', _retries, 0, 5, u8'%d') then
         settings.improve.probeRetries = math.maxEx(0, _retries[0])
         Storage.SaveSettings()
     end
     imgui.PopItemWidth()
+    imgui.TextDisabled(u8'Сколько раз повторить, если карта не открылась при проверке уровня.')
 
-    if imgui.ButtonClickable(not improve.cef.probing, u8"Забыть запомненные уровни", imgui.ImVec2(-1, UI.Scale(26))) then
-        Improve.CardCacheClear(0)
-        Improve.ForgetPacketLevels()
-        for _, c in ipairs(improve.cef.cards or {}) do
-            c.levelKnown = false
-            c.probeFailed = false
-            c.level = 0
+    local canForget = not improve.cef.probing and not improve.isOn
+    if canForget then
+        if Draw.ConfirmButton('confirmForget', 'Забыть запомненные уровни', 'Точно забыть? Нажмите ещё раз', imgui.ImVec2(-1, UI.Scale(26))) then
+            Improve.CardCacheClear(0)
+            Improve.ForgetPacketLevels()
+            for _, c in ipairs(improve.cef.cards or {}) do
+                c.levelKnown = false
+                c.probeFailed = false
+                c.level = 0
+            end
+            improve.cef.probed = false
+            Improve.SyncVideoCardsFromCef()
+            Improve.Say('Запомненные уровни видеокарт очищены.')
         end
-        improve.cef.probed = false
-        Improve.SyncVideoCardsFromCef()
-        Improve.Say('Запомненные уровни видеокарт очищены.')
+    else
+        imgui.ButtonClickable(false, u8'Забыть запомненные уровни', imgui.ImVec2(-1, UI.Scale(26)))
+    end
+
+    imgui.Spacing()
+
+    -- ---------- Тонкая настройка ----------
+    if imgui.CollapsingHeader(u8'Задержки и таймауты') then
+        imgui.TextDisabled(u8'Менять стоит, только если заточка спотыкается: окно не открывается\nили результат не успевает прийти. Те же настройки есть в "Настройки -> Задержки".')
+        imgui.Spacing()
+        Draw.ImproveDelaySettings()
+    end
+
+    imgui.EndChild()
+end
+
+-- ---------- Логи заточки ----------
+
+function Improve.EmptyStats()
+    return { sessions = 0, attempts = 0, success = 0, fail = 0, oilsUsed = 0, spent = 0, byLevel = {}, time = 0 }
+end
+
+-- Сумма статистики за последние N дней (0 = за всё время)
+function Improve.StatsForPeriod(days)
+    local store = Improve.GetStatsStore()
+    if not store then
+        local e = Improve.EmptyStats()
+        Improve.EnsureLevelStats(e)
+        return e
+    end
+    if days == 0 then
+        local total = store.total or Improve.EmptyStats()
+        Improve.EnsureLevelStats(total)
+        return total
+    end
+
+    local sum = Improve.EmptyStats()
+    Improve.EnsureLevelStats(sum)
+    local fromKey = os.date('%Y-%m-%d', os.time() - (days - 1) * 86400)
+    for key, day in pairs(store.days or {}) do
+        if key >= fromKey and type(day) == 'table' then
+            for _, f in ipairs({ 'sessions', 'attempts', 'success', 'fail', 'oilsUsed', 'spent', 'time' }) do
+                sum[f] = sum[f] + (tonumber(day[f]) or 0)
+            end
+            for lvl = 1, 9 do
+                local src = (day.byLevel or {})[lvl] or {}
+                local dst = sum.byLevel[lvl]
+                dst.attempts = (dst.attempts or 0) + (src.attempts or 0)
+                dst.success  = (dst.success or 0) + (src.success or 0)
+                dst.fail     = (dst.fail or 0) + (src.fail or 0)
+                dst.spent    = (dst.spent or 0) + (src.spent or 0)
+            end
+        end
+    end
+    return sum
+end
+
+-- Шанс в процентах строкой (для текста imgui знак процента удвоен)
+function Improve.ChanceText(success, attempts)
+    if (attempts or 0) <= 0 then return '-' end
+    return string.format('%.1f%%%%', success * 100.0 / attempts)
+end
+
+function Draw.ImproveLogsSummary()
+    improve.ui = improve.ui or {}
+    local periods = { { 'Сегодня', 1 }, { '7 дней', 7 }, { '30 дней', 30 }, { 'Всё время', 0 } }
+    local cur = improve.ui.logsPeriod or 1
+    local picked = Draw.ImproveSegment('imp_logs_period', { periods[1][1], periods[2][1], periods[3][1], periods[4][1] }, cur, false)
+    if picked then improve.ui.logsPeriod = picked; cur = picked end
+
+    local st = Improve.StatsForPeriod(periods[cur][2])
+    local att, ok = st.attempts or 0, st.success or 0
+
+    imgui.Spacing()
+    imgui.Columns(4, 'imp_logs_tiles', false)
+        imgui.TextDisabled(u8'Попыток')
+        imgui.Text(u8(string.format('%d за %d сес.', att, st.sessions or 0)))
+    imgui.NextColumn()
+        imgui.TextDisabled(u8'Успехов')
+        imgui.TextColored(UI.Vec4('okColor'), u8(string.format('%d (%s)', ok, Improve.ChanceText(ok, att))))
+    imgui.NextColumn()
+        imgui.TextDisabled(u8'Смазки / денег')
+        imgui.Text(u8(string.format('%d / $%s', st.oilsUsed or 0, Util.GetCommaValue(math.floor(tonumber(st.spent) or 0)))))
+    imgui.NextColumn()
+        imgui.TextDisabled(u8'Время')
+        imgui.Text(u8(Improve.FormatDuration(st.time or 0)))
+    imgui.Columns(1)
+
+    if ok > 0 and (st.spent or 0) > 0 then
+        imgui.TextDisabled(u8(string.format('В среднем один поднятый уровень стоил $%s и %d смазки.',
+            Util.GetCommaValue(math.floor(st.spent / ok)), math.floor((st.oilsUsed or 0) / ok + 0.5))))
+    end
+
+    imgui.Spacing()
+    Draw.SectionTitle('По уровням')
+    if att == 0 then
+        imgui.TextDisabled(u8'За этот период попыток не было.')
+        return
+    end
+
+    imgui.Columns(6, 'imp_logs_levels', false)
+    for _, h in ipairs({ 'Переход', 'Попыток', 'Успехов', 'Шанс', 'Потрачено', 'Цена уровня' }) do
+        imgui.TextDisabled(u8(h))
+        imgui.NextColumn()
+    end
+    for lvl = 1, 9 do
+        local row = st.byLevel[lvl] or {}
+        local a, s = row.attempts or 0, row.success or 0
+        if a > 0 then
+            imgui.Text(u8(string.format('%d -> %d', lvl, lvl + 1))); imgui.NextColumn()
+            imgui.Text(tostring(a)); imgui.NextColumn()
+            imgui.Text(tostring(s)); imgui.NextColumn()
+            local chance = s * 100.0 / a
+            local col = chance >= 50 and UI.Vec4('okColor') or (chance >= 25 and UI.Vec4('warnColor') or UI.Vec4('badColor'))
+            imgui.TextColored(col, Improve.ChanceText(s, a)); imgui.NextColumn()
+            imgui.Text('$' .. Util.GetCommaValue(math.floor(tonumber(row.spent) or 0))); imgui.NextColumn()
+            imgui.Text(s > 0 and ('$' .. Util.GetCommaValue(math.floor((row.spent or 0) / s))) or '-'); imgui.NextColumn()
+        end
+    end
+    imgui.Columns(1)
+    imgui.TextDisabled(u8'Цена уровня = сколько в среднем ушло денег на один успешный переход.')
+
+    imgui.Spacing()
+    if Draw.ConfirmButton('confirmResetStats', 'Сбросить всю статистику', 'Точно сбросить? Нажмите ещё раз', imgui.ImVec2(UI.Scale(240), 0)) then
+        improve.statsStore = { days = {}, total = Improve.EmptyStats() }
+        Improve.EnsureLevelStats(improve.statsStore.total)
+        Improve.SaveStatsStore()
+        Improve.Say('Статистика заточки сброшена.')
     end
 end
 
-function Draw.ImproveLogsTab()
+function Draw.ImproveLogsDays()
     local store = Improve.GetStatsStore()
-    local todayKey = os.date('%Y-%m-%d')
+    local keys = {}
+    for key, day in pairs(store and store.days or {}) do
+        if type(day) == 'table' and (tonumber(day.attempts) or 0) > 0 then table.insert(keys, key) end
+    end
+    table.sort(keys, function(a, b) return a > b end)
 
-    local today = store and store.days and store.days[todayKey] or {
-        sessions  = 0,
-        attempts  = 0,
-        success   = 0,
-        fail      = 0,
-        oilsUsed  = 0,
-        spent     = 0,
-        byLevel   = {},
-        time      = 0,
-    }
-    Improve.EnsureLevelStats(today)
+    if #keys == 0 then
+        imgui.TextDisabled(u8'Дней с заточкой пока нет.')
+        return
+    end
 
-    local total = store and store.total or {
-        sessions  = 0,
-        attempts  = 0,
-        success   = 0,
-        fail      = 0,
-        oilsUsed  = 0,
-        spent     = 0,
-        byLevel   = {},
-        time      = 0,
-    }
-    Improve.EnsureLevelStats(total)
+    imgui.BeginChild('imp_logs_days', imgui.ImVec2(-1, -1), true)
+    imgui.ScrollMouse()
+    imgui.Columns(7, 'imp_logs_days_cols', false)
+    for _, h in ipairs({ 'Дата', 'Сессий', 'Попыток', 'Успехов', 'Смазки', 'Потрачено', 'Время' }) do
+        imgui.TextDisabled(u8(h))
+        imgui.NextColumn()
+    end
+    for _, key in ipairs(keys) do
+        local d = store.days[key]
+        local y, m, dd = key:match('^(%d+)-(%d+)-(%d+)$')
+        imgui.Text(y and string.format('%s.%s.%s', dd, m, y) or key); imgui.NextColumn()
+        imgui.Text(tostring(d.sessions or 0)); imgui.NextColumn()
+        imgui.Text(tostring(d.attempts or 0)); imgui.NextColumn()
+        imgui.TextColored(UI.Vec4('okColor'), string.format('%d (%s)', d.success or 0, Improve.ChanceText(d.success or 0, d.attempts or 0))); imgui.NextColumn()
+        imgui.Text(tostring(d.oilsUsed or 0)); imgui.NextColumn()
+        imgui.Text('$' .. Util.GetCommaValue(math.floor(tonumber(d.spent) or 0))); imgui.NextColumn()
+        imgui.Text(u8(Improve.FormatDuration(d.time or 0))); imgui.NextColumn()
+    end
+    imgui.Columns(1)
+    imgui.EndChild()
+end
 
-    local s = improve.stats
+function Draw.ImproveLogsFeed()
+    improve.ui = improve.ui or {}
+    local filters = { 'Все', 'Успехи', 'Неудачи и ошибки', 'Служебные' }
+    local picked = Draw.ImproveSegment('imp_logs_filter', filters, improve.ui.logsFilter or 1, false)
+    if picked then improve.ui.logsFilter = picked end
+    local filter = improve.ui.logsFilter or 1
 
-    if imgui.BeginTabBar("ImproveLogsSegments") then
-        if imgui.BeginTabItem(u8"Сводка") then
-            imgui.Columns(2, nil, false)
-                imgui.Text(u8(string.format("Сегодня (%s):", todayKey)))
-                imgui.Text(u8(string.format("  Сессий:   %d", today.sessions or 0)))
-                imgui.Text(u8(string.format("  Попыток:  %d (успехов: %d, ошибок: %d)", today.attempts or 0, today.success or 0, today.fail or 0)))
-                imgui.Text(u8(string.format("  Смазки:   %d", today.oilsUsed or 0)))
-                imgui.Text(u8(string.format("  Потрачено: $%d", today.spent or 0)))
-                imgui.Text(u8(string.format("  Время:    %d сек.", today.time or 0)))
-            imgui.NextColumn()
-                imgui.Text(u8("За всё время:"))
-                imgui.Text(u8(string.format("  Сессий:   %d", total.sessions or 0)))
-                imgui.Text(u8(string.format("  Попыток:  %d (успехов: %d, ошибок: %d)", total.attempts or 0, total.success or 0, total.fail or 0)))
-                imgui.Text(u8(string.format("  Смазки:   %d", total.oilsUsed or 0)))
-                imgui.Text(u8(string.format("  Потрачено: $%d", total.spent or 0)))
-                imgui.Text(u8(string.format("  Время:    %d сек.", total.time or 0)))
-            imgui.Columns(1)
+    local autoScrollPtr = imgui.new.bool(improve.logs.autoScroll ~= false)
+    if imgui.Checkbox(u8'Прокручивать к новым', autoScrollPtr) then
+        improve.logs.autoScroll = autoScrollPtr[0]
+    end
+    imgui.SameLine()
+    if imgui.RightButton(u8'Очистить ленту##imp_feed_clear') then
+        improve.logs.items = {}
+    end
 
-            imgui.Separator()
-            imgui.Text(u8("По уровням (с N на N+1):"))
-            imgui.Columns(2, nil, false)
-                imgui.Text(u8("Сегодня"))
-                for lvl = 1, 9 do
-                    local row = today.byLevel[lvl] or {}
-                    local attempts = row.attempts or 0
-                    local success = row.success or 0
-                    local chance = (attempts > 0) and (success * 100.0 / attempts) or 0
-                    imgui.Text(u8(string.format(
-                        "  %d->%d: попыток %d, шанс %.1f%%, потрачено $%d",
-                        lvl, lvl + 1, attempts, chance, row.spent or 0
-                    )))
+    local colors = { SUCCESS = UI.Vec4('okColor'), WARN = UI.Vec4('warnColor'), ERROR = UI.Vec4('badColor') }
+
+    imgui.BeginChild('improve_logs_scroll', imgui.ImVec2(-1, -1), true)
+        imgui.ScrollMouse()
+        local shown = 0
+        for _, entry in ipairs(improve.logs.items or {}) do
+            local etype = entry.type or 'INFO'
+            local pass = filter == 1
+                or (filter == 2 and etype == 'SUCCESS')
+                or (filter == 3 and (etype == 'WARN' or etype == 'ERROR'))
+                or (filter == 4 and etype == 'INFO')
+            if pass then
+                shown = shown + 1
+                local ts = tostring(entry.ts or '')
+                imgui.TextDisabled(ts:match('(%d+:%d+:%d+)$') or ts)
+                if imgui.IsItemHovered() then imgui.SetTooltip(ts) end
+                imgui.SameLine()
+                local col = colors[etype]
+                if col then
+                    imgui.TextColored(col, u8(tostring(entry.text or '')))
+                else
+                    imgui.Text(u8(tostring(entry.text or '')))
                 end
-            imgui.NextColumn()
-                imgui.Text(u8("За всё время"))
-                for lvl = 1, 9 do
-                    local row = total.byLevel[lvl] or {}
-                    local attempts = row.attempts or 0
-                    local success = row.success or 0
-                    local chance = (attempts > 0) and (success * 100.0 / attempts) or 0
-                    imgui.Text(u8(string.format(
-                        "  %d->%d: попыток %d, шанс %.1f%%, потрачено $%d",
-                        lvl, lvl + 1, attempts, chance, row.spent or 0
-                    )))
-                end
-            imgui.Columns(1)
-            imgui.EndTabItem()
+            end
+        end
+        if shown == 0 then
+            imgui.TextDisabled(u8'Записей нет. Полный журнал по дням лежит в config/MMT CFGs/logs.')
         end
 
-        if imgui.BeginTabItem(u8"Сессия") then
-            if s and (s.sessionId or 0) > 0 then
-                local startedStr  = (s.startedAt  and s.startedAt  > 0) and os.date('%d.%m.%Y %H:%M:%S', s.startedAt)  or "-"
-                local finishedStr = (s.finishedAt and s.finishedAt > 0) and os.date('%d.%m.%Y %H:%M:%S', s.finishedAt) or (s.active and "идёт…" or "-")
+        if improve.logs.autoScroll ~= false then
+            imgui.SetScrollHereY(1.0)
+        end
+    imgui.EndChild()
+end
 
-                imgui.Text(u8(string.format("Последняя сессия #%d:", s.sessionId)))
-                imgui.Text(u8("  Старт:      " .. startedStr))
-                imgui.Text(u8("  Завершение: " .. finishedStr))
-                imgui.Text(u8(string.format("  Попыток:    %d (успехов: %d, ошибок: %d)", s.attempts or 0, s.success or 0, s.fail or 0)))
-                imgui.Text(u8(string.format("  Смазки потрачено: %d", s.oilsUsed or 0)))
-                imgui.Text(u8(string.format("  Денег потрачено:  $%d", s.spent or 0)))
-                if s.lastReason and s.lastReason ~= "" then
-                    imgui.Text(u8("  Причина завершения: " .. s.lastReason))
-                end
-            else
-                imgui.TextDisabled(u8"Сессий заточки ещё не было.")
-            end
+function Draw.ImproveLogsTab()
+    if imgui.BeginTabBar('ImproveLogsSegments') then
+        if imgui.BeginTabItem(u8'Статистика') then
+            Draw.ImproveLogsSummary()
             imgui.EndTabItem()
         end
-
-        if imgui.BeginTabItem(u8"Лента") then
-            if imgui.Button(u8"Очистить лог", imgui.ImVec2(UI.Scale(120), 0)) then
-                improve.logs.items = {}
-            end
-            imgui.SameLine()
-            local autoScrollPtr = imgui.new.bool(improve.logs.autoScroll ~= false)
-            if imgui.Checkbox(u8"Автопрокрутка вниз", autoScrollPtr) then
-                improve.logs.autoScroll = autoScrollPtr[0]
-            end
-
-            imgui.Separator()
-            imgui.BeginChild("improve_logs_scroll", imgui.ImVec2(-1, -1), true)
-                imgui.ScrollMouse()
-                for i, entry in ipairs(improve.logs.items or {}) do
-                    local line = string.format("[%s] [%s] %s", entry.ts or "?", entry.type or "INFO", entry.text or "")
-                    local etype = entry.type or "INFO"
-                    if etype == "ERROR" or etype == "WARN" then
-                        imgui.TextColored(imgui.ImVec4(1, 0.4, 0.4, 1), u8(line))
-                    elseif etype == "SUCCESS" then
-                        imgui.TextColored(imgui.ImVec4(0.6, 1.0, 0.6, 1), u8(line))
-                    else
-                        imgui.Text(u8(line))
-                    end
-                end
-
-                if improve.logs.autoScroll ~= false then
-                    imgui.SetScrollHereY(1.0)
-                end
-            imgui.EndChild()
+        if imgui.BeginTabItem(u8'По дням') then
+            Draw.ImproveLogsDays()
             imgui.EndTabItem()
         end
-
-        if imgui.BeginTabItem(u8"Сервис") then
-            imgui.TextWrapped(u8"Сброс удаляет накопленную статистику по дням и за всё время.")
-            if imgui.Button(u8"Сбросить статистику", imgui.ImVec2(UI.Scale(180), 0)) then
-                improve.statsStore = {
-                    days = {},
-                    total = {
-                        sessions  = 0,
-                        attempts  = 0,
-                        success   = 0,
-                        fail      = 0,
-                        oilsUsed  = 0,
-                        spent     = 0,
-                        byLevel   = {},
-                        time      = 0,
-                    }
-                }
-                Improve.EnsureLevelStats(improve.statsStore.total)
-                Improve.SaveStatsStore()
-            end
+        if imgui.BeginTabItem(u8'Лента') then
+            Draw.ImproveLogsFeed()
             imgui.EndTabItem()
         end
-
         imgui.EndTabBar()
     end
 end
@@ -11364,45 +12151,7 @@ function Draw.Settings()
 
             imgui.Spacing()
 
-            imgui.Text(u8"Задержка после получения результата улучшения:")
-            local _improve_waitResult = new.int(settings.deley.improve_waitResult)
-            if imgui.SliderInt("##improve_waitResult", _improve_waitResult, 10, 1000, u8"%d мс") then
-                settings.deley.improve_waitResult = _improve_waitResult[0]
-                Storage.SaveSettings()
-            end
-            imgui.TextDisabled(u8"Пауза после получения результата улучшения")
-
-            imgui.Text(u8"Ожидание перед нажатием на видеокарту:")
-            local _improve_waitTryClick = new.int(settings.deley.improve_waitTryClick)
-            if imgui.SliderInt("##improve_waitTryClick", _improve_waitTryClick, 10, 1000, u8"%d мс") then
-                settings.deley.improve_waitTryClick = _improve_waitTryClick[0]
-                Storage.SaveSettings()
-            end
-            imgui.TextDisabled(u8"Пауза перед тем, как нажать на видеокарту")
-
-            imgui.Text(u8"Интервал автоповтора CEF-клика:")
-            local _improve_retryUseDelay = new.int(settings.deley.improve_retryUseDelay or 1200)
-            if imgui.SliderInt("##improve_retryUseDelay", _improve_retryUseDelay, 200, 5000, u8"%d мс") then
-                settings.deley.improve_retryUseDelay = _improve_retryUseDelay[0]
-                Storage.SaveSettings()
-            end
-            imgui.TextDisabled(u8"Если сервер не подтверждает старт, скрипт нажмёт слот снова")
-
-            imgui.Text(u8"Таймаут ожидания старта улучшения:")
-            local _improve_waitStartTimeout = new.int(settings.deley.improve_waitStartTimeout or 8)
-            if imgui.SliderInt("##improve_waitStartTimeout", _improve_waitStartTimeout, 2, 30, u8"%d сек") then
-                settings.deley.improve_waitStartTimeout = _improve_waitStartTimeout[0]
-                Storage.SaveSettings()
-            end
-            imgui.TextDisabled(u8"Если старт не подтверждён сервером, попытка перезапускается")
-
-            imgui.Text(u8"Таймаут ожидания результата улучшения:")
-            local _improve_waitResultTimeout = new.int(settings.deley.improve_waitResultTimeout or 20)
-            if imgui.SliderInt("##improve_waitResultTimeout", _improve_waitResultTimeout, 3, 60, u8"%d сек") then
-                settings.deley.improve_waitResultTimeout = _improve_waitResultTimeout[0]
-                Storage.SaveSettings()
-            end
-            imgui.TextDisabled(u8"Если нет результата, попытка считается ошибкой и цикл продолжается")
+            Draw.ImproveDelaySettings()
 
             imgui.PopItemWidth()
 
