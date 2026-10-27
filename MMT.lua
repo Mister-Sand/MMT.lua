@@ -5,7 +5,7 @@
 script_authors('Sand')
 script_name('MMT | Mining Tool')
 script_description('Mining assistant TG: @Mister_Sand')
-script_version("2.4")
+script_version("2.5")
 
 -- =====================================================================================================================
 --                                                          Import
@@ -8803,15 +8803,28 @@ end
 --                                                          UTLITES
 -- =====================================================================================================================
 
---- Запустить поток, всегда создавая новый. На NeoMLoader повторный run() уже запускавшегося
---- потока роняет игру (SIGSEGV в LuaThread::run): после terminate() или завершения status()
---- может вернуть "suspended", хотя поток внутри уже освобождён. На MoonLoader он просто перезапускался.
---- Новый поток создаётся приостановленным и запускается run(): lua_thread.create изнутри
---- работающего потока роняет moonloader. Проверку "поток занят" делает вызывающий код
----@param thread table|nil Прежний поток lua_thread - повторно не запускается
----@param entryPoint function Функция потока, из неё создаётся новый
+-- NeoMLoader: скрипты лежат в .../neomloader
+IS_NEOMLOADER = string.find(string.lower(tostring(getWorkingDirectory() or "")), "neomloader", 1, true) ~= nil
+
+--- Запустить поток процесса. Проверку "поток занят" делает вызывающий код.
+--- NeoMLoader: повторный run() уже запускавшегося потока роняет игру (SIGSEGV в LuaThread::run),
+--- status() после terminate() или завершения может вернуть "suspended" - поэтому всегда новый поток.
+--- MoonLoader/MonetLoader: перезапускаем прежний поток, созданный заранее в main. Новый поток,
+--- созданный внутри работающего потока, падает в lua51.dll, когда тот поток завершается
+--- (/mmtflash: поток флешки запускает сбор последней строкой и сразу заканчивается)
+---@param thread table|nil Прежний поток lua_thread
+---@param entryPoint function Функция потока
 ---@return table thread Запущенный поток - его нужно сохранить вместо прежнего
 function RunThreadFresh(thread, entryPoint)
+    if not IS_NEOMLOADER and thread
+        and (thread:status() == "suspended" or thread:status() == "dead")
+    then
+        thread:run()
+        return thread
+    end
+    if not IS_NEOMLOADER then
+        return lua_thread.create(entryPoint)
+    end
     thread = lua_thread.create_suspended(entryPoint)
     thread:run()
     return thread
